@@ -47,11 +47,19 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo dpkg --add-architecture arm64
+          # Add ports.ubuntu.com entries for the new architecture (some mirrors don't host arm64 yet)
+          sudo tee /etc/apt/sources.list.d/ports-arm64.list > /dev/null <<'EOF'
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-backports main restricted universe multiverse
+          EOF
+
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          sudo apt-get install -y libc6-dev-arm64-cross
+          # Cross-compiler and basic sysroot
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
           # Install OpenSSL headers and libs for the target architecture
-          sudo apt-get install -y pkg-config zlib1g-dev libssl-dev:arm64
+          sudo apt-get install -y pkg-config zlib1g-dev:arm64 libssl-dev:arm64
 
       - name: Cache dependencies
         uses: actions/cache@v4
