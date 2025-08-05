@@ -62,7 +62,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build release binary
+      - name: Build release binary (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           cargo build --release --target ${{ matrix.target }}
         env:
@@ -73,6 +74,13 @@ jobs:
           OPENSSL_DIR: /usr
           OPENSSL_LIB_DIR: /usr/lib/x86_64-linux-gnu
           OPENSSL_INCLUDE_DIR: /usr/include
+
+      - name: Build release binary (other targets)
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_INCREMENTAL: 0
 
       - name: Strip binary (Linux)
         if: matrix.os == 'ubuntu-latest'
