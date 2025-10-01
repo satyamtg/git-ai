@@ -225,6 +225,9 @@ pub fn get_git_blame_hunks(
     blame_opts.min_line(start_line.try_into().unwrap());
     blame_opts.max_line(end_line.try_into().unwrap());
 
+    // Ignore whitespace differences to get accurate authorship attribution
+    blame_opts.ignore_whitespace(true);
+
     // Apply boundary options
     if options.blank_boundary {
         // Note: git2 doesn't have a direct equivalent to git blame's -b flag
@@ -343,34 +346,35 @@ pub fn overlay_ai_authorship(
             authorship
         };
 
-        // If we have AI authorship data, look up the author for lines in this hunk
-        if let Some(authorship_log) = authorship_log {
-            // Check each line in this hunk for AI authorship using compact schema
-            // IMPORTANT: Use the original line numbers from the commit, not the current line numbers
-            let num_lines = hunk.range.1 - hunk.range.0 + 1;
-            for i in 0..num_lines {
-                let current_line_num = hunk.range.0 + i;
-                let orig_line_num = hunk.orig_range.0 + i;
+        // Process each line in this hunk
+        let num_lines = hunk.range.1 - hunk.range.0 + 1;
+        for i in 0..num_lines {
+            let current_line_num = hunk.range.0 + i;
+            let orig_line_num = hunk.orig_range.0 + i;
 
-                if let Some((author, prompt)) =
+            // Check if this specific line is in the authorship log for THIS commit only
+            let author_name = if let Some(ref authorship_log) = authorship_log {
+                if let Some((_author, prompt)) =
                     authorship_log.get_line_attribution(file_path, orig_line_num)
                 {
-                    // If this line is AI-assisted, display the tool name; otherwise the human username
+                    // Line is in the authorship log - check if it's AI or human
                     if let Some(prompt_record) = prompt {
-                        line_authors.insert(current_line_num, prompt_record.agent_id.tool.clone());
+                        // AI-generated line
+                        prompt_record.agent_id.tool.clone()
                     } else {
-                        line_authors.insert(current_line_num, author.username.clone());
+                        // Human-authored line (explicitly tracked in log)
+                        hunk.original_author.clone()
                     }
                 } else {
-                    // Fall back to original author if no AI authorship
-                    line_authors.insert(current_line_num, hunk.original_author.clone());
+                    // Line not in authorship log - use git author
+                    hunk.original_author.clone()
                 }
-            }
-        } else {
-            // No authorship log, use original author for all lines in hunk
-            for line_num in hunk.range.0..=hunk.range.1 {
-                line_authors.insert(line_num, hunk.original_author.clone());
-            }
+            } else {
+                // No authorship log for this commit - use git author
+                hunk.original_author.clone()
+            };
+
+            line_authors.insert(current_line_num, author_name);
         }
     }
 
