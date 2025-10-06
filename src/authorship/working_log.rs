@@ -132,6 +132,8 @@ pub struct Checkpoint {
     pub agent_id: Option<AgentId>,
     #[serde(default)]
     pub allow_reset_to_checkpoint: bool,
+    #[serde(default = "default_pass_through_attribution_checkpoint")]
+    pub pass_through_attribution_checkpoint: bool,
 }
 
 impl Checkpoint {
@@ -149,8 +151,32 @@ impl Checkpoint {
             transcript: None,
             agent_id: None,
             allow_reset_to_checkpoint: false,
+            pass_through_attribution_checkpoint: false,
         }
     }
+
+    /// Create a passthrough checkpoint that tracks line changes but doesn't attribute authorship
+    pub fn new_passthrough(diff: String, author: String, entries: Vec<WorkingLogEntry>) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Self {
+            diff,
+            author,
+            entries,
+            timestamp,
+            transcript: None, // Passthrough checkpoints never have transcripts
+            agent_id: None,   // Passthrough checkpoints never have agent_id
+            allow_reset_to_checkpoint: false,
+            pass_through_attribution_checkpoint: true, // This is the key difference
+        }
+    }
+}
+
+fn default_pass_through_attribution_checkpoint() -> bool {
+    false
 }
 
 #[cfg(test)]

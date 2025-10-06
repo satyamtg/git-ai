@@ -463,11 +463,14 @@ impl AuthorshipLog {
                 // Create compressed line ranges for the new additions
                 let new_line_ranges = LineRange::compress_lines(&added_lines);
 
-                // Only process AI-generated content (entries with prompt_session_id)
-                if let Some(session_id) = session_id_opt.clone() {
-                    // Add new attestation entry for the AI-added lines
-                    let entry = AttestationEntry::new(session_id, new_line_ranges);
-                    file_attestation.add_entry(entry);
+                // Skip authorship attribution for passthrough checkpoints
+                if !checkpoint.pass_through_attribution_checkpoint {
+                    // Only process AI-generated content (entries with prompt_session_id)
+                    if let Some(session_id) = session_id_opt.clone() {
+                        // Add new attestation entry for the AI-added lines
+                        let entry = AttestationEntry::new(session_id, new_line_ranges);
+                        file_attestation.add_entry(entry);
+                    }
                 }
             }
         }
@@ -1614,6 +1617,177 @@ mod tests {
         assert_eq!(prompt_record.total_additions, 5);
         assert_eq!(prompt_record.total_deletions, 0); // AI didn't delete anything
         assert_eq!(prompt_record.accepted_lines, 3); // AI still owns lines 1, 4, 5
+    }
+
+    #[test]
+    fn test_passthrough_checkpoint_comprehensive() {
+        use crate::authorship::transcript::{AiTranscript, Message};
+        use crate::authorship::working_log::{AgentId, Checkpoint, Line, WorkingLogEntry};
+
+        // Create an agent ID
+        let agent_id = AgentId {
+            tool: "cursor".to_string(),
+            id: "test_session".to_string(),
+            model: "claude-3-sonnet".to_string(),
+        };
+
+        // Create a transcript
+        let mut transcript = AiTranscript::new();
+        transcript.add_message(Message::user("Add functions and modify code".to_string()));
+        transcript.add_message(Message::assistant(
+            "I'll add the functions and make changes".to_string(),
+        ));
+
+        // Test scenario: Passthrough checkpoint at the top (after merge-squash)
+        // This simulates the intended usage pattern
+
+        // 1. PASSTHROUGH CHECKPOINT (at top) - adds lines 1-3 (top of file)
+        let passthrough_entry = WorkingLogEntry::new(
+            "src/test.rs".to_string(),
+            "blob_sha_passthrough".to_string(),
+            vec![Line::Range(1, 3)], // Lines 1-3
+            vec![],
+        );
+        let passthrough_checkpoint = Checkpoint::new_passthrough(
+            "".to_string(),
+            "human".to_string(),
+            vec![passthrough_entry],
+        );
+
+        // 2. Normal AI checkpoint - adds lines 4-6 (middle)
+        let entry1 = WorkingLogEntry::new(
+            "src/test.rs".to_string(),
+            "blob_sha_1".to_string(),
+            vec![Line::Range(4, 6)], // Lines 4-6
+            vec![],
+        );
+        let mut checkpoint1 = Checkpoint::new("".to_string(), "ai".to_string(), vec![entry1]);
+        checkpoint1.agent_id = Some(agent_id.clone());
+        checkpoint1.transcript = Some(transcript.clone());
+
+        // 3. Another normal AI checkpoint - adds lines 7-9 (middle)
+        let entry2 = WorkingLogEntry::new(
+            "src/test.rs".to_string(),
+            "blob_sha_2".to_string(),
+            vec![Line::Range(7, 9)], // Lines 7-9
+            vec![],
+        );
+        let mut checkpoint2 = Checkpoint::new("".to_string(), "ai".to_string(), vec![entry2]);
+        checkpoint2.agent_id = Some(agent_id.clone());
+        checkpoint2.transcript = Some(transcript.clone());
+
+        // 4. Another passthrough checkpoint - adds lines 10-12 (middle)
+        let passthrough_entry2 = WorkingLogEntry::new(
+            "src/test.rs".to_string(),
+            "blob_sha_passthrough2".to_string(),
+            vec![Line::Range(10, 12)], // Lines 10-12
+            vec![],
+        );
+        let passthrough_checkpoint2 = Checkpoint::new_passthrough(
+            "".to_string(),
+            "human".to_string(),
+            vec![passthrough_entry2],
+        );
+
+        // 5. Final normal AI checkpoint - adds lines 13-15 (bottom)
+        let entry3 = WorkingLogEntry::new(
+            "src/test.rs".to_string(),
+            "blob_sha_3".to_string(),
+            vec![Line::Range(13, 15)], // Lines 13-15
+            vec![],
+        );
+        let mut checkpoint3 = Checkpoint::new("".to_string(), "ai".to_string(), vec![entry3]);
+        checkpoint3.agent_id = Some(agent_id.clone());
+        checkpoint3.transcript = Some(transcript);
+
+        // Convert to authorship log with passthrough checkpoints at the top
+        let authorship_log = AuthorshipLog::from_working_log_with_base_commit_and_human_author(
+            &[
+                passthrough_checkpoint,  // Lines 1-3 (passthrough)
+                checkpoint1,             // Lines 4-6 (AI)
+                checkpoint2,             // Lines 7-9 (AI)
+                passthrough_checkpoint2, // Lines 10-12 (passthrough)
+                checkpoint3,             // Lines 13-15 (AI)
+            ],
+            "base123",
+            None,
+        );
+
+        // Get the prompt record
+        let session_hash = generate_short_hash(&agent_id.id, &agent_id.tool);
+        let prompt_record = authorship_log.metadata.prompts.get(&session_hash).unwrap();
+
+        // Check that the prompt record exists and has the correct metrics
+        // Only normal checkpoints contribute to session metrics (3 + 3 + 3 = 9 lines)
+        // Passthrough checkpoint lines (3 + 3 = 6) are not counted in session metrics
+        assert_eq!(prompt_record.total_additions, 9); // 3 + 3 + 3 lines from normal checkpoints only
+        assert_eq!(prompt_record.total_deletions, 0);
+
+        // Check that only lines 4-6, 7-9, and 13-15 are attributed to the AI session
+        // Lines 1-3 and 10-12 should NOT be attributed due to passthrough checkpoints
+        let file_attestation = authorship_log
+            .attestations
+            .iter()
+            .find(|fa| fa.file_path == "src/test.rs")
+            .unwrap();
+        let attestation_entry = &file_attestation.entries[0];
+
+        // Should have two ranges: 4-9 (merged from 4-6 and 7-9) and 13-15
+        // The AI checkpoints with the same session ID get merged together
+        assert_eq!(attestation_entry.line_ranges.len(), 2);
+
+        // Check that the ranges are correct
+        let ranges: Vec<_> = attestation_entry.line_ranges.iter().collect();
+
+        // Sort ranges by start line for consistent testing
+        let mut sorted_ranges = ranges.clone();
+        sorted_ranges.sort_by_key(|r| match r {
+            LineRange::Single(line) => *line,
+            LineRange::Range(start, _) => *start,
+        });
+
+        match &sorted_ranges[0] {
+            LineRange::Range(start, end) => {
+                assert_eq!(*start, 4);
+                assert_eq!(*end, 9); // Merged range from 4-6 and 7-9
+            }
+            _ => panic!("Expected merged range for lines 4-9"),
+        }
+        match &sorted_ranges[1] {
+            LineRange::Range(start, end) => {
+                assert_eq!(*start, 13);
+                assert_eq!(*end, 15);
+            }
+            _ => panic!("Expected range for lines 13-15"),
+        }
+
+        // Verify that lines 1-3 and 10-12 are NOT attributed to any AI session
+        // (they should not appear in any attestation entry)
+        for entry in &file_attestation.entries {
+            for range in &entry.line_ranges {
+                match range {
+                    LineRange::Single(line) => {
+                        assert!(
+                            (*line < 1 || *line > 3) && (*line < 10 || *line > 12),
+                            "Line {} should not be attributed (passthrough lines)",
+                            line
+                        );
+                    }
+                    LineRange::Range(start, end) => {
+                        assert!(
+                            (*end < 1 || *start > 3) && (*end < 10 || *start > 12),
+                            "Range {}-{} should not be attributed (passthrough lines)",
+                            start,
+                            end
+                        );
+                    }
+                }
+            }
+        }
+
+        // Verify that the passthrough checkpoints still affect line offsets correctly
+        // by checking that AI-attributed lines are in the correct positions
+        // (This is implicitly tested by the range assertions above)
     }
 
     #[test]
