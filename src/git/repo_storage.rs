@@ -218,6 +218,29 @@ impl InMemoryWorkingLog {
             edited_files,
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.checkpoints.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.checkpoints.len()
+    }
+}
+
+impl Default for InMemoryWorkingLog {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+impl IntoIterator for InMemoryWorkingLog {
+    type Item = Checkpoint;
+    type IntoIter = std::vec::IntoIter<Checkpoint>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.checkpoints.into_iter()
+    }
 }
 
 #[cfg(test)]

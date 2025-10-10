@@ -10,8 +10,15 @@ pub fn pre_reset_hook(parsed_args: &ParsedGitInvocation, repository: &mut Reposi
         commit_hooks::get_commit_default_author(repository, &parsed_args.command_args);
 
     // Run checkpoint to capture current working directory state before reset
-    let _result =
-        crate::commands::checkpoint::run(repository, &human_author, false, false, true, None);
+    let _result = crate::commands::checkpoint::run(
+        repository,
+        &human_author,
+        false,
+        false,
+        true,
+        None,
+        false,
+    );
 
     // Capture HEAD before reset happens
     repository.require_pre_command_head();
@@ -233,7 +240,7 @@ fn handle_reset_pathspec_preserve_working_dir(
 
     // Filter existing checkpoints to keep only non-pathspec files
     let mut non_pathspec_checkpoints = Vec::new();
-    for mut checkpoint in existing_checkpoints {
+    for mut checkpoint in existing_checkpoints.checkpoints {
         checkpoint.entries.retain(|entry| {
             !pathspecs
                 .iter()
@@ -264,7 +271,7 @@ fn handle_reset_pathspec_preserve_working_dir(
 
     // Filter target checkpoints to only include pathspec files
     let mut pathspec_checkpoints = Vec::new();
-    for mut checkpoint in target_checkpoints {
+    for mut checkpoint in target_checkpoints.checkpoints {
         checkpoint.entries.retain(|entry| {
             pathspecs
                 .iter()

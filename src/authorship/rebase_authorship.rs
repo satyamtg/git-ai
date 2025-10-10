@@ -3,6 +3,7 @@ use crate::authorship::post_commit;
 use crate::commands::blame::GitAiBlameOptions;
 use crate::error::GitAiError;
 use crate::git::refs::get_reference_as_authorship_log_v3;
+use crate::git::repo_storage::InMemoryWorkingLog;
 use crate::git::repository::{Commit, Repository};
 use crate::git::rewrite_log::RewriteLogEvent;
 use crate::utils::debug_log;
@@ -1522,7 +1523,7 @@ fn create_authorship_log_for_hanging_commit(
         }
         _ => {
             debug_log(&format!("No working log for {}", old_head_sha));
-            Vec::new()
+            InMemoryWorkingLog::default()
         }
     };
 
@@ -1531,7 +1532,7 @@ fn create_authorship_log_for_hanging_commit(
         let mut session_additions = std::collections::HashMap::new();
         let mut session_deletions = std::collections::HashMap::new();
 
-        for checkpoint in &checkpoints {
+        for checkpoint in &checkpoints.checkpoints {
             authorship_log.apply_checkpoint(
                 checkpoint,
                 Some(human_author),
@@ -1767,6 +1768,7 @@ mod tests {
 
         // Clear commit SHA for stable snapshots
         authorship_log.metadata.base_commit_sha = "".to_string();
+        println!("{:?}", authorship_log);
         assert_debug_snapshot!(authorship_log);
     }
 

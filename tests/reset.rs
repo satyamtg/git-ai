@@ -1,4 +1,3 @@
-use git_ai::authorship::working_log::{Checkpoint, Line};
 use git_ai::git::test_utils::{ResetMode, TmpRepo, snapshot_checkpoints};
 use insta::assert_debug_snapshot;
 
@@ -57,7 +56,7 @@ fn test_reset_hard_deletes_working_log() {
         .storage
         .working_log_for_base_commit(&second_commit);
     let checkpoints_after = working_log.read_all_checkpoints().unwrap();
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints_after));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints_after.checkpoints));
 }
 
 /// Test git reset --soft: should reconstruct working log from unwound commits
@@ -94,7 +93,7 @@ fn test_reset_soft_reconstructs_working_log() {
         .read_all_checkpoints()
         .expect("Working log should exist after reset --soft");
 
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset --mixed (default): should reconstruct working log
@@ -137,7 +136,7 @@ fn test_reset_mixed_reconstructs_working_log() {
         .read_all_checkpoints()
         .expect("Working log should exist after reset --mixed");
 
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset to same commit: should be no-op
@@ -177,9 +176,9 @@ fn test_reset_to_same_commit_is_noop() {
     let checkpoints_after = working_log.read_all_checkpoints().unwrap();
     assert_debug_snapshot!((
         "before",
-        snapshot_checkpoints(&checkpoints_before),
+        snapshot_checkpoints(&checkpoints_before.checkpoints),
         "after",
-        snapshot_checkpoints(&checkpoints_after)
+        snapshot_checkpoints(&checkpoints_after.checkpoints)
     ));
 }
 
@@ -228,7 +227,7 @@ fn test_reset_multiple_commits() {
         .read_all_checkpoints()
         .expect("Working log should exist");
 
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset with uncommitted changes preserved
@@ -278,7 +277,7 @@ fn test_reset_preserves_uncommitted_changes() {
         .read_all_checkpoints()
         .expect("Working log should exist");
 
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset with pathspecs: should remove entries for affected files
@@ -348,7 +347,7 @@ fn test_reset_with_pathspec() {
         .working_log_for_base_commit(&first_commit);
 
     let checkpoints = working_log.read_all_checkpoints().unwrap();
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset forward (to descendant): should be no-op
@@ -385,7 +384,7 @@ fn test_reset_forward_is_noop() {
         .working_log_for_base_commit(&second_commit);
 
     let checkpoints = working_log.read_all_checkpoints().unwrap();
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset with AI and human mixed changes
@@ -429,7 +428,7 @@ fn test_reset_mixed_ai_human_changes() {
         .read_all_checkpoints()
         .expect("Working log should exist");
 
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset --merge
@@ -464,7 +463,7 @@ fn test_reset_merge() {
         .read_all_checkpoints()
         .expect("Working log should exist");
 
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset with new files added in unwound commit
@@ -500,7 +499,7 @@ fn test_reset_with_new_files() {
         .read_all_checkpoints()
         .expect("Working log should exist");
 
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset with file deletions in unwound commit
@@ -533,7 +532,7 @@ fn test_reset_with_deleted_files() {
         .storage
         .working_log_for_base_commit(&base);
     let checkpoints = working_log.read_all_checkpoints().unwrap();
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset --mixed with pathspec: should carry AI authorship forward for reset files
@@ -605,7 +604,7 @@ fn test_reset_mixed_pathspec_preserves_ai_authorship() {
         .read_all_checkpoints()
         .expect("Working log should exist after pathspec reset");
 
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }
 
 /// Test git reset --mixed with pathspec on multiple commits worth of AI changes
@@ -682,5 +681,5 @@ fn test_reset_mixed_pathspec_multiple_commits() {
         .read_all_checkpoints()
         .expect("Working log should exist");
 
-    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints));
+    assert_debug_snapshot!(snapshot_checkpoints(&checkpoints.checkpoints));
 }

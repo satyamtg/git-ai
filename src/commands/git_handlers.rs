@@ -9,8 +9,6 @@ use crate::config;
 use crate::git::cli_parser::{ParsedGitInvocation, parse_git_cli_args};
 use crate::git::find_repository;
 use crate::git::repository::Repository;
-use crate::git::rewrite_log::MergeSquashEvent;
-use crate::git::rewrite_log::RewriteLogEvent;
 use crate::utils::Timer;
 
 use crate::utils::debug_log;
