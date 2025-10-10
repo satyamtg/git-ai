@@ -3,6 +3,7 @@ use crate::config;
 use crate::error::GitAiError;
 use crate::git::repo_storage::RepoStorage;
 use crate::git::rewrite_log::RewriteLogEvent;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -985,6 +986,102 @@ impl Repository {
         }
         Ok(Tree { repo: self, oid })
     }
+
+    /// List all files changed in a commit
+    /// Returns a HashSet of file paths relative to the repository root
+    pub fn list_commit_files(
+        &self,
+        commit_sha: &str,
+        pathspecs: Option<&HashSet<String>>,
+    ) -> Result<HashSet<String>, GitAiError> {
+        let mut args = self.global_args_for_exec();
+        args.push("diff-tree".to_string());
+        args.push("--no-commit-id".to_string());
+        args.push("--name-only".to_string());
+        args.push("-r".to_string());
+        args.push(commit_sha.to_string());
+
+        // Add pathspecs if provided
+        if let Some(paths) = pathspecs {
+            args.push("--".to_string());
+            for path in paths {
+                args.push(path.clone());
+            }
+        }
+
+        let output = exec_git(&args)?;
+        let stdout = String::from_utf8(output.stdout)?;
+
+        let files: HashSet<String> = stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| line.to_string())
+            .collect();
+
+        Ok(files)
+    }
+
+    /// Get added line ranges from git diff between two commits
+    /// Returns a HashMap of file paths to vectors of added line numbers
+    ///
+    /// Uses `git diff -U0` to get unified diff with zero context lines,
+    /// then parses the hunk headers to extract line numbers directly.
+    /// This is much faster than fetching blobs and running TextDiff manually.
+    pub fn diff_added_lines(
+        &self,
+        from_ref: &str,
+        to_ref: &str,
+        pathspecs: Option<&HashSet<String>>,
+    ) -> Result<HashMap<String, Vec<u32>>, GitAiError> {
+        let mut args = self.global_args_for_exec();
+        args.push("diff".to_string());
+        args.push("-U0".to_string()); // Zero context lines
+        args.push("--no-color".to_string());
+        args.push(from_ref.to_string());
+        args.push(to_ref.to_string());
+
+        // Add pathspecs if provided
+        if let Some(paths) = pathspecs {
+            args.push("--".to_string());
+            for path in paths {
+                args.push(path.clone());
+            }
+        }
+
+        let output = exec_git(&args)?;
+        let diff_output = String::from_utf8(output.stdout)?;
+
+        parse_diff_added_lines(&diff_output)
+    }
+
+    /// Get added line ranges from git diff between a commit and the working directory
+    /// Returns a HashMap of file paths to vectors of added line numbers
+    ///
+    /// Similar to diff_added_lines but compares against the working directory
+    pub fn diff_workdir_added_lines(
+        &self,
+        from_ref: &str,
+        pathspecs: Option<&HashSet<String>>,
+    ) -> Result<HashMap<String, Vec<u32>>, GitAiError> {
+        let mut args = self.global_args_for_exec();
+        args.push("diff".to_string());
+        args.push("-U0".to_string()); // Zero context lines
+        args.push("--no-color".to_string());
+        args.push(from_ref.to_string());
+
+        // Add pathspecs if provided
+        if let Some(paths) = pathspecs {
+            args.push("--".to_string());
+            for path in paths {
+                args.push(path.clone());
+            }
+        }
+
+        let output = exec_git(&args)?;
+        let diff_output = String::from_utf8(output.stdout)?;
+
+        parse_diff_added_lines(&diff_output)
+    }
 }
 
 pub fn find_repository(global_args: &Vec<String>) -> Result<Repository, GitAiError> {
@@ -1112,4 +1209,88 @@ pub fn exec_git_stdin_with_env(
     }
 
     Ok(output)
+}
+
+/// Parse git diff output to extract added line numbers per file
+///
+/// Parses unified diff format hunk headers like:
+/// @@ -10,2 +15,5 @@
+///
+/// This means: old file line 10 (2 lines), new file line 15 (5 lines)
+/// We extract the "new file" line numbers to know which lines were added.
+fn parse_diff_added_lines(diff_output: &str) -> Result<HashMap<String, Vec<u32>>, GitAiError> {
+    let mut result: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut current_file: Option<String> = None;
+
+    for line in diff_output.lines() {
+        // Track current file being diffed
+        if line.starts_with("+++ b/") {
+            current_file = Some(line[6..].to_string());
+        } else if line.starts_with("+++ /dev/null") {
+            // File was deleted
+            current_file = None;
+        } else if line.starts_with("@@ ") {
+            // Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
+            if let Some(ref file) = current_file {
+                if let Some(added_lines) = parse_hunk_header(line) {
+                    result
+                        .entry(file.clone())
+                        .or_insert_with(Vec::new)
+                        .extend(added_lines);
+                }
+            }
+        }
+    }
+
+    // Sort and deduplicate line numbers for each file
+    for lines in result.values_mut() {
+        lines.sort_unstable();
+        lines.dedup();
+    }
+
+    Ok(result)
+}
+
+/// Parse a hunk header line to extract added line numbers
+///
+/// Format: @@ -old_start,old_count +new_start,new_count @@
+/// Returns the line numbers that were added in the new file
+fn parse_hunk_header(line: &str) -> Option<Vec<u32>> {
+    // Find the part between @@ and @@
+    let parts: Vec<&str> = line.split("@@").collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let hunk_info = parts[1].trim();
+
+    // Split by space to get old and new ranges
+    let ranges: Vec<&str> = hunk_info.split_whitespace().collect();
+    if ranges.len() < 2 {
+        return None;
+    }
+
+    // Parse the new file range (starts with '+')
+    let new_range = ranges
+        .iter()
+        .find(|r| r.starts_with('+'))?
+        .trim_start_matches('+');
+
+    // Parse "start,count" or just "start"
+    let new_parts: Vec<&str> = new_range.split(',').collect();
+    let start: u32 = new_parts[0].parse().ok()?;
+    let count: u32 = if new_parts.len() > 1 {
+        new_parts[1].parse().ok()?
+    } else {
+        1 // If no count specified, it's 1 line
+    };
+
+    // If count is 0, no lines were added (only deleted)
+    if count == 0 {
+        return Some(Vec::new());
+    }
+
+    // Generate all line numbers in the range
+    let lines: Vec<u32> = (start..start + count).collect();
+    Some(lines)
 }

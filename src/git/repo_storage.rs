@@ -2,6 +2,7 @@ use crate::authorship::working_log::Checkpoint;
 use crate::error::GitAiError;
 use crate::git::rewrite_log::{RewriteLogEvent, append_event_to_file};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -170,11 +171,11 @@ impl PersistedWorkingLog {
         Ok(())
     }
 
-    pub fn read_all_checkpoints(&self) -> Result<Vec<Checkpoint>, GitAiError> {
+    pub fn read_all_checkpoints(&self) -> Result<InMemoryWorkingLog, GitAiError> {
         let checkpoints_file = self.dir.join("checkpoints.jsonl");
 
         if !checkpoints_file.exists() {
-            return Ok(Vec::new());
+            return Ok(InMemoryWorkingLog::new(Vec::new()));
         }
 
         let content = fs::read_to_string(&checkpoints_file)?;
@@ -192,7 +193,30 @@ impl PersistedWorkingLog {
             checkpoints.push(checkpoint);
         }
 
-        Ok(checkpoints)
+        Ok(InMemoryWorkingLog::new(checkpoints))
+    }
+}
+
+pub struct InMemoryWorkingLog {
+    pub checkpoints: Vec<Checkpoint>,
+    pub edited_files: HashSet<String>,
+}
+
+impl InMemoryWorkingLog {
+    pub fn new(checkpoints: Vec<Checkpoint>) -> Self {
+        let mut edited_files = HashSet::new();
+        for checkpoint in &checkpoints {
+            for entry in &checkpoint.entries {
+                if !edited_files.contains(&entry.file) {
+                    edited_files.insert(entry.file.clone());
+                }
+            }
+        }
+
+        Self {
+            checkpoints,
+            edited_files,
+        }
     }
 }
 
@@ -334,14 +358,18 @@ mod tests {
             .expect("Failed to append checkpoint");
 
         // Test reading all checkpoints
-        let checkpoints = working_log
+        let working_log_data = working_log
             .read_all_checkpoints()
             .expect("Failed to read checkpoints");
 
-        println!("checkpoints: {:?}", checkpoints);
+        println!("checkpoints: {:?}", working_log_data.checkpoints);
 
-        assert_eq!(checkpoints.len(), 1, "Should have one checkpoint");
-        assert_eq!(checkpoints[0].author, "test-author");
+        assert_eq!(
+            working_log_data.checkpoints.len(),
+            1,
+            "Should have one checkpoint"
+        );
+        assert_eq!(working_log_data.checkpoints[0].author, "test-author");
 
         // Verify the JSONL file exists
         let checkpoints_file = working_log.dir.join("checkpoints.jsonl");
@@ -358,12 +386,16 @@ mod tests {
             .append_checkpoint(&checkpoint2)
             .expect("Failed to append second checkpoint");
 
-        let checkpoints = working_log
+        let working_log_data = working_log
             .read_all_checkpoints()
             .expect("Failed to read checkpoints after second append");
 
-        assert_eq!(checkpoints.len(), 2, "Should have two checkpoints");
-        assert_eq!(checkpoints[1].author, "test-author-2");
+        assert_eq!(
+            working_log_data.checkpoints.len(),
+            2,
+            "Should have two checkpoints"
+        );
+        assert_eq!(working_log_data.checkpoints[1].author, "test-author-2");
     }
 
     #[test]
@@ -390,10 +422,10 @@ mod tests {
 
         // Verify they exist
         assert!(working_log.dir.join("blobs").join(&sha).exists());
-        let checkpoints = working_log
+        let working_log_data = working_log
             .read_all_checkpoints()
             .expect("Failed to read checkpoints");
-        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(working_log_data.checkpoints.len(), 1);
 
         // Reset the working log
         working_log
@@ -407,11 +439,11 @@ mod tests {
         );
 
         // Verify checkpoints are cleared
-        let checkpoints = working_log
+        let working_log_data = working_log
             .read_all_checkpoints()
             .expect("Failed to read checkpoints after reset");
         assert_eq!(
-            checkpoints.len(),
+            working_log_data.checkpoints.len(),
             0,
             "Should have no checkpoints after reset"
         );

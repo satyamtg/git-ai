@@ -44,7 +44,7 @@ pub fn run(
         working_log.reset_working_log()?;
         Vec::new()
     } else {
-        working_log.read_all_checkpoints()?
+        working_log.read_all_checkpoints()?.checkpoints
     };
 
     if show_working_log {
@@ -205,7 +205,7 @@ fn get_all_files(repo: &Repository) -> Result<Vec<String>, GitAiError> {
     let mut files = Vec::new();
 
     // Use porcelain v2 format to get status
-    let statuses = repo.status()?;
+    let statuses = repo.status(None)?;
 
     for entry in statuses {
         // Skip ignored files
@@ -253,8 +253,8 @@ fn get_all_tracked_files(
 
     // Also include files that were in previous checkpoints but might not show up in git status
     // This ensures we track deletions when files return to their original state
-    if let Ok(checkpoints) = working_log.read_all_checkpoints() {
-        for checkpoint in &checkpoints {
+    if let Ok(working_log_data) = working_log.read_all_checkpoints() {
+        for checkpoint in &working_log_data.checkpoints {
             for entry in &checkpoint.entries {
                 if !files.contains(&entry.file) {
                     // Check if it's a text file before adding

@@ -99,7 +99,7 @@ pub fn run(repo: &Repository, json_output: bool) -> Result<(), GitAiError> {
         // Get the working log for this commit
         let working_log = repo_storage.working_log_for_base_commit(commit_hash);
         let checkpoints = match working_log.read_all_checkpoints() {
-            Ok(checkpoints) => checkpoints,
+            Ok(working_log_data) => working_log_data.checkpoints,
             Err(_) => continue, // Skip if we can't get the working log
         };
 
@@ -194,8 +194,8 @@ fn find_working_log_refs(repo: &Repository) -> Result<HashMap<String, usize>, Gi
             let working_log = repo_storage.working_log_for_base_commit(&base_commit);
 
             match working_log.read_all_checkpoints() {
-                Ok(checkpoints) => {
-                    working_log_refs.insert(base_commit, checkpoints.len());
+                Ok(working_log_data) => {
+                    working_log_refs.insert(base_commit, working_log_data.checkpoints.len());
                 }
                 Err(_) => {
                     // If we can't read the checkpoints, still include it but with 0 count

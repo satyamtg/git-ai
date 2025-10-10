@@ -9,6 +9,7 @@ use crate::git::find_repository;
 use crate::git::repository::Repository;
 use crate::git::rewrite_log::MergeSquashEvent;
 use crate::git::rewrite_log::RewriteLogEvent;
+use crate::utils::Timer;
 use crate::utils::debug_log;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -90,18 +91,22 @@ pub fn handle_git(args: &[String]) {
         );
     }
 
+    let mut timer = Timer::new();
+
     // run with hooks
     let exit_status = if !parsed_args.is_help && has_repo && !skip_hooks {
         let repository = repository_option.as_mut().unwrap();
         run_pre_command_hooks(&mut command_hooks_context, &parsed_args, repository);
         let exit_status = proxy_to_git(&parsed_args.to_invocation_vec(), false);
 
+        timer.start("run_post_command_hooks");
         run_post_command_hooks(
             &mut command_hooks_context,
             &parsed_args,
             exit_status,
             repository,
         );
+        timer.end("run_post_command_hooks");
         exit_status
     } else {
         // run without hooks

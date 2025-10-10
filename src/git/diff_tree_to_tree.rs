@@ -1,5 +1,6 @@
 use crate::error::GitAiError;
 use crate::git::repository::{Repository, Tree, exec_git};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
@@ -107,11 +108,13 @@ impl Repository {
     /// * `old_tree` - The old tree to compare (None for empty tree)
     /// * `new_tree` - The new tree to compare (None for empty tree)
     /// * `_opts` - Diff options (currently unused, for API compatibility)
+    /// * `pathspecs` - Optional set of paths to limit the diff to
     pub fn diff_tree_to_tree(
         &self,
         old_tree: Option<&Tree<'_>>,
         new_tree: Option<&Tree<'_>>,
         _opts: Option<()>,
+        pathspecs: Option<&HashSet<String>>,
     ) -> Result<Diff, GitAiError> {
         // Get the empty tree OID if we need it
         let empty_tree_oid = if old_tree.is_none() || new_tree.is_none() {
@@ -149,6 +152,14 @@ impl Repository {
         args.push("--no-abbrev".to_string());
         args.push(old_oid);
         args.push(new_oid);
+
+        // Add pathspecs if provided
+        if let Some(paths) = pathspecs {
+            args.push("--".to_string());
+            for path in paths {
+                args.push(path.clone());
+            }
+        }
 
         let output = exec_git(&args)?;
         let deltas = parse_diff_raw(&output.stdout)?;

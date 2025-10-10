@@ -1,5 +1,6 @@
 use crate::error::GitAiError;
 use crate::git::repository::{Repository, exec_git};
+use std::collections::HashSet;
 use std::str;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,11 +55,23 @@ pub struct StatusEntry {
 
 impl Repository {
     // Run status porcelain v2 on the repository. Will fail for bare repositories.
-    pub fn status(&self) -> Result<Vec<StatusEntry>, GitAiError> {
+    pub fn status(
+        &self,
+        pathspecs: Option<&HashSet<String>>,
+    ) -> Result<Vec<StatusEntry>, GitAiError> {
         let mut args = self.global_args_for_exec();
         args.push("status".to_string());
         args.push("--porcelain=v2".to_string());
         args.push("-z".to_string());
+
+        // Add pathspecs if provided
+        if let Some(paths) = pathspecs {
+            args.push("--".to_string());
+            for path in paths {
+                args.push(path.clone());
+            }
+        }
+
         let output = exec_git(&args)?;
 
         if !output.status.success() {

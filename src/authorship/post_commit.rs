@@ -6,9 +6,8 @@ use crate::commands::checkpoint_agent::agent_preset::CursorPreset;
 use crate::error::GitAiError;
 use crate::git::refs::notes_add;
 use crate::git::repository::Repository;
-use crate::git::status::{EntryKind, StatusCode};
-use similar::{ChangeTag, TextDiff};
-use std::collections::HashMap;
+use crate::utils::{Timer, debug_log};
+use std::collections::{HashMap, HashSet};
 
 pub fn post_commit(
     repo: &Repository,
@@ -30,11 +29,22 @@ pub fn post_commit(
     timer.end("working_log_for_base_commit");
 
     // Pull all working log entries from the parent commit
+
     let parent_working_log = working_log.read_all_checkpoints()?;
+
+    debug_log(&format!(
+        "edited files: {:?}",
+        parent_working_log.edited_files
+    ));
 
     // Filter out untracked files from the working log
     timer.start("filter_untracked_files");
-    let mut filtered_working_log = filter_untracked_files(repo, &parent_working_log, &commit_sha)?;
+    let mut filtered_working_log = filter_untracked_files(
+        repo,
+        &parent_working_log.checkpoints,
+        &commit_sha,
+        Some(&parent_working_log.edited_files),
+    )?;
     timer.end("filter_untracked_files");
 
     // mutates inline
@@ -52,14 +62,20 @@ pub fn post_commit(
     // Filter the authorship log to only include committed lines
     // We need to keep ONLY lines that are in the commit, not filter out unstaged lines
     timer.start("collect_committed_hunks");
-    let committed_hunks = collect_committed_hunks(repo, &parent_sha, &commit_sha)?;
+    let committed_hunks = collect_committed_hunks(
+        repo,
+        &parent_sha,
+        &commit_sha,
+        Some(&parent_working_log.edited_files),
+    )?;
     timer.end("collect_committed_hunks");
 
     // Convert authorship log line numbers from working directory coordinates to commit coordinates
     // The working log uses working directory coordinates (which includes unstaged changes),
     // but the authorship log should store commit coordinates (line numbers as they appear in the commit tree)
     timer.start("collect_unstaged_hunks");
-    let unstaged_hunks = collect_unstaged_hunks(repo, &commit_sha)?;
+    let unstaged_hunks =
+        collect_unstaged_hunks(repo, &commit_sha, Some(&parent_working_log.edited_files))?;
     timer.end("collect_unstaged_hunks");
 
     // Convert working directory line numbers to commit line numbers
@@ -78,6 +94,7 @@ pub fn post_commit(
         let parent_working_log = repo_storage.working_log_for_base_commit(&parent_sha);
         let parent_checkpoints = parent_working_log
             .read_all_checkpoints()
+            .map(|wl| wl.checkpoints)
             .unwrap_or_default();
 
         !parent_checkpoints.is_empty() && parent_checkpoints.iter().any(|cp| cp.agent_id.is_some())
@@ -90,7 +107,9 @@ pub fn post_commit(
         .serialize_to_string()
         .map_err(|_| GitAiError::Generic("Failed to serialize authorship log".to_string()))?;
 
+    timer.start("notes_add");
     notes_add(repo, &commit_sha, &authorship_json)?;
+    timer.end("notes_add");
 
     // Only delete the working log if there are no unstaged AI-authored lines
     // If there are unstaged AI lines, filter and transfer the working log to the new commit
@@ -101,7 +120,7 @@ pub fn post_commit(
     } else {
         // Filter the working log to remove committed lines, keeping only unstaged ones
         let parent_working_log = repo_storage.working_log_for_base_commit(&parent_sha);
-        let parent_checkpoints = parent_working_log.read_all_checkpoints()?;
+        let parent_checkpoints = parent_working_log.read_all_checkpoints()?.checkpoints;
 
         let new_working_log = repo_storage.working_log_for_base_commit(&commit_sha);
 
@@ -162,45 +181,26 @@ fn filter_untracked_files(
     repo: &Repository,
     working_log: &[Checkpoint],
     commit_sha: &str,
+    pathspecs: Option<&HashSet<String>>,
 ) -> Result<Vec<Checkpoint>, GitAiError> {
-    // Get the current commit tree to see which files are currently tracked
-    let current_commit = repo.find_commit(commit_sha.to_string())?;
-    let current_tree = current_commit.tree()?;
+    // Get all files changed in current commit in ONE git command (scoped to pathspecs)
+    // If a file from the working log is in this set, it was committed. Otherwise, it was untracked.
+    let committed_files = repo.list_commit_files(commit_sha, pathspecs)?;
 
-    // Get the parent commit tree to see which files were tracked before
-    let parent_tree = if let Ok(parent) = current_commit.parent(0) {
-        parent.tree()?
-    } else {
-        // No parent commit, so all files in current tree are new
-        current_tree.clone()
-    };
-
-    // Filter the working log
+    // Filter the working log to only include files that were actually committed
     let mut filtered_checkpoints = Vec::new();
 
     for checkpoint in working_log {
         let mut filtered_entries = Vec::new();
 
         for entry in &checkpoint.entries {
-            // Check if this file is currently tracked in the current commit
-            let is_currently_tracked = current_tree
-                .get_path(std::path::Path::new(&entry.file))
-                .is_ok();
-
-            // Check if this file was tracked in the parent commit
-            let was_previously_tracked = parent_tree
-                .get_path(std::path::Path::new(&entry.file))
-                .is_ok();
-
-            // Include the entry if:
-            // 1. The file is currently tracked, OR
-            // 2. The file is new (not in parent) but has working log entries
-            if is_currently_tracked || !was_previously_tracked {
+            // Keep entry only if this file was in the commit
+            if committed_files.contains(&entry.file) {
                 filtered_entries.push(entry.clone());
             }
         }
 
-        // Only include checkpoints that have at least one tracked file entry
+        // Only include checkpoints that have at least one committed file entry
         if !filtered_entries.is_empty() {
             let mut filtered_checkpoint = checkpoint.clone();
             filtered_checkpoint.entries = filtered_entries;
@@ -219,168 +219,31 @@ fn collect_committed_hunks(
     repo: &Repository,
     parent_sha: &str,
     commit_sha: &str,
+    pathspecs: Option<&HashSet<String>>,
 ) -> Result<HashMap<String, Vec<LineRange>>, GitAiError> {
     let mut committed_hunks: HashMap<String, Vec<LineRange>> = HashMap::new();
 
     // Handle initial commit (no parent)
     if parent_sha == "initial" {
-        // For initial commit, all lines in all files are "committed"
-        // We can just get all files from the status
-        let current_commit = repo.find_commit(commit_sha.to_string())?;
-        let current_tree = current_commit.tree()?;
+        // For initial commit, use git diff against the empty tree
+        let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"; // Git's empty tree hash
+        let added_lines = repo.diff_added_lines(empty_tree, commit_sha, pathspecs)?;
 
-        // Use workdir to list files
-        if let Ok(workdir) = repo.workdir() {
-            use std::fs;
-            fn visit_dirs(
-                dir: &std::path::Path,
-                repo_root: &std::path::Path,
-                files: &mut Vec<String>,
-            ) -> std::io::Result<()> {
-                if dir.is_dir() {
-                    for entry in fs::read_dir(dir)? {
-                        let entry = entry?;
-                        let path = entry.path();
-                        // Skip .git directory
-                        if path.file_name().and_then(|s| s.to_str()) == Some(".git") {
-                            continue;
-                        }
-                        if path.is_dir() {
-                            visit_dirs(&path, repo_root, files)?;
-                        } else if path.is_file() {
-                            if let Ok(rel_path) = path.strip_prefix(repo_root) {
-                                files.push(rel_path.to_string_lossy().to_string());
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-
-            let mut files = Vec::new();
-            visit_dirs(&workdir, &workdir, &mut files)?;
-
-            for file_path in files {
-                if let Ok(entry) = current_tree.get_path(std::path::Path::new(&file_path)) {
-                    if let Ok(blob) = repo.find_blob(entry.id()) {
-                        let content = blob.content()?;
-                        let content_str = String::from_utf8_lossy(&content);
-                        let line_count = content_str.lines().count() as u32;
-                        if line_count > 0 {
-                            let lines: Vec<u32> = (1..=line_count).collect();
-                            committed_hunks.insert(file_path, LineRange::compress_lines(&lines));
-                        }
-                    }
-                }
+        for (file_path, lines) in added_lines {
+            if !lines.is_empty() {
+                committed_hunks.insert(file_path, LineRange::compress_lines(&lines));
             }
         }
 
         return Ok(committed_hunks);
     }
 
-    let parent_commit = repo.find_commit(parent_sha.to_string())?;
-    let parent_tree = parent_commit.tree()?;
+    // Use git diff to get added lines directly
+    let added_lines = repo.diff_added_lines(parent_sha, commit_sha, pathspecs)?;
 
-    let current_commit = repo.find_commit(commit_sha.to_string())?;
-    let current_tree = current_commit.tree()?;
-
-    // Get diff between parent and current commit
-    let diff = repo.diff_tree_to_tree(Some(&parent_tree), Some(&current_tree), None)?;
-
-    for delta in diff.deltas() {
-        let file_path = delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-            .ok_or_else(|| GitAiError::Generic("File path not available".to_string()))?;
-        let file_path = file_path.to_string_lossy().to_string();
-
-        // Get content from both commits
-        let parent_content = match parent_tree.get_path(std::path::Path::new(&file_path)) {
-            Ok(tree_entry) => {
-                if let Ok(blob) = repo.find_blob(tree_entry.id()) {
-                    let blob_content = blob.content()?;
-                    String::from_utf8_lossy(&blob_content).to_string()
-                } else {
-                    String::new()
-                }
-            }
-            Err(_) => String::new(),
-        };
-
-        let current_content = match current_tree.get_path(std::path::Path::new(&file_path)) {
-            Ok(tree_entry) => {
-                if let Ok(blob) = repo.find_blob(tree_entry.id()) {
-                    let blob_content = blob.content()?;
-                    String::from_utf8_lossy(&blob_content).to_string()
-                } else {
-                    String::new()
-                }
-            }
-            Err(_) => String::new(),
-        };
-
-        if parent_content == current_content {
-            continue; // No changes in this file
-        }
-
-        // Normalize line endings
-        let parent_norm = if parent_content.ends_with('\n') {
-            parent_content.clone()
-        } else if !parent_content.is_empty() {
-            format!("{}\n", parent_content)
-        } else {
-            parent_content.clone()
-        };
-        let current_norm = if current_content.ends_with('\n') {
-            current_content.clone()
-        } else if !current_content.is_empty() {
-            format!("{}\n", current_content)
-        } else {
-            current_content.clone()
-        };
-
-        let diff = TextDiff::from_lines(&parent_norm, &current_norm);
-        let mut modified_lines = Vec::new();
-        let mut current_line = 1u32;
-
-        for change in diff.iter_all_changes() {
-            match change.tag() {
-                ChangeTag::Equal => {
-                    // Use the number of lines in the change, accounting for whether it ends with newline
-                    let line_count = if change.value().is_empty() {
-                        0
-                    } else if change.value().ends_with('\n') {
-                        change.value().matches('\n').count() as u32
-                    } else {
-                        change.value().matches('\n').count() as u32 + 1
-                    };
-                    current_line += line_count;
-                }
-                ChangeTag::Delete => {
-                    // Deletions don't add lines to the current commit
-                }
-                ChangeTag::Insert => {
-                    let insert_start = current_line;
-                    let line_count = if change.value().is_empty() {
-                        0
-                    } else if change.value().ends_with('\n') {
-                        change.value().matches('\n').count() as u32
-                    } else {
-                        change.value().matches('\n').count() as u32 + 1
-                    };
-                    for i in 0..line_count {
-                        modified_lines.push(insert_start + i);
-                    }
-                    current_line += line_count;
-                }
-            }
-        }
-
-        if !modified_lines.is_empty() {
-            modified_lines.sort_unstable();
-            let line_ranges = LineRange::compress_lines(&modified_lines);
-            committed_hunks.insert(file_path.clone(), line_ranges);
+    for (file_path, lines) in added_lines {
+        if !lines.is_empty() {
+            committed_hunks.insert(file_path, LineRange::compress_lines(&lines));
         }
     }
 
@@ -395,85 +258,16 @@ fn collect_committed_hunks(
 fn collect_unstaged_hunks(
     repo: &Repository,
     commit_sha: &str,
+    pathspecs: Option<&HashSet<String>>,
 ) -> Result<HashMap<String, Vec<LineRange>>, GitAiError> {
     let mut unstaged_hunks: HashMap<String, Vec<LineRange>> = HashMap::new();
 
-    // Get all files with unstaged changes
-    let statuses = repo.status()?;
+    // Use git diff to get added lines in working directory vs commit
+    let added_lines = repo.diff_workdir_added_lines(commit_sha, pathspecs)?;
 
-    // Get the HEAD commit tree (what was just committed)
-    let head_commit = repo.find_commit(commit_sha.to_string())?;
-    let head_tree = head_commit.tree()?;
-
-    let repo_workdir = repo.workdir()?;
-
-    for entry in &statuses {
-        // Skip files without unstaged changes
-        if entry.unstaged == StatusCode::Unmodified || entry.kind == EntryKind::Ignored {
-            continue;
-        }
-
-        let file_path = &entry.path;
-        let abs_path = repo_workdir.join(file_path);
-
-        // Get content from HEAD (what was just committed)
-        let head_content = match head_tree.get_path(std::path::Path::new(file_path)) {
-            Ok(tree_entry) => {
-                if let Ok(blob) = repo.find_blob(tree_entry.id()) {
-                    let blob_content = blob.content()?;
-                    String::from_utf8_lossy(&blob_content).to_string()
-                } else {
-                    String::new()
-                }
-            }
-            Err(_) => String::new(), // File not in HEAD (untracked/new file)
-        };
-
-        // Get content from working directory
-        let working_content = std::fs::read_to_string(&abs_path).unwrap_or_else(|_| String::new());
-
-        // Normalize trailing newlines
-        let head_norm = if head_content.ends_with('\n') {
-            head_content.clone()
-        } else {
-            format!("{}\n", head_content)
-        };
-        let working_norm = if working_content.ends_with('\n') {
-            working_content.clone()
-        } else {
-            format!("{}\n", working_content)
-        };
-
-        // Diff HEAD (committed content) against working directory to find unstaged changes
-        let diff = TextDiff::from_lines(&head_norm, &working_norm);
-        let mut modified_lines = Vec::new();
-        let mut current_line = 1u32;
-
-        for change in diff.iter_all_changes() {
-            match change.tag() {
-                ChangeTag::Equal => {
-                    current_line += change.value().lines().count() as u32;
-                }
-                ChangeTag::Delete => {
-                    // Deletions don't add lines to the working directory
-                }
-                ChangeTag::Insert => {
-                    // These are the lines that exist in the working directory but not in HEAD
-                    let insert_start = current_line;
-                    let insert_count = change.value().lines().count() as u32;
-                    for i in 0..insert_count {
-                        modified_lines.push(insert_start + i);
-                    }
-                    current_line += insert_count;
-                }
-            }
-        }
-
-        // Convert line numbers to LineRange format
-        if !modified_lines.is_empty() {
-            modified_lines.sort_unstable();
-            let line_ranges = LineRange::compress_lines(&modified_lines);
-            unstaged_hunks.insert(file_path.clone(), line_ranges);
+    for (file_path, lines) in added_lines {
+        if !lines.is_empty() {
+            unstaged_hunks.insert(file_path, LineRange::compress_lines(&lines));
         }
     }
 
