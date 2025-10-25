@@ -927,7 +927,8 @@ pub fn attributions_to_line_attributions(
     let mut line_authors: Vec<Option<(String, bool)>> = Vec::with_capacity(line_count as usize);
 
     for line_num in 1..=line_count {
-        let (author, overridden) = find_dominant_author_for_line(line_num, &boundaries, attributions, content);
+        let (author, overridden) =
+            find_dominant_author_for_line(line_num, &boundaries, attributions, content);
         line_authors.push(Some((author, overridden)));
     }
 
@@ -979,23 +980,25 @@ fn find_dominant_author_for_line(
         .collect::<Vec<String>>();
     let last_ai_edit_ts = candidate_attrs
         .iter()
-        .filter(|a | a.author_id != CheckpointKind::Human.to_str())
+        .filter(|a| a.author_id != CheckpointKind::Human.to_str())
         .map(|a| a.ts)
         .last();
     let last_human_edit_ts = candidate_attrs
         .iter()
-        .filter(|a | a.author_id == CheckpointKind::Human.to_str())
+        .filter(|a| a.author_id == CheckpointKind::Human.to_str())
         .map(|a| a.ts)
         .last();
-    let overridden = match(last_ai_edit_ts, last_human_edit_ts) {
+    let overridden = match (last_ai_edit_ts, last_human_edit_ts) {
         (Some(ai_ts), Some(h_ts)) => h_ts > ai_ts,
-        _ => false
+        _ => false,
     };
     return (latest_author[0].clone(), overridden);
 }
 
 /// Merge consecutive lines with the same author into LineAttribution ranges
-fn merge_consecutive_line_attributions(line_authorship: Vec<Option<(String, bool)>>) -> Vec<LineAttribution> {
+fn merge_consecutive_line_attributions(
+    line_authorship: Vec<Option<(String, bool)>>,
+) -> Vec<LineAttribution> {
     let mut result = Vec::new();
     let line_count = line_authorship.len();
 
@@ -1017,7 +1020,12 @@ fn merge_consecutive_line_attributions(line_authorship: Vec<Option<(String, bool
             (Some(_), None) => {
                 // End current attribution
                 if let Some(authorship) = current_authorship.take() {
-                    result.push(LineAttribution::new(current_start, line_num - 1, authorship.0, authorship.1));
+                    result.push(LineAttribution::new(
+                        current_start,
+                        line_num - 1,
+                        authorship.0,
+                        authorship.1,
+                    ));
                 }
             }
             (Some(curr), Some(new_authorship)) => {
@@ -1029,7 +1037,7 @@ fn merge_consecutive_line_attributions(line_authorship: Vec<Option<(String, bool
                         current_start,
                         line_num - 1,
                         curr.0.clone(),
-                        curr.1.clone()
+                        curr.1.clone(),
                     ));
                     current_authorship = Some(new_authorship);
                     current_start = line_num;

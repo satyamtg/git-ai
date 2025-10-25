@@ -907,6 +907,13 @@ fn reconstruct_authorship_from_diff(
     let deltas: Vec<_> = diff.deltas().collect();
     debug_log(&format!("Diff has {} deltas", deltas.len()));
 
+    // Create blame cache to avoid running git blame multiple times per file
+    // OPTIMIZATION: Instead of running "git blame file.rs -L 42,42" for each inserted line,
+    // we run "git blame file.rs" ONCE per file and cache all hunks. This reduces subprocess
+    // calls from O(total_inserted_lines) to O(changed_files), a ~100x improvement.
+    // Key: file_path, Value: Vec<BlameHunk> for entire file
+    let mut blame_cache: HashMap<String, Vec<crate::commands::blame::BlameHunk>> = HashMap::new();
+
     // Iterate through each file in the diff
     for delta in deltas {
         let old_file_path = delta.old_file().path();
@@ -1019,6 +1026,7 @@ fn reconstruct_authorship_from_diff(
                                 hanging_commit_sha,
                                 authorship_log_cache,
                                 foreign_prompts_cache,
+                                &mut blame_cache,
                             );
 
                             // Handle blame errors gracefully (e.g., file doesn't exist in hanging commit)
@@ -1198,6 +1206,7 @@ fn run_blame_in_context(
         String,
         Option<crate::authorship::authorship_log::PromptRecord>,
     >,
+    blame_cache: &mut HashMap<String, Vec<crate::commands::blame::BlameHunk>>,
 ) -> Result<
     Option<(
         crate::authorship::authorship_log::Author,
@@ -1205,26 +1214,31 @@ fn run_blame_in_context(
     )>,
     GitAiError,
 > {
-    // println!(
-    //     "Running blame in context for line {} in file {}",
-    //     line_number, file_path
-    // );
+    // Get or compute blame for entire file (cached)
+    let blame_hunks = blame_cache.entry(file_path.to_string()).or_insert_with(|| {
+        // Find the hanging commit
+        let hanging_commit = match repo.find_commit(hanging_commit_sha.to_string()) {
+            Ok(commit) => commit,
+            Err(_) => return Vec::new(),
+        };
 
-    // Find the hanging commit
-    let hanging_commit = repo.find_commit(hanging_commit_sha.to_string())?;
+        // Create blame options for the entire file
+        let mut blame_opts = GitAiBlameOptions::default();
+        blame_opts.newest_commit = Some(hanging_commit.id().to_string());
 
-    // Create blame options for the specific line
-    let mut blame_opts = GitAiBlameOptions::default();
-    blame_opts.newest_commit = Some(hanging_commit.id().to_string()); // Set the hanging commit as the newest commit for blame
+        // Run blame on the ENTIRE file in the context of the hanging commit
+        match repo.blame_hunks(file_path, 1, u32::MAX, &blame_opts) {
+            Ok(hunks) => hunks,
+            Err(_) => Vec::new(),
+        }
+    });
 
-    // Run blame on the file in the context of the hanging commit
-    let blame = repo.blame_hunks(file_path, line_number, line_number, &blame_opts)?;
+    // Find the hunk that contains the requested line number
+    let hunk = blame_hunks
+        .iter()
+        .find(|h| line_number >= h.range.0 && line_number <= h.range.1);
 
-    if blame.len() > 0 {
-        let hunk = blame
-            .get(0)
-            .ok_or_else(|| GitAiError::Generic("Failed to get blame hunk".to_string()))?;
-
+    if let Some(hunk) = hunk {
         let commit_sha = &hunk.commit_sha;
 
         // Look up the AI authorship log for this commit using the cache
