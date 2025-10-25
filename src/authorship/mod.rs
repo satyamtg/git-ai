@@ -8,4 +8,5 @@ pub mod range_authorship;
 pub mod rebase_authorship;
 pub mod stats;
 pub mod transcript;
+pub mod virtual_attribution;
 pub mod working_log;
