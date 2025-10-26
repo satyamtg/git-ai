@@ -36,10 +36,11 @@ impl VirtualAttributions {
             .as_millis();
 
         // Load prompts from base commit's authorship log
-        let prompts = match crate::git::refs::get_reference_as_authorship_log_v3(&repo, &base_commit) {
-            Ok(log) => log.metadata.prompts,
-            Err(_) => BTreeMap::new(),
-        };
+        let prompts =
+            match crate::git::refs::get_reference_as_authorship_log_v3(&repo, &base_commit) {
+                Ok(log) => log.metadata.prompts,
+                Err(_) => BTreeMap::new(),
+            };
 
         let mut virtual_attrs = VirtualAttributions {
             repo,
@@ -428,7 +429,7 @@ impl VirtualAttributions {
             ts,
         }
     }
-    
+
     pub fn from_raw_data_with_prompts(
         repo: Repository,
         base_commit: String,
@@ -559,7 +560,9 @@ pub fn merge_attributions_favoring_first(
     // Merge prompts from both VAs
     let mut merged_prompts = primary.prompts.clone();
     for (key, value) in &secondary.prompts {
-        merged_prompts.entry(key.clone()).or_insert_with(|| value.clone());
+        merged_prompts
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
     }
 
     let mut merged = VirtualAttributions {
