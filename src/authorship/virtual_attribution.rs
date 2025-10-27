@@ -77,31 +77,76 @@ impl VirtualAttributions {
             return Ok(());
         }
 
-        // Load prompts from blamed commits by searching through history
-        for missing_id in missing_ids {
-            // Try to find this prompt in the commit history by running git log
-            // and checking authorship logs
-            if let Ok(prompt) = self.find_prompt_in_history(&missing_id) {
-                self.prompts.insert(missing_id.clone(), prompt);
-            }
+        // Load prompts in parallel using the established MAX_CONCURRENT pattern
+        let prompts = smol::block_on(async { self.load_prompts_concurrent(&missing_ids).await })?;
+
+        // Insert loaded prompts into our map
+        for (id, prompt) in prompts {
+            self.prompts.insert(id, prompt);
         }
 
         Ok(())
     }
 
-    /// Find a prompt record in the commit history by searching authorship logs
-    fn find_prompt_in_history(
+    /// Load multiple prompts concurrently using MAX_CONCURRENT limit
+    async fn load_prompts_concurrent(
         &self,
+        missing_ids: &[String],
+    ) -> Result<Vec<(String, PromptRecord)>, GitAiError> {
+        const MAX_CONCURRENT: usize = 30;
+
+        let semaphore = Arc::new(smol::lock::Semaphore::new(MAX_CONCURRENT));
+        let mut tasks = Vec::new();
+
+        for missing_id in missing_ids {
+            let missing_id = missing_id.clone();
+            let repo = self.repo.clone();
+            let semaphore = Arc::clone(&semaphore);
+
+            let task = smol::spawn(async move {
+                // Acquire semaphore permit to limit concurrency
+                let _permit = semaphore.acquire().await;
+
+                // Wrap blocking git operations in smol::unblock
+                smol::unblock(move || {
+                    Self::find_prompt_in_history_static(&repo, &missing_id)
+                        .map(|prompt| (missing_id.clone(), prompt))
+                })
+                .await
+            });
+
+            tasks.push(task);
+        }
+
+        // Await all tasks concurrently
+        let results = futures::future::join_all(tasks).await;
+
+        // Process results and collect successful prompts
+        let mut prompts = Vec::new();
+        for result in results {
+            match result {
+                Ok((id, prompt)) => prompts.push((id, prompt)),
+                Err(_) => {
+                    // Error finding prompt, skip it
+                }
+            }
+        }
+
+        Ok(prompts)
+    }
+
+    /// Static version of find_prompt_in_history for use in async context
+    fn find_prompt_in_history_static(
+        repo: &Repository,
         prompt_id: &str,
     ) -> Result<crate::authorship::authorship_log::PromptRecord, GitAiError> {
         // Use git grep to search for the prompt ID in authorship notes
-        let shas = crate::git::refs::grep_ai_notes(&self.repo, &format!("\"{}\"", prompt_id))
+        let shas = crate::git::refs::grep_ai_notes(&repo, &format!("\"{}\"", prompt_id))
             .unwrap_or_default();
 
         // Check the most recent commit with this prompt ID
         if let Some(latest_sha) = shas.first() {
-            if let Ok(log) =
-                crate::git::refs::get_reference_as_authorship_log_v3(&self.repo, latest_sha)
+            if let Ok(log) = crate::git::refs::get_reference_as_authorship_log_v3(&repo, latest_sha)
             {
                 if let Some(prompt) = log.metadata.prompts.get(prompt_id) {
                     return Ok(prompt.clone());
@@ -982,6 +1027,7 @@ fn get_file_content_at_commit(
     }
 }
 
+#[cfg(test)]
 mod tests {
 
     use super::*;
