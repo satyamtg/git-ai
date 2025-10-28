@@ -1692,3 +1692,14 @@ fn parse_hunk_header(line: &str) -> Option<Vec<u32>> {
     let lines: Vec<u32> = (start..start + count).collect();
     Some(lines)
 }
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_example() {
+        let repo = find_repository_in_path(".").unwrap();
+        let answer = repo.commit_range_on_branch("fix/commit-single").unwrap();
+        println!("answer: {:?}", answer);
+    }
+}
