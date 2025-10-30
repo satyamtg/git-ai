@@ -51,16 +51,26 @@ pub fn post_commit(
     // We need to keep ONLY lines that are in the commit, not filter out unstaged lines
     let committed_hunks = collect_committed_hunks(repo, &parent_sha, &commit_sha, None)?;
 
+    println!("committed_hunks: {:?}", committed_hunks);
+
     // Convert authorship log line numbers from working directory coordinates to commit coordinates
     // The working log uses working directory coordinates (which includes unstaged changes),
     // but the authorship log should store commit coordinates (line numbers as they appear in the commit tree)
     let unstaged_hunks = collect_unstaged_hunks(repo, &commit_sha, None)?;
 
+    println!("unstaged_hunks: {:?}", unstaged_hunks);
+
+    println!("authorship_log (before conversion to commit coordinates): {:?}", authorship_log.serialize_to_string().unwrap());
+
     // Convert working directory line numbers to commit line numbers
     convert_authorship_log_to_commit_coordinates(&mut authorship_log, &unstaged_hunks);
 
+    println!("authorship_log (before filter to committed lines): {:?}", authorship_log.serialize_to_string().unwrap());
+
     // Now filter to only include committed lines
     authorship_log.filter_to_committed_lines(&committed_hunks);
+
+    println!("authorship_log (after filter to committed lines): {:?}", authorship_log.serialize_to_string().unwrap());
 
     // Check if there are unstaged AI-authored lines to preserve in working log
     let has_unstaged_ai_lines = if !unstaged_hunks.is_empty() {
