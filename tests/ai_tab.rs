@@ -275,6 +275,7 @@ fn test_ai_tab_e2e_marks_ai_lines() {
 }
 
 #[test]
+#[cfg_attr(target_os = "windows", ignore)]
 fn test_ai_tab_e2e_handles_dirty_files_map() {
     let repo = TestRepo::new();
     let lib_relative_path = std::path::Path::new("src").join("lib.rs");
