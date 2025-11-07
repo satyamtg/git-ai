@@ -439,6 +439,10 @@ fn get_checkpoint_entry_for_file(
 ) -> Result<Option<WorkingLogEntry>, GitAiError> {
     let abs_path = working_log.repo_root.join(&file_path);
     let current_content = std::fs::read_to_string(&abs_path).unwrap_or_else(|_| String::new());
+    
+    println!("\n========== CHECKPOINT DEBUG: {} ==========", file_path);
+    println!("Checkpoint Kind: {:?}", kind);
+    println!("Author ID: {}", author_id.as_ref());
 
     // Try to get previous state from checkpoints first
     let from_checkpoint = previous_checkpoints.iter().rev().find_map(|checkpoint| {
@@ -465,9 +469,11 @@ fn get_checkpoint_entry_for_file(
     let is_from_checkpoint = from_checkpoint.is_some();
     let (previous_content, prev_attributions) = if let Some((content, attrs)) = from_checkpoint {
         // File exists in a previous checkpoint - use that
+        println!("Source: Previous checkpoint");
         (content, attrs)
     } else {
         // File doesn't exist in any previous checkpoint - need to initialize from git + INITIAL
+        println!("Source: Git HEAD + INITIAL attributions");
 
         // Get previous content from HEAD tree
         let previous_content = if let Some(tree_id) = head_tree_id.as_ref().as_ref() {
@@ -586,8 +592,17 @@ fn get_checkpoint_entry_for_file(
     // Skip if no changes (but we already checked this earlier, accounting for INITIAL attributions)
     // For files from previous checkpoints, check if content has changed
     if is_from_checkpoint && current_content == previous_content {
+        println!("No changes detected - skipping");
         return Ok(None);
     }
+
+    println!("\n--- PREVIOUS CONTENT (blob/checkpoint) ---");
+    println!("{}", previous_content);
+    println!("\n--- CURRENT CONTENT (filesystem) ---");
+    println!("{}", current_content);
+    println!("\n--- PREVIOUS ATTRIBUTIONS ---");
+    println!("{:?}", prev_attributions);
+    println!("==========================================\n");
 
     let entry = make_entry_for_file(
         &file_path,
@@ -728,6 +743,8 @@ fn make_entry_for_file(
     content: &str,
     ts: u128,
 ) -> Result<WorkingLogEntry, GitAiError> {
+    println!(">>> make_entry_for_file: {} (author: {})", file_path, author_id);
+    
     let tracker = AttributionTracker::new();
     let filled_in_prev_attributions = tracker.attribute_unattributed_ranges(
         previous_content,
@@ -735,6 +752,9 @@ fn make_entry_for_file(
         &CheckpointKind::Human.to_str(),
         ts - 1,
     );
+    
+    println!(">>> Filled in previous attributions: {:?}", filled_in_prev_attributions);
+    
     let new_attributions = tracker.update_attributions(
         previous_content,
         content,
@@ -742,6 +762,9 @@ fn make_entry_for_file(
         author_id,
         ts,
     )?;
+    
+    println!(">>> New attributions after update: {:?}", new_attributions);
+    
     // TODO Consider discarding any "uncontentious" attributions for the human author. Any human attributions that do not share a line with any other author's attributions can be discarded.
     // let filtered_attributions = crate::authorship::attribution_tracker::discard_uncontentious_attributions_for_author(&new_attributions, &CheckpointKind::Human.to_str());
     let line_attributions =
@@ -749,6 +772,9 @@ fn make_entry_for_file(
             &new_attributions,
             content,
         );
+    
+    println!(">>> Line attributions: {:?}", line_attributions);
+    
     Ok(WorkingLogEntry::new(
         file_path.to_string(),
         blob_sha.to_string(),

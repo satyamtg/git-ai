@@ -588,7 +588,10 @@ fn test_ai_deletion_with_human_checkpoint_in_same_commit() {
     let repo = TestRepo::new();
     let file_path = repo.path().join("data.txt");
 
-    // COMMIT 1: AI creates initial content with base lines + AI lines
+    fs::write(&file_path, "Base Line 1\nBase Line 2\nBase Line 3").unwrap();
+
+    repo.git_ai(&["checkpoint"]).unwrap();
+
     fs::write(
         &file_path,
         "Base Line 1\nBase Line 2\nAI: Line 1\nAI: Line 2\nAI: Line 3\nBase Line 3",
@@ -602,6 +605,7 @@ fn test_ai_deletion_with_human_checkpoint_in_same_commit() {
         .unwrap();
 
     // COMMIT 2: Human adds 2 lines, then AI modifies
+    // -------
     // Step 1: Human adds lines
     fs::write(
         &file_path,
@@ -620,11 +624,19 @@ fn test_ai_deletion_with_human_checkpoint_in_same_commit() {
     .unwrap();
 
     // AI checkpoint
-    repo.git_ai(&["checkpoint", "mock_ai", "data.txt"]).unwrap();
+    println!(
+        "checkpoint: {:?}",
+        repo.git_ai(&["checkpoint", "mock_ai", "data.txt"]).unwrap()
+    );
 
     // Now commit everything together
-    repo.stage_all_and_commit("Commit 2: Human adds 2, AI deletes 1 and adds 2")
+    let commit = repo
+        .stage_all_and_commit("Commit 2: Human adds 2, AI deletes 1 and adds 2")
         .unwrap();
+
+    commit.print_authorship();
+
+    println!("file: {:?}", repo.git_ai(&["blame", "data.txt"]).unwrap());
 
     // Verify line-by-line attribution
     let mut file = repo.filename("data.txt");
