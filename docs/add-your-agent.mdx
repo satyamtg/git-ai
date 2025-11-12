@@ -65,7 +65,7 @@ Now you just need to get your agent to call `git-ai checkpoint` the same way to 
 
 ## Using the `agent-v1` preset
 
-Git AI checkpoint has versioned presets designed for generic agent integrations. The `agent-v1` preset shape is strictly enforced and expected to be passed via stdin.
+Git AI checkpoint has versioned presets designed for generic agent integrations. The `agent-v1` preset shape is strictly enforced and expected to be passed via stdin. 
 
 Right before your agent edits a file use the `agent-v1` preset to mark any changes since the last AI insertion as human: 
 
@@ -135,6 +135,8 @@ echo '{
 That's it. Get your agent calling `git-ai checkpoint` with the `agent-v1` preset and we take care of the rest. 
 
 If you need something more advanced you might want to build your own preset (see the [Advanced - Hooks and Presets](#advanced---hooks-and-custom-presets) section below). 
+
+Here is the [full schema for both message types, defined in code](https://github.com/acunniffe/git-ai/blob/c5dfc2114bd4aaa5494e69a041cf16441a196665/src/commands/checkpoint_agent/agent_v1_preset.rs#L15). 
 
 
 ## Checklist for opening a PR for Hooks + Preset Integration 
