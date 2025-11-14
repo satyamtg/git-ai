@@ -533,8 +533,8 @@ mod tests {
     #[test]
     fn test_simulate_post_commit() {
         let repository = find_repository_in_path(".").unwrap();
-        let working_log_base_sha = "6e777f80da481bd9ee7570b5a014982719fc0e89";
-        let commit_sha = "1234567890";
+        let working_log_base_sha = "d32919c9e60932d7dae41ce1ae54a0bfa63d325d";
+        let commit_sha = "1234d32919c9e60932d7dae41ce1ae54a0bfa63d325d567890";
 
         let stats = simulate_post_commit(&repository, working_log_base_sha, commit_sha).unwrap();
         println!("stats: {:?}", stats);
