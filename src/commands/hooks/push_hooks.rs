@@ -1,14 +1,10 @@
-use crate::commands::git_handlers::CommandHooksContext;
 use crate::commands::upgrade;
 use crate::git::cli_parser::{ParsedGitInvocation, is_dry_run};
-use crate::git::repository::{Repository, find_repository};
-use crate::git::sync_authorship::{fetch_authorship_notes, push_authorship_notes};
+use crate::git::repository::Repository;
+use crate::git::sync_authorship::fetch_authorship_notes;
 use crate::utils::debug_log;
 
-pub fn push_pre_command_hook(
-    parsed_args: &ParsedGitInvocation,
-    repository: &Repository,
-) -> Option<std::thread::JoinHandle<()>> {
+pub fn push_pre_command_hook(parsed_args: &ParsedGitInvocation, repository: &Repository) {
     upgrade::maybe_schedule_background_update_check();
 
     // Early returns for cases where we shouldn't push authorship notes
@@ -19,7 +15,7 @@ pub fn push_pre_command_hook(
             .any(|a| a == "-d" || a == "--delete")
         || parsed_args.command_args.iter().any(|a| a == "--mirror")
     {
-        return None;
+        return;
     }
 
     let remotes = repository.remotes().ok();
@@ -52,8 +48,6 @@ pub fn push_pre_command_hook(
             "started pushing authorship notes to remote: {}",
             remote
         ));
-        // Clone what we need for the background thread
-        let global_args = repository.global_args_for_exec();
 
         crate::observability::spawn_background_flush();
 
@@ -72,26 +66,9 @@ pub fn push_pre_command_hook(
         if let Err(e) = fetch_authorship_notes(&repository, &remote) {
             debug_log(&format!("authorship fetch and merge failed: {}", e));
         }
-
-        None
     } else {
         // No remotes configured; skip silently
         debug_log("no remotes found for authorship push; skipping");
-        None
-    }
-}
-
-pub fn push_post_command_hook(
-    _repository: &Repository,
-    _parsed_args: &ParsedGitInvocation,
-    _exit_status: std::process::ExitStatus,
-    command_hooks_context: &mut CommandHooksContext,
-) {
-    // Always wait for the authorship push thread to complete if it was started,
-    // regardless of whether the main push succeeded or failed.
-    // This ensures proper cleanup of the background thread.
-    if let Some(handle) = command_hooks_context.push_authorship_handle.take() {
-        let _ = handle.join();
     }
 }
 
