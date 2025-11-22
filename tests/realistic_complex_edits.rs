@@ -1208,3 +1208,428 @@ CREATE INDEX idx_posts_user_id ON posts(user_id);",
         "CREATE INDEX idx_posts_user_id ON posts(user_id);".ai(),
     ]);
 }
+
+#[test]
+fn test_realistic_refactoring_with_deletions() {
+    // Test removing deprecated code - AI removes old API, human cleans up more
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("api.rs");
+
+    // Human creates initial API with old and new versions
+    fs::write(
+        &file_path,
+        "// Legacy API - deprecated
+pub fn process_data_v1(data: &str) -> String {
+    data.to_uppercase()
+}
+
+pub fn process_data_v1_with_trim(data: &str) -> String {
+    data.trim().to_uppercase()
+}
+
+// New API
+pub fn process_data(data: &str) -> Result<String, String> {
+    if data.is_empty() {
+        return Err(\"Empty data\".to_string());
+    }
+    Ok(data.trim().to_uppercase())
+}
+
+// Helper function
+pub fn validate_input(data: &str) -> bool {
+    !data.is_empty()
+}",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint"]).unwrap();
+    repo.stage_all_and_commit("Initial API with legacy functions")
+        .unwrap();
+
+    // AI removes deprecated v1 functions
+    fs::write(
+        &file_path,
+        "// New API
+pub fn process_data(data: &str) -> Result<String, String> {
+    if data.is_empty() {
+        return Err(\"Empty data\".to_string());
+    }
+    Ok(data.trim().to_uppercase())
+}
+
+// Helper function
+pub fn validate_input(data: &str) -> bool {
+    !data.is_empty()
+}",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint", "mock_ai", "api.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("AI removes deprecated v1 functions")
+        .unwrap();
+
+    // Human adds new function and improves validation
+    fs::write(
+        &file_path,
+        "// New API
+pub fn process_data(data: &str) -> Result<String, String> {
+    if data.is_empty() {
+        return Err(\"Empty data\".to_string());
+    }
+    Ok(data.trim().to_uppercase())
+}
+
+pub fn process_batch(items: &[&str]) -> Vec<Result<String, String>> {
+    items.iter().map(|item| process_data(item)).collect()
+}
+
+// Helper function
+pub fn validate_input(data: &str) -> bool {
+    !data.trim().is_empty()
+}",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint"]).unwrap();
+    repo.stage_all_and_commit("Human adds batch processing and improves validation")
+        .unwrap();
+
+    // AI removes comment and adds error type
+    fs::write(
+        &file_path,
+        "pub type ProcessError = String;
+
+pub fn process_data(data: &str) -> Result<String, ProcessError> {
+    if data.is_empty() {
+        return Err(\"Empty data\".to_string());
+    }
+    Ok(data.trim().to_uppercase())
+}
+
+pub fn process_batch(items: &[&str]) -> Vec<Result<String, ProcessError>> {
+    items.iter().map(|item| process_data(item)).collect()
+}
+
+pub fn validate_input(data: &str) -> bool {
+    !data.trim().is_empty()
+}",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint", "mock_ai", "api.rs"])
+        .unwrap();
+    repo.stage_all_and_commit("AI adds error type alias")
+        .unwrap();
+
+    // Verify attribution after deletions
+    let mut file = repo.filename("api.rs");
+    file.assert_lines_and_blame(lines![
+        "pub type ProcessError = String;".ai(),
+        "".ai(),
+        "pub fn process_data(data: &str) -> Result<String, ProcessError> {".ai(),
+        "    if data.is_empty() {".human(),
+        "        return Err(\"Empty data\".to_string());".human(),
+        "    }".human(),
+        "    Ok(data.trim().to_uppercase())".human(),
+        "}".human(),
+        "".human(),
+        "pub fn process_batch(items: &[&str]) -> Vec<Result<String, ProcessError>> {".ai(),
+        "    items.iter().map(|item| process_data(item)).collect()".human(),
+        "}".human(),
+        "".human(),
+        "pub fn validate_input(data: &str) -> bool {".human(),
+        "    !data.trim().is_empty()".human(),
+        "}".human(),
+    ]);
+}
+
+#[test]
+fn test_realistic_formatting_and_whitespace_changes() {
+    // Test code formatting changes - human writes compact, AI reformats, human adds features
+    let repo = TestRepo::new();
+    let file_path = repo.path().join("config.py");
+
+    // Human writes compact Python config
+    fs::write(
+        &file_path,
+        "class Config:
+    def __init__(self):
+        self.debug = False
+        self.port = 8000
+        self.host = \"localhost\"
+
+    def get_url(self):
+        return f\"http://{self.host}:{self.port}\"",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint"]).unwrap();
+    repo.stage_all_and_commit("Initial compact config")
+        .unwrap();
+
+    // AI reformats with better spacing and adds docstrings
+    fs::write(
+        &file_path,
+        "class Config:
+    \"\"\"Application configuration.\"\"\"
+
+    def __init__(self):
+        \"\"\"Initialize with default settings.\"\"\"
+        self.debug = False
+        self.port = 8000
+        self.host = \"localhost\"
+
+    def get_url(self):
+        \"\"\"Get the full application URL.\"\"\"
+        return f\"http://{self.host}:{self.port}\"",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint", "mock_ai", "config.py"])
+        .unwrap();
+    repo.stage_all_and_commit("AI adds docstrings and formatting")
+        .unwrap();
+
+    // Human adds database config
+    fs::write(
+        &file_path,
+        "class Config:
+    \"\"\"Application configuration.\"\"\"
+
+    def __init__(self):
+        \"\"\"Initialize with default settings.\"\"\"
+        self.debug = False
+        self.port = 8000
+        self.host = \"localhost\"
+        self.db_url = \"sqlite:///app.db\"
+
+    def get_url(self):
+        \"\"\"Get the full application URL.\"\"\"
+        return f\"http://{self.host}:{self.port}\"
+
+    def get_database_url(self):
+        return self.db_url",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint"]).unwrap();
+    repo.stage_all_and_commit("Human adds database config")
+        .unwrap();
+
+    // AI reformats new method with docstring
+    fs::write(
+        &file_path,
+        "class Config:
+    \"\"\"Application configuration.\"\"\"
+
+    def __init__(self):
+        \"\"\"Initialize with default settings.\"\"\"
+        self.debug = False
+        self.port = 8000
+        self.host = \"localhost\"
+        self.db_url = \"sqlite:///app.db\"
+
+    def get_url(self):
+        \"\"\"Get the full application URL.\"\"\"
+        return f\"http://{self.host}:{self.port}\"
+
+    def get_database_url(self):
+        \"\"\"Get the database connection URL.\"\"\"
+        return self.db_url",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint", "mock_ai", "config.py"])
+        .unwrap();
+    repo.stage_all_and_commit("AI adds docstring to new method")
+        .unwrap();
+
+    // Verify attribution with whitespace changes
+    let mut file = repo.filename("config.py");
+    file.assert_lines_and_blame(lines![
+        "class Config:".human(),
+        "    \"\"\"Application configuration.\"\"\"".ai(),
+        "    ".ai(),
+        "    def __init__(self):".human(),
+        "        \"\"\"Initialize with default settings.\"\"\"".ai(),
+        "        self.debug = False".human(),
+        "        self.port = 8000".human(),
+        "        self.host = \"localhost\"".human(),
+        "        self.db_url = \"sqlite:///app.db\"".human(),
+        "    ".human(),  // Line 10: git attributes whitespace to human
+        "    def get_url(self):".human(),
+        "        \"\"\"Get the full application URL.\"\"\"".ai(),
+        "        return f\"http://{self.host}:{self.port}\"".human(),
+        "    ".human(),  // Line 14: git attributes to human
+        "    def get_database_url(self):".human(),
+        "        \"\"\"Get the database connection URL.\"\"\"".ai(),
+        "        return self.db_url".human(),
+    ]);
+}
+
+#[test]
+fn test_realistic_multi_file_commit() {
+    // Test editing multiple related files in a single commit
+    let repo = TestRepo::new();
+    let model_path = repo.path().join("models.rs");
+    let handler_path = repo.path().join("handlers.rs");
+    let schema_path = repo.path().join("schema.sql");
+
+    // Human creates initial model
+    fs::write(
+        &model_path,
+        "pub struct User {
+    pub id: i32,
+    pub name: String,
+}",
+    )
+    .unwrap();
+
+    fs::write(
+        &handler_path,
+        "use crate::models::User;
+
+pub fn get_user(id: i32) -> Option<User> {
+    None
+}",
+    )
+    .unwrap();
+
+    fs::write(
+        &schema_path,
+        "CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL
+);",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint"]).unwrap();
+    repo.stage_all_and_commit("Initial user model and schema")
+        .unwrap();
+
+    // AI adds email field to all three files
+    fs::write(
+        &model_path,
+        "pub struct User {
+    pub id: i32,
+    pub name: String,
+    pub email: String,
+}",
+    )
+    .unwrap();
+
+    fs::write(
+        &handler_path,
+        "use crate::models::User;
+
+pub fn get_user(id: i32) -> Option<User> {
+    None
+}
+
+pub fn get_user_by_email(email: &str) -> Option<User> {
+    None
+}",
+    )
+    .unwrap();
+
+    fs::write(
+        &schema_path,
+        "CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL
+);
+
+CREATE INDEX idx_users_email ON users(email);",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint", "mock_ai"]).unwrap();
+    repo.stage_all_and_commit("AI adds email field across all files")
+        .unwrap();
+
+    // Human adds validation
+    fs::write(
+        &model_path,
+        "pub struct User {
+    pub id: i32,
+    pub name: String,
+    pub email: String,
+}
+
+impl User {
+    pub fn validate_email(&self) -> bool {
+        self.email.contains('@')
+    }
+}",
+    )
+    .unwrap();
+
+    fs::write(
+        &handler_path,
+        "use crate::models::User;
+
+pub fn get_user(id: i32) -> Option<User> {
+    None
+}
+
+pub fn get_user_by_email(email: &str) -> Option<User> {
+    if !email.contains('@') {
+        return None;
+    }
+    None
+}",
+    )
+    .unwrap();
+
+    repo.git_ai(&["checkpoint"]).unwrap();
+    repo.stage_all_and_commit("Human adds email validation")
+        .unwrap();
+
+    // Verify models.rs
+    let mut models_file = repo.filename("models.rs");
+    models_file.assert_lines_and_blame(lines![
+        "pub struct User {".human(),
+        "    pub id: i32,".human(),
+        "    pub name: String,".human(),
+        "    pub email: String,".ai(),
+        "}".human(),  // Line 5: git attributes closing brace to human (impl added after)
+        "".human(),
+        "impl User {".human(),
+        "    pub fn validate_email(&self) -> bool {".human(),
+        "        self.email.contains('@')".human(),
+        "    }".human(),
+        "}".human(),  // Line 11: stays human
+    ]);
+
+    // Verify handlers.rs
+    let mut handlers_file = repo.filename("handlers.rs");
+    handlers_file.assert_lines_and_blame(lines![
+        "use crate::models::User;".human(),
+        "".human(),
+        "pub fn get_user(id: i32) -> Option<User> {".human(),
+        "    None".human(),
+        "}".ai(),  // Line 5: git attributes closing brace to AI (next function added by AI)
+        "".ai(),
+        "pub fn get_user_by_email(email: &str) -> Option<User> {".ai(),
+        "    if !email.contains('@') {".human(),
+        "        return None;".human(),
+        "    }".human(),
+        "    None".ai(),
+        "}".human(),  // Line 12: final closing brace stays human
+    ]);
+
+    // Verify schema.sql
+    let mut schema_file = repo.filename("schema.sql");
+    schema_file.assert_lines_and_blame(lines![
+        "CREATE TABLE users (".human(),
+        "    id INTEGER PRIMARY KEY,".human(),
+        "    name TEXT NOT NULL,".ai(),  // Line 3: git attributes to AI (comma added)
+        "    email TEXT UNIQUE NOT NULL".ai(),
+        ");".ai(),
+        "".ai(),
+        "CREATE INDEX idx_users_email ON users(email);".ai(),
+    ]);
+}
