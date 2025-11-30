@@ -8,7 +8,7 @@ AuthorshipLogV3 {
             file_path: "src/my file.rs",
             entries: [
                 AttestationEntry {
-                    hash: "c9883b0",
+                    hash: "c9883b05a2487d6d",
                     line_ranges: [
                         Range(
                             1,
@@ -22,7 +22,7 @@ AuthorshipLogV3 {
             file_path: "docs/README (copy).md",
             entries: [
                 AttestationEntry {
-                    hash: "c9883b0",
+                    hash: "c9883b05a2487d6d",
                     line_ranges: [
                         Single(
                             5,
@@ -35,7 +35,7 @@ AuthorshipLogV3 {
             file_path: "test/file-with-dashes.js",
             entries: [
                 AttestationEntry {
-                    hash: "c9883b0",
+                    hash: "c9883b05a2487d6d",
                     line_ranges: [
                         Range(
                             20,
@@ -53,7 +53,7 @@ AuthorshipLogV3 {
         ),
         base_commit_sha: "",
         prompts: {
-            "c9883b0": PromptRecord {
+            "c9883b05a2487d6d": PromptRecord {
                 agent_id: AgentId {
                     tool: "cursor",
                     id: "session_123",

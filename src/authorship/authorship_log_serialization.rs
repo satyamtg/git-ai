@@ -632,7 +632,7 @@ pub fn generate_short_hash(agent_id: &str, tool: &str) -> String {
     hasher.update(combined.as_bytes());
     let result = hasher.finalize();
     // Take first 7 characters of the hex representation
-    format!("{:x}", result)[..7].to_string()
+    format!("{:x}", result)[..16].to_string()
 }
 
 #[cfg(test)]

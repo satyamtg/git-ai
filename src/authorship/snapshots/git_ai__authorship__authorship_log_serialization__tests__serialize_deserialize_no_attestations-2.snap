@@ -11,7 +11,7 @@ AuthorshipLogV3 {
         ),
         base_commit_sha: "abc123",
         prompts: {
-            "c9883b0": PromptRecord {
+            "c9883b05a2487d6d": PromptRecord {
                 agent_id: AgentId {
                     tool: "cursor",
                     id: "session_123",
