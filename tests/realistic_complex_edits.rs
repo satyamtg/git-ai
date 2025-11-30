@@ -339,7 +339,8 @@ fn test_realistic_test_file_evolution() {
         "#[test]
 fn test_addition() {
     assert_eq!(2 + 2, 4);
-}",
+}
+",
     )
     .unwrap();
 
@@ -362,7 +363,8 @@ fn test_subtraction() {
 #[test]
 fn test_multiplication() {
     assert_eq!(3 * 4, 12);
-}",
+}
+",
     )
     .unwrap();
 
@@ -463,35 +465,37 @@ fn test_multiplication() {
         .unwrap();
 
     // Verify git alignment
+    // Without move detection, when human refactored to add module wrapper,
+    // git attributes all indented lines to human, but blank lines stay with AI
     let mut file = repo.filename("tests.rs");
     file.assert_lines_and_blame(lines![
         "mod arithmetic_tests {".human(),
         "    #[test]".human(),
         "    fn test_addition() {".human(),
         "        assert_eq!(2 + 2, 4);".human(),
-        "    }".ai(), // Line 5: git attributes closing brace to AI due to module refactoring
-        "".ai(),
-        "    #[test]".ai(),
-        "    fn test_subtraction() {".ai(),
-        "        assert_eq!(5 - 3, 2);".ai(),
-        "    }".ai(),
-        "".ai(),
-        "    #[test]".ai(),
-        "    fn test_multiplication() {".ai(),
-        "        assert_eq!(3 * 4, 12);".ai(),
-        "    }".human(), // Line 15: git attributes to Test User
-        "".ai(),
+        "    }".human(), // Line 5: attributed to human who added indentation
+        "".ai(),         // Blank lines stay attributed to AI who originally added them
+        "    #[test]".human(),
+        "    fn test_subtraction() {".human(),
+        "        assert_eq!(5 - 3, 2);".human(),
+        "    }".human(),
+        "".ai(), // Blank line stays with AI
+        "    #[test]".human(),
+        "    fn test_multiplication() {".human(),
+        "        assert_eq!(3 * 4, 12);".human(),
+        "    }".human(),
+        "".ai(), // Blank line added by AI with division test
         "    #[test]".ai(),
         "    fn test_division() {".ai(),
         "        assert_eq!(12 / 3, 4);".ai(),
         "    }".ai(),
-        "".human(),
+        "".human(), // Blank line added by human with edge case test
         "    #[test]".human(),
         "    #[should_panic]".human(),
         "    fn test_division_by_zero() {".human(),
         "        let _ = 1 / 0;".human(),
         "    }".human(),
-        "}".human(), // Line 27: final closing brace stays human
+        "}".human(), // Line 27: closing brace from human's module wrapper
     ]);
 }
 
