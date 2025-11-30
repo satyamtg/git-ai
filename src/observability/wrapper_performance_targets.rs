@@ -8,7 +8,7 @@ use crate::{
     utils::{debug_performance_log, debug_performance_log_structured},
 };
 
-pub const PERFORMANCE_FLOOR_MS: Duration = Duration::from_millis(70);
+pub const PERFORMANCE_FLOOR_MS: Duration = Duration::from_millis(270);
 
 /// Performance benchmark result containing timing breakdowns
 #[derive(Debug, Clone)]

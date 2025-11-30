@@ -13,7 +13,7 @@ impl Default for FeatureFlags {
         {
             return FeatureFlags {
                 rewrite_stash: true,
-                inter_commit_move: true,
+                inter_commit_move: false,
             };
         }
         #[cfg(not(debug_assertions))]

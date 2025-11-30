@@ -1,3 +1,5 @@
+use git_ai::config::Config;
+use git_ai::feature_flags::FeatureFlags;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::collections::HashMap;
@@ -11,6 +13,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod repos;
 use git_ai::observability::wrapper_performance_targets::BenchmarkResult;
 use repos::test_repo::TestRepo;
+
+fn setup() {
+    git_ai::config::Config::clear_test_feature_flags();
+
+    // Test that we can override feature flags
+    let test_flags = FeatureFlags {
+        rewrite_stash: true,
+        inter_commit_move: true,
+    };
+
+    git_ai::config::Config::set_test_feature_flags(test_flags.clone());
+}
 
 #[cfg(test)]
 mod tests {
@@ -28,7 +42,6 @@ mod tests {
         let test_repo = repos
             .get(repo_name)
             .expect(&format!("{} repo should be available", repo_name));
-
         // Find random files for testing
         let random_files = find_random_files(test_repo).expect("Should find random files");
 
@@ -231,6 +244,7 @@ fn clone_and_init_repos() -> HashMap<String, TestRepo> {
 /// Get the performance test repositories
 /// This function ensures repositories are cloned and initialized only once
 pub fn get_performance_repos() -> &'static HashMap<String, TestRepo> {
+    setup();
     PERFORMANCE_REPOS_MAP.get_or_init(clone_and_init_repos)
 }
 

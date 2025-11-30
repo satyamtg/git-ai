@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::feature_flags::FeatureFlags;
 use crate::git::repository::Repository;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::RwLock;
 
 /// Centralized configuration for the application
@@ -80,7 +80,7 @@ struct FileConfig {
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_FEATURE_FLAGS_OVERRIDE: RwLock<Option<FeatureFlags>> = RwLock::new(None);
 
 impl Config {
@@ -176,8 +176,9 @@ impl Config {
     }
 
     /// Override feature flags for testing purposes.
-    /// This only works in test mode and allows tests to temporarily override the feature flags.
-    #[cfg(test)]
+    /// Only available when the `test-support` feature is enabled or in test mode.
+    /// Must be `pub` to work with integration tests in the `tests/` directory.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_test_feature_flags(flags: FeatureFlags) {
         let mut override_flags = TEST_FEATURE_FLAGS_OVERRIDE
             .write()
@@ -186,8 +187,9 @@ impl Config {
     }
 
     /// Clear any feature flag overrides.
+    /// Only available when the `test-support` feature is enabled or in test mode.
     /// This should be called in test cleanup to reset to default behavior.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn clear_test_feature_flags() {
         let mut override_flags = TEST_FEATURE_FLAGS_OVERRIDE
             .write()
@@ -197,7 +199,7 @@ impl Config {
 
     /// Get feature flags, checking for test overrides first.
     /// In test mode, this will return overridden flags if set, otherwise the normal flags.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn get_feature_flags(&self) -> FeatureFlags {
         let override_flags = TEST_FEATURE_FLAGS_OVERRIDE
             .read()
@@ -208,7 +210,7 @@ impl Config {
     }
 
     /// Get feature flags (non-test version, just returns a reference).
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     pub fn get_feature_flags(&self) -> &FeatureFlags {
         &self.feature_flags
     }

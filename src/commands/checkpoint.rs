@@ -1,18 +1,22 @@
-use crate::authorship::attribution_tracker::{Attribution, AttributionTracker, INITIAL_ATTRIBUTION_TS, LineAttribution};
+use crate::authorship::attribution_tracker::{
+    Attribution, AttributionTracker, INITIAL_ATTRIBUTION_TS, LineAttribution,
+};
 use crate::authorship::working_log::CheckpointKind;
 use crate::authorship::working_log::{Checkpoint, WorkingLogEntry};
 use crate::commands::blame::{GitAiBlameOptions, OLDEST_AI_BLAME_DATE};
 use crate::commands::checkpoint_agent::agent_presets::AgentRunResult;
+use crate::config::Config;
 use crate::error::GitAiError;
 use crate::git::repo_storage::{PersistedWorkingLog, RepoStorage};
 use crate::git::repository::Repository;
 use crate::git::status::{EntryKind, StatusCode};
 use crate::utils::{debug_log, normalize_to_posix};
+use futures::stream::{self, StreamExt};
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Per-file line statistics (in-memory only, not persisted)
 #[derive(Debug, Clone, Default)]
@@ -33,6 +37,9 @@ pub fn run(
     agent_run_result: Option<AgentRunResult>,
     is_pre_commit: bool,
 ) -> Result<(usize, usize, usize), GitAiError> {
+    let checkpoint_start = Instant::now();
+    debug_log(&format!("[BENCHMARK] Starting checkpoint run"));
+
     // Robustly handle zero-commit repos
     let base_commit = match repo.head() {
         Ok(head) => match head.target() {
@@ -51,8 +58,28 @@ pub fn run(
     }
 
     // Initialize the new storage system
+    let storage_start = Instant::now();
     let repo_storage = RepoStorage::for_repo_path(repo.path(), &repo.workdir()?);
     let mut working_log = repo_storage.working_log_for_base_commit(&base_commit);
+    debug_log(&format!(
+        "[BENCHMARK] Storage initialization took {:?}",
+        storage_start.elapsed()
+    ));
+
+    // Early exit for human only
+    if is_pre_commit {
+        let has_no_ai_edits = working_log
+            .all_ai_touched_files()
+            .map(|files| files.is_empty())
+            .unwrap_or(true);
+
+        // we can only skip the work here if inter_commit_move is not enabled.
+        // otherwise we might miss an AI attribution that was moved by a user ie: copy / pasting
+        if has_no_ai_edits && !Config::get().get_feature_flags().inter_commit_move {
+            debug_log("No AI edits,in pre-commit checkpoint, skipping");
+            return Ok((0, 0, 0));
+        }
+    }
 
     // Set dirty files if available
     if let Some(dirty_files) = agent_run_result
@@ -72,6 +99,7 @@ pub fn run(
     // For human checkpoints, use will_edit_filepaths to narrow git status scope
     // For AI checkpoints, use edited_filepaths
     // Filter out paths outside the repository to prevent git call crashes
+    let pathspec_start = Instant::now();
     let mut filtered_pathspec: Option<Vec<String>> = None;
     let pathspec_filter = agent_run_result.as_ref().and_then(|result| {
         let paths = if result.checkpoint_kind == CheckpointKind::Human {
@@ -132,7 +160,12 @@ pub fn run(
             }
         })
     });
+    debug_log(&format!(
+        "[BENCHMARK] Pathspec filtering took {:?}",
+        pathspec_start.elapsed()
+    ));
 
+    let files_start = Instant::now();
     let files = get_all_tracked_files(
         repo,
         &base_commit,
@@ -140,7 +173,13 @@ pub fn run(
         pathspec_filter,
         is_pre_commit,
     )?;
+    debug_log(&format!(
+        "[BENCHMARK] get_all_tracked_files found {} files, took {:?}",
+        files.len(),
+        files_start.elapsed()
+    ));
 
+    let read_checkpoints_start = Instant::now();
     let mut checkpoints = if reset {
         // If reset flag is set, start with an empty working log
         working_log.reset_working_log()?;
@@ -148,6 +187,11 @@ pub fn run(
     } else {
         working_log.read_all_checkpoints()?
     };
+    debug_log(&format!(
+        "[BENCHMARK] Reading {} checkpoints took {:?}",
+        checkpoints.len(),
+        read_checkpoints_start.elapsed()
+    ));
 
     if show_working_log {
         if checkpoints.is_empty() {
@@ -205,9 +249,16 @@ pub fn run(
     }
 
     // Save current file states and get content hashes
+    let save_states_start = Instant::now();
     let file_content_hashes = save_current_file_states(&working_log, &files)?;
+    debug_log(&format!(
+        "[BENCHMARK] save_current_file_states for {} files took {:?}",
+        files.len(),
+        save_states_start.elapsed()
+    ));
 
     // Order file hashes by key and create a hash of the ordered hashes
+    let hash_compute_start = Instant::now();
     let mut ordered_hashes: Vec<_> = file_content_hashes.iter().collect();
     ordered_hashes.sort_by_key(|(file_path, _)| *file_path);
 
@@ -217,11 +268,16 @@ pub fn run(
         combined_hasher.update(hash.as_bytes());
     }
     let combined_hash = format!("{:x}", combined_hasher.finalize());
+    debug_log(&format!(
+        "[BENCHMARK] Hash computation took {:?}",
+        hash_compute_start.elapsed()
+    ));
 
     // Note: foreign prompts from INITIAL file are read in post_commit.rs
     // when converting working log -> authorship log
 
     // Get checkpoint entries using unified function that handles both initial and subsequent checkpoints
+    let entries_start = Instant::now();
     let (entries, file_stats) = smol::block_on(get_checkpoint_entries(
         kind,
         repo,
@@ -232,9 +288,15 @@ pub fn run(
         agent_run_result.as_ref(),
         ts,
     ))?;
+    debug_log(&format!(
+        "[BENCHMARK] get_checkpoint_entries generated {} entries, took {:?}",
+        entries.len(),
+        entries_start.elapsed()
+    ));
 
     // Skip adding checkpoint if there are no changes
     if !entries.is_empty() {
+        let checkpoint_create_start = Instant::now();
         let mut checkpoint = Checkpoint::new(
             kind.clone(),
             combined_hash.clone(),
@@ -253,9 +315,18 @@ pub fn run(
             checkpoint.agent_id = Some(agent_run.agent_id.clone());
             checkpoint.agent_metadata = agent_run.agent_metadata.clone();
         }
+        debug_log(&format!(
+            "[BENCHMARK] Checkpoint creation took {:?}",
+            checkpoint_create_start.elapsed()
+        ));
 
         // Append checkpoint to the working log
+        let append_start = Instant::now();
         working_log.append_checkpoint(&checkpoint)?;
+        debug_log(&format!(
+            "[BENCHMARK] Appending checkpoint to working log took {:?}",
+            append_start.elapsed()
+        ));
         checkpoints.push(checkpoint);
     }
 
@@ -309,6 +380,10 @@ pub fn run(
     }
 
     // Return the requested values: (entries_len, files_len, working_log_len)
+    debug_log(&format!(
+        "[BENCHMARK] Total checkpoint run took {:?}",
+        checkpoint_start.elapsed()
+    ));
     Ok((entries.len(), files.len(), checkpoints.len()))
 }
 
@@ -329,7 +404,12 @@ fn get_status_of_files(
         Some(&edited_filepaths)
     };
 
+    let status_start = Instant::now();
     let statuses = repo.status(edited_filepaths_option, skip_untracked)?;
+    debug_log(&format!(
+        "[BENCHMARK]   git status call took {:?}",
+        status_start.elapsed()
+    ));
 
     for entry in statuses {
         // Skip ignored files
@@ -380,6 +460,7 @@ fn get_all_tracked_files(
         .map(|paths| paths.iter().cloned().collect())
         .unwrap_or_default();
 
+    let initial_read_start = Instant::now();
     for file in working_log.read_initial_attributions().files.keys() {
         // Normalize path separators to forward slashes
         let normalized_path = normalize_to_posix(file);
@@ -387,7 +468,12 @@ fn get_all_tracked_files(
             files.insert(normalized_path);
         }
     }
+    debug_log(&format!(
+        "[BENCHMARK]   Reading INITIAL attributions in get_all_tracked_files took {:?}",
+        initial_read_start.elapsed()
+    ));
 
+    let checkpoints_read_start = Instant::now();
     if let Ok(working_log_data) = working_log.read_all_checkpoints() {
         for checkpoint in &working_log_data {
             for entry in &checkpoint.entries {
@@ -402,6 +488,10 @@ fn get_all_tracked_files(
             }
         }
     }
+    debug_log(&format!(
+        "[BENCHMARK]   Reading checkpoints in get_all_tracked_files took {:?}",
+        checkpoints_read_start.elapsed()
+    ));
 
     let has_ai_checkpoints = if let Ok(working_log_data) = working_log.read_all_checkpoints() {
         working_log_data.iter().any(|checkpoint| {
@@ -411,11 +501,16 @@ fn get_all_tracked_files(
         false
     };
 
+    let status_files_start = Instant::now();
     let mut results_for_tracked_files = if is_pre_commit && !has_ai_checkpoints {
         get_status_of_files(repo, working_log, files, true)?
     } else {
         get_status_of_files(repo, working_log, files, false)?
     };
+    debug_log(&format!(
+        "[BENCHMARK]   get_status_of_files in get_all_tracked_files took {:?}",
+        status_files_start.elapsed()
+    ));
 
     // Ensure to always include all dirty files
     if let Some(ref dirty_files) = working_log.dirty_files {
@@ -439,18 +534,77 @@ fn save_current_file_states(
     working_log: &PersistedWorkingLog,
     files: &[String],
 ) -> Result<HashMap<String, String>, GitAiError> {
-    let mut file_content_hashes = HashMap::new();
+    let read_start = Instant::now();
 
-    for file_path in files {
-        // Read file content using working_log, which respects dirty_files
-        let content = working_log
-            .read_current_file_content(file_path)
-            .unwrap_or_else(|_| String::new());
+    // Extract only the data we need (no cloning the entire working_log)
+    let blobs_dir = working_log.dir.join("blobs");
+    let repo_workdir = working_log.repo_workdir.clone();
+    let dirty_files = working_log.dirty_files.clone();
 
-        // Persist the file content and get the content hash
-        let content_hash = working_log.persist_file_version(&content)?;
-        file_content_hashes.insert(file_path.clone(), content_hash);
-    }
+    // Process files concurrently with a semaphore limiting to 8 at a time
+    let file_content_hashes = smol::block_on(async {
+        let semaphore = Arc::new(smol::lock::Semaphore::new(8));
+        let blobs_dir = Arc::new(blobs_dir);
+        let repo_workdir = Arc::new(repo_workdir);
+        let dirty_files = Arc::new(dirty_files);
+
+        let futures = files.iter().map(|file_path| {
+            let file_path = file_path.clone();
+            let blobs_dir = Arc::clone(&blobs_dir);
+            let repo_workdir = Arc::clone(&repo_workdir);
+            let dirty_files = Arc::clone(&dirty_files);
+            let semaphore = Arc::clone(&semaphore);
+
+            async move {
+                // Acquire semaphore permit
+                let _permit = semaphore.acquire().await;
+
+                // Read file content - check dirty_files first, then filesystem
+                let content = if let Some(ref dirty_map) = *dirty_files {
+                    dirty_map.get(&file_path).cloned()
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| {
+                    // Construct absolute path
+                    let abs_path = if std::path::Path::new(&file_path).is_absolute() {
+                        file_path.clone()
+                    } else {
+                        repo_workdir.join(&file_path).to_string_lossy().to_string()
+                    };
+                    // Read from filesystem
+                    std::fs::read_to_string(&abs_path).unwrap_or_default()
+                });
+
+                // Create SHA256 hash of the content
+                let mut hasher = Sha256::new();
+                hasher.update(content.as_bytes());
+                let sha = format!("{:x}", hasher.finalize());
+
+                // Ensure blobs directory exists
+                std::fs::create_dir_all(&*blobs_dir)?;
+
+                // Write content to blob file
+                let blob_path = blobs_dir.join(&sha);
+                std::fs::write(blob_path, content)?;
+
+                Ok::<(String, String), GitAiError>((file_path, sha))
+            }
+        });
+
+        // Collect results from all concurrent operations
+        let results: Vec<Result<(String, String), GitAiError>> =
+            stream::iter(futures).buffer_unordered(8).collect().await;
+
+        // Convert results into HashMap
+        let mut file_content_hashes = HashMap::new();
+        for result in results {
+            let (file_path, content_hash) = result?;
+            file_content_hashes.insert(file_path, content_hash);
+        }
+
+        Ok::<HashMap<String, String>, GitAiError>(file_content_hashes)
+    })?;
 
     Ok(file_content_hashes)
 }
@@ -468,6 +622,9 @@ fn get_checkpoint_entry_for_file(
     initial_attributions: Arc<HashMap<String, Vec<LineAttribution>>>,
     ts: u128,
 ) -> Result<Option<(WorkingLogEntry, FileLineStats)>, GitAiError> {
+    let feature_flag_inter_commit_move = Config::get().get_feature_flags().inter_commit_move;
+
+    let file_start = Instant::now();
     let current_content = working_log
         .read_current_file_content(&file_path)
         .unwrap_or_default();
@@ -537,40 +694,53 @@ fn get_checkpoint_entry_for_file(
             }
         }
 
-        // Get blame for lines not in INITIAL
-        let mut ai_blame_opts = GitAiBlameOptions::default();
-        ai_blame_opts.no_output = true;
-        ai_blame_opts.return_human_authors_as_human = true;
-        ai_blame_opts.use_prompt_hashes_as_names = true;
-        ai_blame_opts.newest_commit = head_commit_sha.as_ref().clone();
-        ai_blame_opts.oldest_date = Some(OLDEST_AI_BLAME_DATE.clone());
-        let ai_blame = repo.blame(&file_path, &ai_blame_opts);
-
         // Start with INITIAL attributions (they win)
         let mut prev_line_attributions = initial_attrs_for_file.clone();
-
-        // Add blame results for lines NOT covered by INITIAL
         let mut blamed_lines: HashSet<u32> = HashSet::new();
-        if let Ok((blames, _)) = ai_blame {
-            for (line, author) in blames {
-                blamed_lines.insert(line);
-                // Skip if INITIAL already has this line
-                if initial_covered_lines.contains(&line) {
-                    continue;
-                }
 
-                // Skip human-authored lines - they should remain human
-                if author == CheckpointKind::Human.to_str() {
-                    continue;
-                }
+        if feature_flag_inter_commit_move {
+            // Get blame for lines not in INITIAL
+            let blame_start = Instant::now();
+            let mut ai_blame_opts = GitAiBlameOptions::default();
+            ai_blame_opts.no_output = true;
+            ai_blame_opts.return_human_authors_as_human = true;
+            ai_blame_opts.use_prompt_hashes_as_names = true;
+            ai_blame_opts.newest_commit = head_commit_sha.as_ref().clone();
+            ai_blame_opts.oldest_date = Some(OLDEST_AI_BLAME_DATE.clone());
+            let ai_blame = repo.blame(&file_path, &ai_blame_opts);
+            debug_log(&format!(
+                "[BENCHMARK] Blame for {} took {:?}",
+                file_path,
+                blame_start.elapsed()
+            ));
 
-                prev_line_attributions.push(LineAttribution {
-                    start_line: line,
-                    end_line: line,
-                    author_id: author.clone(),
-                    overrode: None,
-                });
+            // Add blame results for lines NOT covered by INITIAL
+            if let Ok((blames, _)) = ai_blame {
+                for (line, author) in blames {
+                    blamed_lines.insert(line);
+                    // Skip if INITIAL already has this line
+                    if initial_covered_lines.contains(&line) {
+                        continue;
+                    }
+
+                    // Skip human-authored lines - they should remain human
+                    if author == CheckpointKind::Human.to_str() {
+                        continue;
+                    }
+
+                    prev_line_attributions.push(LineAttribution {
+                        start_line: line,
+                        end_line: line,
+                        author_id: author.clone(),
+                        overrode: None,
+                    });
+                }
             }
+        } else {
+            debug_log(&format!(
+                "Inter-commit move feature flag is disabled, skipping blame for {}",
+                &file_path
+            ));
         }
 
         // For AI checkpoints, attribute any lines NOT in INITIAL and NOT returned by ai_blame
@@ -631,6 +801,11 @@ fn get_checkpoint_entry_for_file(
         &current_content,
         ts,
     )?;
+    debug_log(&format!(
+        "[BENCHMARK] Processing file {} took {:?}",
+        file_path,
+        file_start.elapsed()
+    ));
     Ok(Some((entry, stats)))
 }
 
@@ -644,9 +819,16 @@ async fn get_checkpoint_entries(
     agent_run_result: Option<&AgentRunResult>,
     ts: u128,
 ) -> Result<(Vec<WorkingLogEntry>, Vec<FileLineStats>), GitAiError> {
+    let entries_fn_start = Instant::now();
+
     // Read INITIAL attributions from working log (empty if file doesn't exist)
+    let initial_read_start = Instant::now();
     let initial_data = working_log.read_initial_attributions();
     let initial_attributions = initial_data.files;
+    debug_log(&format!(
+        "[BENCHMARK] Reading initial attributions took {:?}",
+        initial_read_start.elapsed()
+    ));
 
     // Determine author_id based on checkpoint kind and agent_id
     let author_id = if kind != CheckpointKind::Human {
@@ -691,6 +873,7 @@ async fn get_checkpoint_entries(
     let initial_attributions = Arc::new(initial_attributions);
 
     // Spawn tasks for each file
+    let spawn_start = Instant::now();
     let mut tasks = Vec::new();
 
     for file_path in files {
@@ -734,11 +917,24 @@ async fn get_checkpoint_entries(
 
         tasks.push(task);
     }
+    debug_log(&format!(
+        "[BENCHMARK] Spawning {} tasks took {:?}",
+        tasks.len(),
+        spawn_start.elapsed()
+    ));
 
     // Await all tasks concurrently
+    let await_start = Instant::now();
     let results = futures::future::join_all(tasks).await;
+    debug_log(&format!(
+        "[BENCHMARK] Awaiting {} tasks took {:?}",
+        results.len(),
+        await_start.elapsed()
+    ));
 
     // Process results
+    let process_start = Instant::now();
+    let results_count = results.len();
     let mut entries = Vec::new();
     let mut file_stats = Vec::new();
     for result in results {
@@ -751,6 +947,15 @@ async fn get_checkpoint_entries(
             Err(e) => return Err(e),
         }
     }
+    debug_log(&format!(
+        "[BENCHMARK] Processing {} results took {:?}",
+        results_count,
+        process_start.elapsed()
+    ));
+    debug_log(&format!(
+        "[BENCHMARK] get_checkpoint_entries function total took {:?}",
+        entries_fn_start.elapsed()
+    ));
 
     Ok((entries, file_stats))
 }
@@ -765,12 +970,21 @@ fn make_entry_for_file(
     ts: u128,
 ) -> Result<(WorkingLogEntry, FileLineStats), GitAiError> {
     let tracker = AttributionTracker::new();
+
+    let fill_start = Instant::now();
     let filled_in_prev_attributions = tracker.attribute_unattributed_ranges(
         previous_content,
         previous_attributions,
         &CheckpointKind::Human.to_str(),
         ts - 1,
     );
+    debug_log(&format!(
+        "[BENCHMARK]   attribute_unattributed_ranges for {} took {:?}",
+        file_path,
+        fill_start.elapsed()
+    ));
+
+    let update_start = Instant::now();
     let new_attributions = tracker.update_attributions(
         previous_content,
         content,
@@ -778,16 +992,35 @@ fn make_entry_for_file(
         author_id,
         ts,
     )?;
+    debug_log(&format!(
+        "[BENCHMARK]   update_attributions for {} took {:?}",
+        file_path,
+        update_start.elapsed()
+    ));
+
     // TODO Consider discarding any "uncontentious" attributions for the human author. Any human attributions that do not share a line with any other author's attributions can be discarded.
     // let filtered_attributions = crate::authorship::attribution_tracker::discard_uncontentious_attributions_for_author(&new_attributions, &CheckpointKind::Human.to_str());
+
+    let line_attr_start = Instant::now();
     let line_attributions =
         crate::authorship::attribution_tracker::attributions_to_line_attributions(
             &new_attributions,
             content,
         );
+    debug_log(&format!(
+        "[BENCHMARK]   attributions_to_line_attributions for {} took {:?}",
+        file_path,
+        line_attr_start.elapsed()
+    ));
 
     // Compute line stats while we already have both contents in memory
+    let stats_start = Instant::now();
     let line_stats = compute_file_line_stats(previous_content, content);
+    debug_log(&format!(
+        "[BENCHMARK]   compute_file_line_stats for {} took {:?}",
+        file_path,
+        stats_start.elapsed()
+    ));
 
     let entry = WorkingLogEntry::new(
         file_path.to_string(),
