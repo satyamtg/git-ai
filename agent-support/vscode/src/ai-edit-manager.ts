@@ -8,7 +8,7 @@ export class AIEditManager {
   private workspaceBaseStoragePath: string | null = null;
   private gitAiVersion: string | null = null;
   private hasShownGitAiErrorMessage = false;
-  private lastHumanCheckpointAt: Date | null = null;
+  private lastHumanCheckpointAt = new Map<string, number>();
   private pendingSaves = new Map<string, {
     timestamp: number;
     timer: NodeJS.Timeout;
@@ -20,6 +20,9 @@ export class AIEditManager {
   }>();
   private readonly SAVE_EVENT_DEBOUNCE_WINDOW_MS = 300;
   private readonly HUMAN_CHECKPOINT_DEBOUNCE_MS = 500;
+  private readonly HUMAN_CHECKPOINT_CLEANUP_INTERVAL_MS = 60000; // 1 minute
+  private readonly MAX_SNAPSHOT_AGE_MS = 10_000; // 10 seconds; used to avoid triggering AI checkpoints on stale snapshots
+  private cleanupTimer: NodeJS.Timeout;
 
   constructor(context: vscode.ExtensionContext) {
     if (context.storageUri?.fsPath) {
@@ -27,6 +30,39 @@ export class AIEditManager {
     } else {
       // No workspace active (extension will be re-activated when a workspace is opened)
       console.warn('[git-ai] No workspace storage URI available');
+    }
+
+    // Periodically clean up old entries from lastHumanCheckpointAt to avoid memory leaks
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupOldCheckpointEntries();
+    }, this.HUMAN_CHECKPOINT_CLEANUP_INTERVAL_MS);
+  }
+
+  public dispose(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+    }
+  }
+
+  private cleanupOldCheckpointEntries(): void {
+    const now = Date.now();
+    const entriesToDelete: string[] = [];
+
+    // Remove entries older than 5 minutes
+    const MAX_AGE_MS = 5 * 60 * 1000;
+
+    this.lastHumanCheckpointAt.forEach((timestamp, filePath) => {
+      if (now - timestamp > MAX_AGE_MS) {
+        entriesToDelete.push(filePath);
+      }
+    });
+
+    entriesToDelete.forEach(filePath => {
+      this.lastHumanCheckpointAt.delete(filePath);
+    });
+
+    if (entriesToDelete.length > 0) {
+      console.log('[git-ai] AIEditManager: Cleaned up', entriesToDelete.length, 'old checkpoint entries');
     }
   }
 
@@ -53,7 +89,8 @@ export class AIEditManager {
   }
 
   public handleOpenEvent(doc: vscode.TextDocument): void {
-    if (doc.uri.scheme === "chat-editing-snapshot-text-model") {
+    console.log('[git-ai] AIEditManager: Open event detected for', doc);
+    if (doc.uri.scheme === "chat-editing-snapshot-text-model" || doc.uri.scheme === "chat-editing-text-model") {
       const filePath = doc.uri.fsPath;
       const now = Date.now();
 
@@ -69,14 +106,18 @@ export class AIEditManager {
         });
       }
 
-      console.log('[git-ai] AIEditManager: Snapshot open event tracked for', filePath, 'count:', this.snapshotOpenEvents.get(filePath)?.count);
+      // Trigger human checkpoint when whenever we see a snapshot open (before any changes are made -- debounce logic is handled in the triggerHumanCheckpoint method)
+      console.log('[git-ai] AIEditManager: Snapshot open event detected for', filePath, 'scheme:', doc.uri.scheme, 'seen count:', this.snapshotOpenEvents.get(filePath)?.count, '- triggering human checkpoint');
+      this.triggerHumanCheckpoint([filePath]);
     }
   }
 
   public handleCloseEvent(doc: vscode.TextDocument): void {
-    if (doc.uri.scheme === "chat-editing-snapshot-text-model") {
-      console.log('[git-ai] AIEditManager: Snapshot close event detected, triggering human checkpoint');
-      this.checkpoint("human");
+    if (doc.uri.scheme === "chat-editing-snapshot-text-model" || doc.uri.scheme === "chat-editing-text-model") {
+      console.log('[git-ai] AIEditManager: Snapshot close event detected for', doc);
+      // console.log('[git-ai] AIEditManager: Snapshot close event detected, triggering human checkpoint');
+      // const filePath = doc.uri.fsPath;
+      // this.triggerHumanCheckpoint([filePath]);
     }
   }
 
@@ -101,24 +142,29 @@ export class AIEditManager {
     let checkpointTriggered = false;
 
     if (snapshotInfo && snapshotInfo.count >= 1 && snapshotInfo.uri?.query) {
-      const storagePath = this.workspaceBaseStoragePath;
-      if (!storagePath) {
-        console.warn('[git-ai] AIEditManager: Missing workspace storage path, skipping AI checkpoint for', filePath);
-      } else {
-        try {
-          const params = JSON.parse(snapshotInfo.uri.query);
-          const sessionId = params.sessionId;
-          const requestId = params.requestId;
+      // Check if the snapshot is fresh to avoid triggering AI checkpoints on stale snapshots
+      const snapshotAge = Date.now() - snapshotInfo.timestamp;
 
-          if (!sessionId || !requestId) {
-            console.warn('[git-ai] AIEditManager: Snapshot URI missing session or request id, skipping AI checkpoint for', filePath);
-          } else {
-            const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
-            if (!workspaceFolder) {
-              console.warn('[git-ai] AIEditManager: No workspace folder found for', filePath, '- skipping AI checkpoint');
+      if (snapshotAge >= this.MAX_SNAPSHOT_AGE_MS) {
+        console.log('[git-ai] AIEditManager: Snapshot is too old (' + Math.round(snapshotAge / 1000) + 's), skipping AI checkpoint for', filePath);
+      } else {
+        const storagePath = this.workspaceBaseStoragePath;
+        if (!storagePath) {
+          console.warn('[git-ai] AIEditManager: Missing workspace storage path, skipping AI checkpoint for', filePath);
+        } else {
+          try {
+            const params = JSON.parse(snapshotInfo.uri.query);
+            const sessionId = params.chatSessionId || params.sessionId;
+
+            if (!sessionId) {
+              console.warn('[git-ai] AIEditManager: Snapshot URI missing session id, skipping AI checkpoint for', filePath);
             } else {
+              const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filePath));
+              if (!workspaceFolder) {
+                console.warn('[git-ai] AIEditManager: No workspace folder found for', filePath, '- skipping AI checkpoint');
+              } else {
               const chatSessionPath = path.join(storagePath, 'chatSessions', `${sessionId}.json`);
-              console.log('[git-ai] AIEditManager: AI edit detected for', filePath, '- triggering AI checkpoint (sessionId:', sessionId, ', requestId:', requestId, ', chatSessionPath:', chatSessionPath, ', workspaceFolder:', workspaceFolder.uri.fsPath, ')');
+              console.log('[git-ai] AIEditManager: AI edit detected for', filePath, '- triggering AI checkpoint (sessionId:', sessionId, ', chatSessionPath:', chatSessionPath, ', workspaceFolder:', workspaceFolder.uri.fsPath, ')');
               
               // Get dirty files and ensure the saved file is included with its content from VS Code
               const dirtyFiles = this.getDirtyFiles();
@@ -134,24 +180,24 @@ export class AIEditManager {
               
               console.log('[git-ai] AIEditManager: Dirty files with saved file content:', dirtyFiles);
               this.checkpoint("ai", JSON.stringify({
+                hook_event_name: "after_edit",
                 chatSessionPath,
                 sessionId,
-                requestId,
                 workspaceFolder: workspaceFolder.uri.fsPath,
                 dirtyFiles,
               }));
               checkpointTriggered = true;
+              }
             }
+          } catch (e) {
+            console.error('[git-ai] AIEditManager: Unable to trigger AI checkpoint for', filePath, e);
           }
-        } catch (e) {
-          console.error('[git-ai] AIEditManager: Unable to trigger AI checkpoint for', filePath, e);
         }
       }
     }
 
     if (!checkpointTriggered) {
-      console.log('[git-ai] AIEditManager: No AI pattern detected for', filePath, '- triggering human checkpoint');
-      this.checkpoint("human");
+      console.log('[git-ai] AIEditManager: No AI pattern detected for', filePath, '- skipping checkpoint');
     }
 
     // Cleanup
@@ -159,27 +205,79 @@ export class AIEditManager {
     this.snapshotOpenEvents.delete(filePath);
   }
 
-  public triggerInitialHumanCheckpoint(): void {
-    console.log('[git-ai] AIEditManager: Triggering initial human checkpoint');
-    this.checkpoint("human");
+  /**
+   * Trigger a human checkpoint with debouncing per file.
+   * Debounce logic: trigger immediately, but skip files that were already checkpointed within the debounce window.
+   */
+  private triggerHumanCheckpoint(willEditFilepaths: string[]): void {
+    if (!willEditFilepaths || willEditFilepaths.length === 0) {
+      console.warn('[git-ai] AIEditManager: Cannot trigger human checkpoint without files');
+      return;
+    }
+
+    // Filter out files that were recently checkpointed (within debounce window)
+    const now = Date.now();
+    const filesToCheckpoint = willEditFilepaths.filter(filePath => {
+      const lastCheckpoint = this.lastHumanCheckpointAt.get(filePath);
+      if (lastCheckpoint && (now - lastCheckpoint) < this.HUMAN_CHECKPOINT_DEBOUNCE_MS) {
+        console.log('[git-ai] AIEditManager: Skipping file due to debounce:', filePath);
+        return false;
+      }
+      return true;
+    });
+
+    if (filesToCheckpoint.length === 0) {
+      console.log('[git-ai] AIEditManager: All files were recently checkpointed, skipping');
+      return;
+    }
+
+    // Update last checkpoint time for files we're about to checkpoint
+    filesToCheckpoint.forEach(filePath => {
+      this.lastHumanCheckpointAt.set(filePath, now);
+    });
+
+    // Get dirty files
+    const dirtyFiles = this.getDirtyFiles();
+
+    // Add the files we're checkpointing to dirtyFiles (even if they're not dirty)
+    // Read from VS Code to handle codespaces lag
+    filesToCheckpoint.forEach(filePath => {
+      const fileDoc = vscode.workspace.textDocuments.find(doc =>
+        doc.uri.fsPath === filePath && doc.uri.scheme === "file"
+      );
+      if (fileDoc) {
+        dirtyFiles[filePath] = fileDoc.getText();
+      }
+    });
+
+    // Find workspace folder
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(filesToCheckpoint[0]))
+      || vscode.workspace.workspaceFolders?.[0];
+
+    if (!workspaceFolder) {
+      console.warn('[git-ai] AIEditManager: No workspace folder found for human checkpoint');
+      return;
+    }
+
+    console.log('[git-ai] AIEditManager: Triggering human checkpoint for files:', filesToCheckpoint);
+
+    // Prepare hook input for human checkpoint (session ID is not reliable, so we skip it)
+    const hookInput = JSON.stringify({
+      hook_event_name: "before_edit",
+      workspaceFolder: workspaceFolder.uri.fsPath,
+      will_edit_filepaths: filesToCheckpoint,
+      dirtyFiles: dirtyFiles,
+    });
+
+    this.checkpoint("human", hookInput);
   }
 
-  async checkpoint(author: "human" | "ai" | "ai_tab", hookInput?: string): Promise<boolean> {
+  async checkpoint(author: "human" | "ai" | "ai_tab", hookInput: string): Promise<boolean> {
     if (!(await this.checkGitAi())) {
       return false;
     }
 
-    // Throttle human checkpoints
-    if (author === "human") {
-      const now = new Date();
-      if (this.lastHumanCheckpointAt && (now.getTime() - this.lastHumanCheckpointAt.getTime()) < this.HUMAN_CHECKPOINT_DEBOUNCE_MS) {
-        console.log('[git-ai] AIEditManager: Skipping human checkpoint due to debounce');
-        return false;
-      }
-      this.lastHumanCheckpointAt = now;
-    }
-
-    return new Promise<boolean>((resolve, reject) => {
+    return new Promise<boolean>((resolve) => {
       let workspaceRoot: string | undefined;
 
       const activeEditor = vscode.window.activeTextEditor;
@@ -201,11 +299,17 @@ export class AIEditManager {
         return;
       }
 
-      const args = ["checkpoint", "github-copilot"];
-      
-      if (hookInput) {
-        args.push("--hook-input", "stdin");
+      const args = ["checkpoint"];
+      if (author === "ai_tab") {
+        args.push("ai_tab");
+      } else {
+        args.push("github-copilot");
       }
+      args.push("--hook-input", "stdin");
+
+      console.log('[git-ai] AIEditManager: Spawning git-ai with args:', args);
+      console.log('[git-ai] AIEditManager: Workspace root:', workspaceRoot);
+      console.log('[git-ai] AIEditManager: Hook input:', hookInput);
 
       const proc = spawn("git-ai", args, { cwd: workspaceRoot });
 

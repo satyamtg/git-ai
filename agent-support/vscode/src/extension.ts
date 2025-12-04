@@ -28,8 +28,6 @@ export function activate(context: vscode.ExtensionContext) {
 
   if (ideHostCfg.kind == IDEHostKindVSCode) {
     console.log('[git-ai] Using VS Code/Copilot detection strategy');
-    // Trigger initial human checkpoint
-    aiEditManager.triggerInitialHumanCheckpoint();
 
     // Save event
     context.subscriptions.push(
@@ -52,6 +50,15 @@ export function activate(context: vscode.ExtensionContext) {
       })
     );
   }
+
+  // vscode.commands.getCommands(true)
+  //   .then(commands => {
+  //     const content = commands.join('\n');
+  //     vscode.workspace.openTextDocument({ content, language: 'text' })
+  //       .then(doc => vscode.window.showTextDocument(doc));
+  //   });
 }
 
-export function deactivate() { }
+export function deactivate() {
+  console.log('[git-ai] extension deactivated');
+}

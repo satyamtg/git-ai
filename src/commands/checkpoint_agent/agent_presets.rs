@@ -524,23 +524,31 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
         let hook_data: serde_json::Value = serde_json::from_str(&hook_input_json)
             .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 
-        let chat_session_path = hook_data
-            .get("chatSessionPath")
+        // Extract hook_event_name to determine checkpoint type
+        let hook_event_name = hook_data
+            .get("hook_event_name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                GitAiError::PresetError("chatSessionPath not found in hook_input".to_string())
+                GitAiError::PresetError("hook_event_name not found in hook_input".to_string())
             })?;
-        
-        let agent_metadata = HashMap::from([
-            ("chat_session_path".to_string(), chat_session_path.to_string()),
-        ]);
 
-        // Accept either chatSessionId (old) or sessionId (from VS Code extension)
-        let chat_session_id = hook_data
-            .get("chatSessionId")
+        // Validate hook_event_name
+        if hook_event_name != "before_edit" && hook_event_name != "after_edit" {
+            return Err(GitAiError::PresetError(format!(
+                "Invalid hook_event_name: {}. Expected 'before_edit' or 'after_edit'",
+                hook_event_name
+            )));
+        }
+
+        // Required working directory provided by the extension
+        let repo_working_dir: String = hook_data
+            .get("workspaceFolder")
             .and_then(|v| v.as_str())
-            .or_else(|| hook_data.get("sessionId").and_then(|v| v.as_str()))
-            .unwrap_or("unknown")
+            .ok_or_else(|| {
+                GitAiError::PresetError(
+                    "workspaceFolder not found in hook_input for GitHub Copilot preset".to_string(),
+                )
+            })?
             .to_string();
 
         // Extract dirtyFiles if available
@@ -557,15 +565,63 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
                     .collect::<HashMap<String, String>>()
             });
 
-        // Required working directory provided by the extension
-        let repo_working_dir: String = hook_data
-            .get("workspaceFolder")
+        // Handle before_edit (human checkpoint)
+        if hook_event_name == "before_edit" {
+            // Extract will_edit_filepaths (required for human checkpoints)
+            let will_edit_filepaths = hook_data
+                .get("will_edit_filepaths")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<String>>()
+                })
+                .ok_or_else(|| {
+                    GitAiError::PresetError(
+                        "will_edit_filepaths is required for before_edit hook_event_name".to_string(),
+                    )
+                })?;
+
+            if will_edit_filepaths.is_empty() {
+                return Err(GitAiError::PresetError(
+                    "will_edit_filepaths cannot be empty for before_edit hook_event_name".to_string(),
+                ));
+            }
+
+            return Ok(AgentRunResult {
+                agent_id: AgentId {
+                    tool: "human".to_string(),
+                    id: "human".to_string(),
+                    model: "human".to_string(),
+                },
+                agent_metadata: None,
+                checkpoint_kind: CheckpointKind::Human,
+                transcript: None,
+                repo_working_dir: Some(repo_working_dir),
+                edited_filepaths: None,
+                will_edit_filepaths: Some(will_edit_filepaths),
+                dirty_files,
+            });
+        }
+
+        // Handle after_edit (AI checkpoint)
+        let chat_session_path = hook_data
+            .get("chatSessionPath")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                GitAiError::PresetError(
-                    "workspaceFolder not found in hook_input for GitHub Copilot preset".to_string(),
-                )
-            })?
+                GitAiError::PresetError("chatSessionPath not found in hook_input for after_edit".to_string())
+            })?;
+
+        let agent_metadata = HashMap::from([
+            ("chat_session_path".to_string(), chat_session_path.to_string()),
+        ]);
+
+        // Accept either chatSessionId (old) or sessionId (from VS Code extension)
+        let chat_session_id = hook_data
+            .get("chatSessionId")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("sessionId").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
             .to_string();
 
         // Read the Copilot chat session JSON (ignore errors)
