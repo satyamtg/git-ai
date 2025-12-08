@@ -826,8 +826,17 @@ impl AttributionTracker {
                                 }
                             }
                         }
+                    } else if !data_is_whitespace(diff.data()) {
+                        // For non-move deletions of substantive content, create a zero-length
+                        // marker attribution at the deletion point. This ensures lines with
+                        // deletions get attributed to the deleting author.
+                        new_attributions.push(Attribution::new(
+                            new_pos,
+                            new_pos, // Zero-length marker
+                            current_author.to_string(),
+                            ts,
+                        ));
                     }
-                    // else: True deletion - attributions are lost
 
                     old_pos += len;
                     deletion_idx += 1;
@@ -1497,7 +1506,10 @@ fn find_dominant_author_for_line(
             ..std::cmp::min(line_end, attribution.end)];
         let attr_non_whitespace_count =
             content_slice.chars().filter(|c| !c.is_whitespace()).count();
-        if attr_non_whitespace_count > 0 || is_line_empty {
+        // Zero-length attributions are deletion markers - they indicate the author
+        // deleted content at this position, so they should influence line attribution
+        let is_deletion_marker = attribution.start == attribution.end;
+        if attr_non_whitespace_count > 0 || is_line_empty || is_deletion_marker {
             candidate_attrs.push(attribution.clone());
         } else {
             // If the attribution is only whitespace, discard it
