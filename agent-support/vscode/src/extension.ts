@@ -26,7 +26,7 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  if (ideHostCfg.kind == IDEHostKindVSCode) {
+  if (ideHostCfg.kind === IDEHostKindVSCode) {
     console.log('[git-ai] Using VS Code/Copilot detection strategy');
 
     // Save event

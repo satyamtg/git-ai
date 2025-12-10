@@ -39,7 +39,7 @@ export class AITabEditManager {
     console.log('[git-ai] before ai tab completion accepted', args);
     this.beforeCompletionFileStates = {};
     for (const doc of vscode.workspace.textDocuments) {
-      if (doc.uri.scheme != "file") {
+      if (doc.uri.scheme !== "file") {
         continue;
       }
       this.beforeCompletionFileStates[doc.uri.fsPath] = doc.getText();
@@ -61,7 +61,7 @@ export class AITabEditManager {
     let beforeContent: string | null = null;
 
     for (const [filePath, content] of Object.entries(this.beforeCompletionFileStates)) {
-      if (filePath == last.document.uri.fsPath) {
+      if (filePath === last.document.uri.fsPath) {
         beforeContent = content;
         break;
       }

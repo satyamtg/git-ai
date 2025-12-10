@@ -9,7 +9,7 @@ export const GIT_AI_INSTALL_DOCS_URL = "https://github.com/acunniffe/git-ai?tab=
 export const TAB_AI_COMPLETION_COMMANDS: Partial<Record<IDEHostKind, string>> = {
   'cursor': 'editor.action.acceptCursorTabSuggestion', // Cursor AI tab accepted (AI edit shows up between before and after hooks)
   'vscode': 'editor.action.inlineSuggest.commit', // VS Code AI tab accepted (AI edit shows up between before and after hooks)
-}
+};
 
 // Notes: For future inline chat detection
 // 'inlineChat.acceptChanges'; // VS Code inline AI chat accepted (changes were already applied)

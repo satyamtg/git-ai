@@ -123,7 +123,7 @@ export class AIEditManager {
 
   public getDirtyFiles(): { [filePath: string]: string } {
     // Return a map of absolute file paths to string content of any dirty files in the workspace
-    const dirtyFiles = vscode.workspace.textDocuments.filter(doc => doc.isDirty && doc.uri.scheme == "file");
+    const dirtyFiles = vscode.workspace.textDocuments.filter(doc => doc.isDirty && doc.uri.scheme === "file");
     return dirtyFiles.reduce((acc, doc) => {
       acc[doc.uri.fsPath] = doc.getText();
       return acc;
