@@ -4,6 +4,7 @@ use crate::{
         working_log::{AgentId, CheckpointKind},
     },
     error::GitAiError,
+    git::repo_storage::RepoStorage,
 };
 use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -661,9 +662,12 @@ impl AgentCheckpointPreset for CursorPreset {
             .unwrap_or_else(|| "unknown".to_string());
 
         // Validate hook_event_name
-        if hook_event_name != "beforeSubmitPrompt" && hook_event_name != "afterFileEdit" {
+        if hook_event_name != "beforeSubmitPrompt"
+            && hook_event_name != "afterFileEdit"
+            && hook_event_name != "beforeTabFileRead"
+            && hook_event_name != "afterTabFileEdit" {
             return Err(GitAiError::PresetError(format!(
-                "Invalid hook_event_name: {}. Expected 'beforeSubmitPrompt' or 'afterFileEdit'",
+                "Invalid hook_event_name: {}. Expected 'beforeSubmitPrompt', 'afterFileEdit', 'beforeTabFileRead', or 'afterTabFileEdit'",
                 hook_event_name
             )));
         }
@@ -687,6 +691,96 @@ impl AgentCheckpointPreset for CursorPreset {
                 edited_filepaths: None,
                 will_edit_filepaths: None,
                 dirty_files: None,
+            });
+        }
+
+        if hook_event_name == "beforeTabFileRead" {
+            // Handle Cursor Tab AI file read - create a human checkpoint scoped to one file
+            let file_path = hook_data
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    GitAiError::PresetError("file_path not found in beforeTabFileRead hook".to_string())
+                })?
+                .to_string();
+
+            let content = hook_data
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    GitAiError::PresetError("content not found in beforeTabFileRead hook".to_string())
+                })?
+                .to_string();
+
+            // Create dirty_files with just this one file
+            let mut dirty_files = HashMap::new();
+            dirty_files.insert(file_path.clone(), content);
+
+            return Ok(AgentRunResult {
+                agent_id: AgentId {
+                    tool: "cursor".to_string(),
+                    id: conversation_id.clone(),
+                    model: model.clone(),
+                },
+                agent_metadata: None,
+                checkpoint_kind: CheckpointKind::Human,
+                transcript: None,
+                repo_working_dir: Some(repo_working_dir.clone()),
+                edited_filepaths: None,
+                will_edit_filepaths: Some(vec![file_path]),
+                dirty_files: Some(dirty_files),
+            });
+        }
+
+        if hook_event_name == "afterTabFileEdit" {
+            // Handle Cursor Tab AI file edit - create an AiTab checkpoint
+            let file_path = hook_data
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    GitAiError::PresetError("file_path not found in afterTabFileEdit hook".to_string())
+                })?
+                .to_string();
+
+            let edits = hook_data
+                .get("edits")
+                .ok_or_else(|| {
+                    GitAiError::PresetError("edits not found in afterTabFileEdit hook".to_string())
+                })?;
+
+            // Get the most recent file content from the working log
+            let old_content = Self::get_most_recent_file_content(&repo_working_dir, &file_path)
+                .map(|(content, _blob_sha)| content)
+                .unwrap_or_else(|| {
+                    // If no checkpoint exists, try to read from filesystem as fallback
+                    std::fs::read_to_string(&file_path).unwrap_or_default()
+                });
+
+            // Apply the edits to get the new content
+            let new_content = Self::apply_edits_to_content(&old_content, edits).unwrap_or_else(|e| {
+                eprintln!("[Warning] Failed to apply edits for afterTabFileEdit: {}", e);
+                old_content.clone()
+            });
+
+            // Create dirty_files with the new content
+            let mut dirty_files = HashMap::new();
+            dirty_files.insert(file_path.clone(), new_content);
+
+            let agent_id = AgentId {
+                tool: "cursor".to_string(),
+                id: conversation_id,
+                model,
+            };
+
+            return Ok(AgentRunResult {
+                agent_id,
+                agent_metadata: None,
+                checkpoint_kind: CheckpointKind::AiTab,
+                transcript: None,
+                repo_working_dir: Some(repo_working_dir),
+                edited_filepaths: Some(vec![file_path]),
+                will_edit_filepaths: None,
+                dirty_files: Some(dirty_files),
             });
         }
 
@@ -761,6 +855,156 @@ impl AgentCheckpointPreset for CursorPreset {
 }
 
 impl CursorPreset {
+    /// Get the most recent file content from the working log for a given file path
+    /// Returns (content, blob_sha) if found
+    fn get_most_recent_file_content(
+        repo_working_dir: &str,
+        file_path: &str,
+    ) -> Option<(String, String)> {
+        // Open the repository and get the base commit
+        let repo = crate::git::repository::find_repository_in_path(repo_working_dir).ok()?;
+        let base_commit = match repo.head() {
+            Ok(head) => match head.target() {
+                Ok(oid) => oid,
+                Err(_) => return None,
+            },
+            Err(_) => return None,
+        };
+
+        // Get repo path and workdir
+        let repo_path = repo.path();
+        let repo_workdir_path = match repo.workdir() {
+            Ok(path) => path,
+            Err(_) => return None,
+        };
+
+        // Create storage and working log
+        let repo_storage = RepoStorage::for_repo_path(&repo_path, &repo_workdir_path);
+        let working_log = repo_storage.working_log_for_base_commit(&base_commit);
+
+        // Read all checkpoints
+        let checkpoints = working_log.read_all_checkpoints().ok()?;
+
+        // Convert file_path to repo-relative format for comparison
+        let relative_file_path = working_log.to_repo_relative_path(file_path);
+
+        // Find the most recent checkpoint that has an entry for this file
+        for checkpoint in checkpoints.iter().rev() {
+            for entry in &checkpoint.entries {
+                if entry.file == relative_file_path {
+                    // Found the most recent checkpoint for this file
+                    if !entry.blob_sha.is_empty() {
+                        // Load the content from the blob
+                        if let Ok(content) = working_log.get_file_version(&entry.blob_sha) {
+                            return Some((content, entry.blob_sha.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Apply edit operations to file content
+    /// The edits are provided in the format from Cursor's afterTabFileEdit hook
+    fn apply_edits_to_content(
+        old_content: &str,
+        edits: &serde_json::Value,
+    ) -> Result<String, GitAiError> {
+        let edits_array = edits.as_array().ok_or_else(|| {
+            GitAiError::PresetError("edits must be an array".to_string())
+        })?;
+
+        let mut lines: Vec<String> = old_content.lines().map(|s| s.to_string()).collect();
+
+        // Apply each edit in order
+        for edit in edits_array {
+            let range = edit.get("range").ok_or_else(|| {
+                GitAiError::PresetError("edit missing range field".to_string())
+            })?;
+
+            let start_line = range
+                .get("start_line_number")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| {
+                    GitAiError::PresetError("range missing start_line_number".to_string())
+                })? as usize;
+
+            let start_col = range
+                .get("start_column")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| {
+                    GitAiError::PresetError("range missing start_column".to_string())
+                })? as usize;
+
+            let end_line = range
+                .get("end_line_number")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| {
+                    GitAiError::PresetError("range missing end_line_number".to_string())
+                })? as usize;
+
+            let end_col = range
+                .get("end_column")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| {
+                    GitAiError::PresetError("range missing end_column".to_string())
+                })? as usize;
+
+            let new_string = edit
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // Convert 1-indexed line numbers to 0-indexed
+            let start_line_idx = start_line.saturating_sub(1);
+            let end_line_idx = end_line.saturating_sub(1);
+
+            // Ensure we have enough lines
+            while lines.len() <= end_line_idx {
+                lines.push(String::new());
+            }
+
+            if start_line_idx == end_line_idx {
+                // Single-line edit
+                let line = &lines[start_line_idx];
+                // Convert 1-indexed columns to 0-indexed
+                let start_col_idx = start_col.saturating_sub(1);
+                let end_col_idx = end_col.saturating_sub(1);
+
+                // Split the line and insert the new string
+                let before = if start_col_idx < line.len() {
+                    &line[..start_col_idx]
+                } else {
+                    line.as_str()
+                };
+                let after = if end_col_idx < line.len() {
+                    &line[end_col_idx..]
+                } else {
+                    ""
+                };
+
+                lines[start_line_idx] = format!("{}{}{}", before, new_string, after);
+            } else {
+                // Multi-line edit - for now, treat as single-line at start position
+                // This is a simplification; full implementation would handle multi-line edits
+                let line = &lines[start_line_idx];
+                let start_col_idx = start_col.saturating_sub(1);
+
+                let before = if start_col_idx < line.len() {
+                    &line[..start_col_idx]
+                } else {
+                    line.as_str()
+                };
+
+                lines[start_line_idx] = format!("{}{}", before, new_string);
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
     /// Fetch the latest version of a Cursor conversation from the database
     pub fn fetch_latest_cursor_conversation(
         conversation_id: &str,

@@ -511,3 +511,236 @@ fn test_cursor_e2e_with_resync() {
 
     // The temp directory and database will be automatically cleaned up when temp_dir goes out of scope
 }
+
+#[test]
+fn test_cursor_preset_before_tab_file_read() {
+    use git_ai::authorship::working_log::CheckpointKind;
+    use git_ai::commands::checkpoint_agent::agent_presets::{
+        AgentCheckpointFlags, AgentCheckpointPreset, CursorPreset,
+    };
+
+    let hook_input = r##"{
+        "conversation_id": "test-tab-conversation-id",
+        "workspace_roots": ["/Users/test/workspace"],
+        "hook_event_name": "beforeTabFileRead",
+        "file_path": "/Users/test/workspace/src/main.rs",
+        "content": "fn main() {\n    println!(\"Hello\");\n}",
+        "model": "tab"
+    }"##;
+
+    let flags = AgentCheckpointFlags {
+        hook_input: Some(hook_input.to_string()),
+    };
+
+    let preset = CursorPreset;
+    let result = preset
+        .run(flags)
+        .expect("Should succeed for beforeTabFileRead");
+
+    // Verify this is a human checkpoint
+    assert_eq!(
+        result.checkpoint_kind,
+        CheckpointKind::Human,
+        "Should be a human checkpoint"
+    );
+
+    // Verify will_edit_filepaths is set with the single file
+    assert!(result.will_edit_filepaths.is_some(), "Should have will_edit_filepaths");
+    let will_edit = result.will_edit_filepaths.unwrap();
+    assert_eq!(will_edit.len(), 1, "Should have exactly one file");
+    assert_eq!(will_edit[0], "/Users/test/workspace/src/main.rs");
+
+    // Verify dirty_files contains the file content
+    assert!(result.dirty_files.is_some(), "Should have dirty_files");
+    let dirty_files = result.dirty_files.unwrap();
+    assert_eq!(dirty_files.len(), 1, "Should have exactly one dirty file");
+    assert!(
+        dirty_files.contains_key("/Users/test/workspace/src/main.rs"),
+        "Should contain the file path"
+    );
+    assert_eq!(
+        dirty_files.get("/Users/test/workspace/src/main.rs").unwrap(),
+        "fn main() {\n    println!(\"Hello\");\n}"
+    );
+
+    // Verify agent_id
+    assert_eq!(result.agent_id.tool, "cursor");
+    assert_eq!(result.agent_id.id, "test-tab-conversation-id");
+    assert_eq!(result.agent_id.model, "tab");
+}
+
+#[test]
+fn test_cursor_preset_after_tab_file_edit() {
+    use git_ai::authorship::working_log::CheckpointKind;
+    use git_ai::commands::checkpoint_agent::agent_presets::{
+        AgentCheckpointFlags, AgentCheckpointPreset, CursorPreset,
+    };
+
+    let hook_input = r##"{
+        "conversation_id": "test-tab-conversation-id",
+        "workspace_roots": ["/Users/test/workspace"],
+        "hook_event_name": "afterTabFileEdit",
+        "file_path": "/Users/test/workspace/src/main.rs",
+        "edits": [
+            {
+                "old_string": "",
+                "new_string": "// New comment",
+                "range": {
+                    "start_line_number": 1,
+                    "start_column": 1,
+                    "end_line_number": 1,
+                    "end_column": 1
+                },
+                "old_line": "",
+                "new_line": "// New comment"
+            }
+        ],
+        "model": "tab"
+    }"##;
+
+    let flags = AgentCheckpointFlags {
+        hook_input: Some(hook_input.to_string()),
+    };
+
+    let preset = CursorPreset;
+    let result = preset
+        .run(flags)
+        .expect("Should succeed for afterTabFileEdit");
+
+    // Verify this is an AiTab checkpoint
+    assert_eq!(
+        result.checkpoint_kind,
+        CheckpointKind::AiTab,
+        "Should be an AiTab checkpoint"
+    );
+
+    // Verify edited_filepaths is set
+    assert!(result.edited_filepaths.is_some(), "Should have edited_filepaths");
+    let edited = result.edited_filepaths.unwrap();
+    assert_eq!(edited.len(), 1, "Should have exactly one file");
+    assert_eq!(edited[0], "/Users/test/workspace/src/main.rs");
+
+    // Verify dirty_files contains the new content
+    assert!(result.dirty_files.is_some(), "Should have dirty_files");
+    let dirty_files = result.dirty_files.unwrap();
+    assert_eq!(dirty_files.len(), 1, "Should have exactly one dirty file");
+    assert!(
+        dirty_files.contains_key("/Users/test/workspace/src/main.rs"),
+        "Should contain the file path"
+    );
+
+    // Verify agent_id
+    assert_eq!(result.agent_id.tool, "cursor");
+    assert_eq!(result.agent_id.id, "test-tab-conversation-id");
+    assert_eq!(result.agent_id.model, "tab");
+
+    // Verify no agent_metadata
+    assert!(result.agent_metadata.is_none(), "Should not have agent_metadata");
+}
+
+#[test]
+fn test_cursor_tab_e2e_workflow() {
+    use std::fs;
+
+    let repo = TestRepo::new();
+
+    // Create parent directory for the test file
+    let src_dir = repo.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    // Create initial file with some base content
+    let file_path = repo.path().join("src/main.rs");
+    let base_content = "fn main() {\n    println!(\"Hello, World!\");\n}\n";
+    fs::write(&file_path, base_content).unwrap();
+
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    // Step 1: beforeTabFileRead - simulate Tab reading the file
+    let before_read_hook = serde_json::json!({
+        "conversation_id": "test-tab-session",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "beforeTabFileRead",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "content": base_content,
+        "model": "tab"
+    })
+    .to_string();
+
+    let result = repo
+        .git_ai(&["checkpoint", "cursor", "--hook-input", &before_read_hook])
+        .unwrap();
+
+    println!("Before read checkpoint output: {}", result);
+
+    // Step 2: Simulate Tab making edits to the file
+    let edited_content = "fn main() {\n    println!(\"Hello, World!\");\n    // Added by Tab AI\n    println!(\"Tab was here!\");\n}\n";
+    fs::write(&file_path, edited_content).unwrap();
+
+    // Step 3: afterTabFileEdit - simulate Tab completing the edit
+    let after_edit_hook = serde_json::json!({
+        "conversation_id": "test-tab-session",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "afterTabFileEdit",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "edits": [{
+            "old_string": "",
+            "new_string": "    // Added by Tab AI\n    println!(\"Tab was here!\");\n",
+            "range": {
+                "start_line_number": 3,
+                "start_column": 1,
+                "end_line_number": 3,
+                "end_column": 1
+            },
+            "old_line": "",
+            "new_line": "    // Added by Tab AI"
+        }],
+        "model": "tab"
+    })
+    .to_string();
+
+    let result = repo
+        .git_ai(&["checkpoint", "cursor", "--hook-input", &after_edit_hook])
+        .unwrap();
+
+    println!("After edit checkpoint output: {}", result);
+
+    // Commit the changes
+    let commit = repo.stage_all_and_commit("Add Tab AI edits").unwrap();
+
+    // Verify attribution using TestFile
+    let mut file = repo.filename("src/main.rs");
+    file.assert_lines_and_blame(lines![
+        "fn main() {".human(),
+        "    println!(\"Hello, World!\");".human(),
+        "    // Added by Tab AI".ai(),
+        "    println!(\"Tab was here!\");".ai(),
+        "}".human(),
+    ]);
+
+    // Verify the authorship log contains attestations
+    assert!(
+        commit.authorship_log.attestations.len() > 0,
+        "Should have at least one attestation"
+    );
+
+    // Verify the agent metadata
+    let prompt_record = commit
+        .authorship_log
+        .metadata
+        .prompts
+        .values()
+        .next()
+        .expect("Should have at least one prompt record");
+
+    // Verify the model is "tab"
+    assert_eq!(
+        prompt_record.agent_id.model, "tab",
+        "Model should be 'tab' from Tab AI"
+    );
+
+    // Verify the tool is "cursor"
+    assert_eq!(
+        prompt_record.agent_id.tool, "cursor",
+        "Tool should be 'cursor'"
+    );
+}

@@ -23,6 +23,8 @@ const CLAUDE_POST_TOOL_CMD: &str = "checkpoint claude --hook-input stdin";
 // Cursor hooks (requires absolute path to avoid shell config loading delay)
 const CURSOR_BEFORE_SUBMIT_CMD: &str = "checkpoint cursor --hook-input stdin";
 const CURSOR_AFTER_EDIT_CMD: &str = "checkpoint cursor --hook-input stdin";
+const CURSOR_BEFORE_TAB_FILE_READ_CMD: &str = "checkpoint cursor-tab --hook-input stdin";
+const CURSOR_AFTER_TAB_FILE_EDIT_CMD: &str = "checkpoint cursor-tab --hook-input stdin";
 
 // OpenCode plugin content (TypeScript), embedded from the source file to avoid drift
 const OPENCODE_PLUGIN_CONTENT: &str = include_str!(concat!(
