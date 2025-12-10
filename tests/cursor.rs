@@ -744,3 +744,411 @@ fn test_cursor_tab_e2e_workflow() {
         "Tool should be 'cursor'"
     );
 }
+
+#[test]
+fn test_cursor_tab_multiple_edits_in_one_session() {
+    use std::fs;
+
+    let repo = TestRepo::new();
+
+    // Create initial file with base content
+    let file_path = repo.path().join("index.ts");
+    let base_content = "function hello() {\n    console.log('hello world');\n}\n";
+    fs::write(&file_path, base_content).unwrap();
+
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    // Step 1: beforeTabFileRead
+    let before_read_hook = serde_json::json!({
+        "conversation_id": "test-multi-edit-session",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "beforeTabFileRead",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "content": base_content,
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &before_read_hook])
+        .unwrap();
+
+    // Step 2: Tab makes multiple edits - wrapping line with a for loop
+    // This simulates the example from the user where Tab wraps existing code
+    let edited_content = "function hello() {\n    for (let i = 0; i < 10; i++) {\n        console.log('hello world');\n    }\n}\n";
+    fs::write(&file_path, edited_content).unwrap();
+
+    // Step 3: afterTabFileEdit with multiple edits
+    let after_edit_hook = serde_json::json!({
+        "conversation_id": "test-multi-edit-session",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "afterTabFileEdit",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "edits": [
+            {
+                "old_string": "",
+                "new_string": "for (let i = 0; i < 10; i++) {\n        ",
+                "range": {
+                    "start_line_number": 2,
+                    "start_column": 5,
+                    "end_line_number": 2,
+                    "end_column": 5
+                },
+                "old_line": "    console.log('hello world');",
+                "new_line": "    for (let i = 0; i < 10; i++) {"
+            },
+            {
+                "old_string": "",
+                "new_string": "\n    }",
+                "range": {
+                    "start_line_number": 2,
+                    "start_column": 36,
+                    "end_line_number": 2,
+                    "end_column": 36
+                },
+                "old_line": "    console.log('hello world');",
+                "new_line": "        console.log('hello world');"
+            }
+        ],
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &after_edit_hook])
+        .unwrap();
+
+    // Commit the changes
+    repo.stage_all_and_commit("Tab wraps code in for loop").unwrap();
+
+    // Verify attribution - the for loop lines should be attributed to AI
+    let mut file = repo.filename("index.ts");
+    file.assert_lines_and_blame(lines![
+        "function hello() {".human(),
+        "    for (let i = 0; i < 10; i++) {".ai(),
+        "        console.log('hello world');".human(),
+        "    }".ai(),
+        "}".human(),
+    ]);
+}
+
+#[test]
+fn test_cursor_tab_edit_at_beginning_of_file() {
+    use std::fs;
+
+    let repo = TestRepo::new();
+
+    // Create initial file
+    let file_path = repo.path().join("config.ts");
+    let base_content = "export const API_URL = 'https://api.example.com';\n";
+    fs::write(&file_path, base_content).unwrap();
+
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    // beforeTabFileRead
+    let before_read_hook = serde_json::json!({
+        "conversation_id": "test-beginning-edit",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "beforeTabFileRead",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "content": base_content,
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &before_read_hook])
+        .unwrap();
+
+    // Tab adds comment at the beginning
+    let edited_content = "// API Configuration\nexport const API_URL = 'https://api.example.com';\n";
+    fs::write(&file_path, edited_content).unwrap();
+
+    // afterTabFileEdit
+    let after_edit_hook = serde_json::json!({
+        "conversation_id": "test-beginning-edit",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "afterTabFileEdit",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "edits": [{
+            "old_string": "",
+            "new_string": "// API Configuration\n",
+            "range": {
+                "start_line_number": 1,
+                "start_column": 1,
+                "end_line_number": 1,
+                "end_column": 1
+            },
+            "old_line": "",
+            "new_line": "// API Configuration"
+        }],
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &after_edit_hook])
+        .unwrap();
+
+    repo.stage_all_and_commit("Tab adds comment at beginning")
+        .unwrap();
+
+    // Verify blame
+    let mut file = repo.filename("config.ts");
+    file.assert_lines_and_blame(lines![
+        "// API Configuration".ai(),
+        "export const API_URL = 'https://api.example.com';".human(),
+    ]);
+}
+
+#[test]
+fn test_cursor_tab_edit_at_end_of_file() {
+    use std::fs;
+
+    let repo = TestRepo::new();
+
+    // Create initial file
+    let file_path = repo.path().join("utils.ts");
+    let base_content = "export function add(a: number, b: number) {\n    return a + b;\n}\n";
+    fs::write(&file_path, base_content).unwrap();
+
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    // beforeTabFileRead
+    let before_read_hook = serde_json::json!({
+        "conversation_id": "test-end-edit",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "beforeTabFileRead",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "content": base_content,
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &before_read_hook])
+        .unwrap();
+
+    // Tab adds new function at the end
+    let edited_content = "export function add(a: number, b: number) {\n    return a + b;\n}\n\nexport function subtract(a: number, b: number) {\n    return a - b;\n}\n";
+    fs::write(&file_path, edited_content).unwrap();
+
+    // afterTabFileEdit
+    let after_edit_hook = serde_json::json!({
+        "conversation_id": "test-end-edit",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "afterTabFileEdit",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "edits": [{
+            "old_string": "",
+            "new_string": "\nexport function subtract(a: number, b: number) {\n    return a - b;\n}\n",
+            "range": {
+                "start_line_number": 4,
+                "start_column": 1,
+                "end_line_number": 4,
+                "end_column": 1
+            },
+            "old_line": "",
+            "new_line": ""
+        }],
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &after_edit_hook])
+        .unwrap();
+
+    repo.stage_all_and_commit("Tab adds subtract function")
+        .unwrap();
+
+    // Verify blame
+    let mut file = repo.filename("utils.ts");
+    file.assert_lines_and_blame(lines![
+        "export function add(a: number, b: number) {".human(),
+        "    return a + b;".human(),
+        "}".human(),
+        "".ai(),
+        "export function subtract(a: number, b: number) {".ai(),
+        "    return a - b;".ai(),
+        "}".ai(),
+    ]);
+}
+
+#[test]
+fn test_cursor_tab_inline_completion() {
+    use std::fs;
+
+    let repo = TestRepo::new();
+
+    // Create initial file with incomplete line
+    let file_path = repo.path().join("greeting.ts");
+    let base_content = "function greet(name: string) {\n    console.log(\n}\n";
+    fs::write(&file_path, base_content).unwrap();
+
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    // beforeTabFileRead
+    let before_read_hook = serde_json::json!({
+        "conversation_id": "test-inline-completion",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "beforeTabFileRead",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "content": base_content,
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &before_read_hook])
+        .unwrap();
+
+    // Tab completes the console.log line
+    let edited_content = "function greet(name: string) {\n    console.log(`Hello, ${name}!`);\n}\n";
+    fs::write(&file_path, edited_content).unwrap();
+
+    // afterTabFileEdit - inline completion on same line
+    let after_edit_hook = serde_json::json!({
+        "conversation_id": "test-inline-completion",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "afterTabFileEdit",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "edits": [{
+            "old_string": "",
+            "new_string": "`Hello, ${name}!`);",
+            "range": {
+                "start_line_number": 2,
+                "start_column": 17,
+                "end_line_number": 2,
+                "end_column": 17
+            },
+            "old_line": "    console.log(",
+            "new_line": "    console.log(`Hello, ${name}!`);"
+        }],
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &after_edit_hook])
+        .unwrap();
+
+    repo.stage_all_and_commit("Tab completes console.log")
+        .unwrap();
+
+    // Verify blame - inline completion modifies an existing line, so it stays human
+    // (Git sees this as a modification of line 2, not a new AI-added line)
+    let mut file = repo.filename("greeting.ts");
+    file.assert_lines_and_blame(lines![
+        "function greet(name: string) {".human(),
+        "    console.log(`Hello, ${name}!`);".human(),
+        "}".human(),
+    ]);
+}
+
+#[test]
+fn test_cursor_tab_multiple_sessions_same_file() {
+    use std::fs;
+
+    let repo = TestRepo::new();
+
+    // Create initial file
+    let file_path = repo.path().join("math.ts");
+    let base_content = "export function multiply(a: number, b: number) {\n    return a * b;\n}\n";
+    fs::write(&file_path, base_content).unwrap();
+
+    repo.stage_all_and_commit("Initial commit").unwrap();
+
+    // First Tab session - add a comment
+    let before_read_1 = serde_json::json!({
+        "conversation_id": "session-1",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "beforeTabFileRead",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "content": base_content,
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &before_read_1])
+        .unwrap();
+
+    let content_after_1 = "// Multiplication function\nexport function multiply(a: number, b: number) {\n    return a * b;\n}\n";
+    fs::write(&file_path, content_after_1).unwrap();
+
+    let after_edit_1 = serde_json::json!({
+        "conversation_id": "session-1",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "afterTabFileEdit",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "edits": [{
+            "old_string": "",
+            "new_string": "// Multiplication function\n",
+            "range": {
+                "start_line_number": 1,
+                "start_column": 1,
+                "end_line_number": 1,
+                "end_column": 1
+            },
+            "old_line": "",
+            "new_line": "// Multiplication function"
+        }],
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &after_edit_1])
+        .unwrap();
+
+    repo.stage_all_and_commit("Tab adds comment").unwrap();
+
+    // Second Tab session - add another function
+    let before_read_2 = serde_json::json!({
+        "conversation_id": "session-2",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "beforeTabFileRead",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "content": content_after_1,
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &before_read_2])
+        .unwrap();
+
+    let content_after_2 = "// Multiplication function\nexport function multiply(a: number, b: number) {\n    return a * b;\n}\n\n// Division function\nexport function divide(a: number, b: number) {\n    return a / b;\n}\n";
+    fs::write(&file_path, content_after_2).unwrap();
+
+    let after_edit_2 = serde_json::json!({
+        "conversation_id": "session-2",
+        "workspace_roots": [repo.canonical_path().to_string_lossy().to_string()],
+        "hook_event_name": "afterTabFileEdit",
+        "file_path": file_path.to_string_lossy().to_string(),
+        "edits": [{
+            "old_string": "",
+            "new_string": "\n// Division function\nexport function divide(a: number, b: number) {\n    return a / b;\n}\n",
+            "range": {
+                "start_line_number": 5,
+                "start_column": 1,
+                "end_line_number": 5,
+                "end_column": 1
+            },
+            "old_line": "",
+            "new_line": ""
+        }],
+        "model": "tab"
+    })
+    .to_string();
+
+    repo.git_ai(&["checkpoint", "cursor", "--hook-input", &after_edit_2])
+        .unwrap();
+
+    repo.stage_all_and_commit("Tab adds divide function")
+        .unwrap();
+
+    // Verify blame - both Tab sessions' contributions should be attributed
+    let mut file = repo.filename("math.ts");
+    file.assert_lines_and_blame(lines![
+        "// Multiplication function".ai(),
+        "export function multiply(a: number, b: number) {".human(),
+        "    return a * b;".human(),
+        "}".human(),
+        "".ai(),
+        "// Division function".ai(),
+        "export function divide(a: number, b: number) {".ai(),
+        "    return a / b;".ai(),
+        "}".ai(),
+    ]);
+}
