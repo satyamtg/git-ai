@@ -38,11 +38,17 @@ impl TestRepo {
             .set_str("user.email", "test@example.com")
             .expect("failed to initialize git2 repository");
 
-        Self {
+        let mut repo = Self {
             path,
             feature_flags: FeatureFlags::default(),
             config_patch: None,
-        }
+        };
+
+        repo.patch_git_ai_config(|patch| {
+            patch.share_prompts_in_repositories = Some(vec!["*".to_string()]);
+        });
+
+        repo
     }
 
     pub fn new_at_path(path: &PathBuf) -> Self {
