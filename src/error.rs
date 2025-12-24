@@ -15,6 +15,7 @@ pub enum GitAiError {
     Utf8Error(std::str::Utf8Error),
     FromUtf8Error(std::string::FromUtf8Error),
     PresetError(String),
+    SqliteError(rusqlite::Error),
     Generic(String),
 }
 
@@ -38,6 +39,7 @@ impl fmt::Display for GitAiError {
             GitAiError::Utf8Error(e) => write!(f, "UTF-8 error: {}", e),
             GitAiError::FromUtf8Error(e) => write!(f, "From UTF-8 error: {}", e),
             GitAiError::PresetError(e) => write!(f, "{}", e),
+            GitAiError::SqliteError(e) => write!(f, "SQLite error: {}", e),
             GitAiError::Generic(e) => write!(f, "Generic error: {}", e),
         }
     }
@@ -76,6 +78,12 @@ impl From<std::string::FromUtf8Error> for GitAiError {
     }
 }
 
+impl From<rusqlite::Error> for GitAiError {
+    fn from(err: rusqlite::Error) -> Self {
+        GitAiError::SqliteError(err)
+    }
+}
+
 impl Clone for GitAiError {
     fn clone(&self) -> Self {
         match self {
@@ -93,6 +101,7 @@ impl Clone for GitAiError {
             GitAiError::Utf8Error(e) => GitAiError::Utf8Error(*e),
             GitAiError::FromUtf8Error(e) => GitAiError::FromUtf8Error(e.clone()),
             GitAiError::PresetError(s) => GitAiError::PresetError(s.clone()),
+            GitAiError::SqliteError(e) => GitAiError::Generic(format!("SQLite error: {}", e)),
             GitAiError::Generic(s) => GitAiError::Generic(s.clone()),
         }
     }

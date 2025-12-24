@@ -1268,16 +1268,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), GitAiError> {
 }
 
 fn home_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home);
-    }
-    #[cfg(windows)]
-    {
-        if let Ok(userprofile) = std::env::var("USERPROFILE") {
-            return PathBuf::from(userprofile);
-        }
-    }
-    PathBuf::from(".")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(windows)]

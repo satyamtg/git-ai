@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use dirs;
 
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
@@ -434,16 +435,8 @@ fn load_file_config() -> Option<FileConfig> {
 }
 
 fn config_file_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        let home = env::var("USERPROFILE").ok()?;
-        Some(Path::new(&home).join(".git-ai").join("config.json"))
-    }
-    #[cfg(not(windows))]
-    {
-        let home = env::var("HOME").ok()?;
-        Some(Path::new(&home).join(".git-ai").join("config.json"))
-    }
+    let home = dirs::home_dir()?;
+    Some(home.join(".git-ai").join("config.json"))
 }
 
 /// Public accessor for config file path

@@ -1,4 +1,5 @@
 use serde_json::Value;
+use dirs;
 
 use crate::git::repository::find_repository_in_path;
 
@@ -49,10 +50,8 @@ fn detect_pattern_type(value: &str) -> PatternType {
 fn resolve_path_to_remotes(path: &str) -> Result<Vec<String>, String> {
     // Expand ~ to home directory
     let expanded_path = if path.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            format!("{}{}", home, &path[1..])
-        } else if let Ok(home) = std::env::var("USERPROFILE") {
-            format!("{}{}", home, &path[1..])
+        if let Some(home) = dirs::home_dir() {
+            format!("{}{}", home.to_string_lossy(), &path[1..])
         } else {
             path.to_string()
         }

@@ -1,0 +1,699 @@
+use crate::authorship::authorship_log_serialization::generate_short_hash;
+use crate::authorship::transcript::AiTranscript;
+use crate::authorship::working_log::Checkpoint;
+use crate::error::GitAiError;
+use dirs;
+use rusqlite::{params, Connection};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Current schema version (must match MIGRATIONS.len())
+const SCHEMA_VERSION: usize = 1;
+
+/// Database migrations - each migration upgrades the schema by one version
+/// Migration at index N upgrades from version N to version N+1
+const MIGRATIONS: &[&str] = &[
+    // Migration 0 -> 1: Initial schema with prompts table
+    r#"
+    CREATE TABLE prompts (
+        id TEXT PRIMARY KEY NOT NULL,
+        workdir TEXT,
+        tool TEXT NOT NULL,
+        model TEXT NOT NULL,
+        external_thread_id TEXT NOT NULL,
+        messages TEXT NOT NULL,
+        commit_sha TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        human_author TEXT,
+        total_additions INTEGER,
+        total_deletions INTEGER,
+        accepted_lines INTEGER,
+        overridden_lines INTEGER
+    );
+
+    CREATE INDEX idx_prompts_tool
+        ON prompts(tool);
+    CREATE INDEX idx_prompts_external_thread_id
+        ON prompts(external_thread_id);
+    CREATE INDEX idx_prompts_workdir
+        ON prompts(workdir);
+    CREATE INDEX idx_prompts_commit_sha
+        ON prompts(commit_sha);
+    CREATE INDEX idx_prompts_updated_at
+        ON prompts(updated_at);
+    "#,
+    // Future migrations go here as new entries
+    // Migration 1 -> 2: (example)
+    // r#"ALTER TABLE prompts ADD COLUMN new_field TEXT;"#,
+];
+
+/// Global database singleton
+static INTERNAL_DB: OnceLock<Mutex<InternalDatabase>> = OnceLock::new();
+
+/// Prompt record for database storage
+#[derive(Debug, Clone)]
+pub struct PromptDbRecord {
+    pub id: String,                        // 16-char short hash
+    pub workdir: Option<String>,           // Repository working directory
+    pub tool: String,                      // Agent tool name
+    pub model: String,                     // Model name
+    pub external_thread_id: String,        // Original agent_id.id
+    pub messages: AiTranscript,            // Transcript
+    pub commit_sha: Option<String>,        // Commit SHA (nullable)
+    pub created_at: i64,                   // Unix timestamp
+    pub updated_at: i64,                   // Unix timestamp
+    pub human_author: Option<String>,      // Human author from checkpoint
+    pub total_additions: Option<u32>,      // Line additions from checkpoint stats
+    pub total_deletions: Option<u32>,      // Line deletions from checkpoint stats
+    pub accepted_lines: Option<u32>,       // Lines accepted in commit (future)
+    pub overridden_lines: Option<u32>,     // Lines overridden in commit (future)
+}
+
+impl PromptDbRecord {
+    /// Create a new PromptDbRecord from checkpoint data
+    pub fn from_checkpoint(
+        checkpoint: &Checkpoint,
+        workdir: Option<String>,
+        commit_sha: Option<String>,
+    ) -> Option<Self> {
+        let agent_id = checkpoint.agent_id.as_ref()?;
+        let transcript = checkpoint.transcript.as_ref()?;
+
+        let short_hash = generate_short_hash(&agent_id.id, &agent_id.tool);
+
+        Some(Self {
+            id: short_hash,
+            workdir,
+            tool: agent_id.tool.clone(),
+            model: agent_id.model.clone(),
+            external_thread_id: agent_id.id.clone(),
+            messages: transcript.clone(),
+            commit_sha,
+            created_at: checkpoint.timestamp as i64,
+            updated_at: checkpoint.timestamp as i64,
+            human_author: Some(checkpoint.author.clone()),
+            total_additions: Some(checkpoint.line_stats.additions),
+            total_deletions: Some(checkpoint.line_stats.deletions),
+            accepted_lines: None,      // Not yet calculated
+            overridden_lines: None,    // Not yet calculated
+        })
+    }
+}
+
+/// Database wrapper for internal git-ai storage
+pub struct InternalDatabase {
+    conn: Connection,
+    _db_path: PathBuf,
+}
+
+impl InternalDatabase {
+    /// Get or initialize the global database
+    pub fn global() -> Result<&'static Mutex<InternalDatabase>, GitAiError> {
+        // Use get_or_init (stable) instead of get_or_try_init (unstable)
+        // Errors during initialization will be logged and returned as Err
+        let db_mutex = INTERNAL_DB.get_or_init(|| {
+            match Self::new() {
+                Ok(db) => Mutex::new(db),
+                Err(e) => {
+                    // Log error during initialization
+                    eprintln!("[Error] Failed to initialize internal database: {}", e);
+                    // Create a dummy connection that will fail on any operation
+                    // This allows the program to continue even if DB init fails
+                    let temp_path = std::env::temp_dir().join("git-ai-db-failed");
+                    let conn = Connection::open(&temp_path).expect("Failed to create temp DB");
+                    Mutex::new(InternalDatabase {
+                        conn,
+                        _db_path: temp_path,
+                    })
+                }
+            }
+        });
+
+        Ok(db_mutex)
+    }
+
+    /// Create a new database connection
+    fn new() -> Result<Self, GitAiError> {
+        let db_path = Self::database_path()?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Open with WAL mode for better concurrency
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+        let mut db = Self {
+            conn,
+            _db_path: db_path,
+        };
+        db.initialize_schema()?;
+
+        Ok(db)
+    }
+
+    /// Get database path: ~/.git-ai/internal/db
+    fn database_path() -> Result<PathBuf, GitAiError> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| GitAiError::Generic("Could not determine home directory".to_string()))?;
+        Ok(home
+            .join(".git-ai")
+            .join("internal")
+            .join("db"))
+    }
+
+    /// Initialize schema and handle migrations
+    /// This is the ONLY place where schema changes should be made
+    /// Failures are FATAL - the program cannot continue without a valid database
+    fn initialize_schema(&mut self) -> Result<(), GitAiError> {
+        // Step 1: Create schema_metadata table (this is the only table we create directly)
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS schema_metadata (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+            "#,
+        )?;
+
+        // Step 2: Get current schema version (0 if brand new database)
+        let current_version: usize = self
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'version'",
+                [],
+                |row| {
+                    let version_str: String = row.get(0)?;
+                    version_str
+                        .parse::<usize>()
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+                },
+            )
+            .unwrap_or(0); // Default to version 0 for new databases
+
+        // Step 3: Validate that we're not downgrading
+        if current_version > SCHEMA_VERSION {
+            return Err(GitAiError::Generic(format!(
+                "Database schema version {} is newer than supported version {}. \
+                 Please upgrade git-ai to the latest version.",
+                current_version, SCHEMA_VERSION
+            )));
+        }
+
+        // Step 4: Apply all missing migrations sequentially
+        for target_version in current_version..SCHEMA_VERSION {
+            eprintln!(
+                "[Migration] Upgrading database from version {} to {}",
+                target_version,
+                target_version + 1
+            );
+
+            // Apply the migration (FATAL on error)
+            self.apply_migration(target_version)?;
+
+            // Update version in database
+            if current_version == 0 {
+                // First migration - insert version
+                self.conn.execute(
+                    "INSERT INTO schema_metadata (key, value) VALUES ('version', ?1)",
+                    params![(target_version + 1).to_string()],
+                )?;
+            } else {
+                // Subsequent migrations - update version
+                self.conn.execute(
+                    "UPDATE schema_metadata SET value = ?1 WHERE key = 'version'",
+                    params![(target_version + 1).to_string()],
+                )?;
+            }
+
+            eprintln!(
+                "[Migration] Successfully upgraded to version {}",
+                target_version + 1
+            );
+        }
+
+        // Step 5: Verify final version matches expected
+        let final_version: usize = self
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'version'",
+                [],
+                |row| {
+                    let version_str: String = row.get(0)?;
+                    version_str
+                        .parse::<usize>()
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+                },
+            )?;
+
+        if final_version != SCHEMA_VERSION {
+            return Err(GitAiError::Generic(format!(
+                "Migration failed: expected version {} but got version {}",
+                SCHEMA_VERSION, final_version
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Apply a single migration
+    /// Migration failures are FATAL - the program cannot continue with a partially migrated database
+    fn apply_migration(&mut self, from_version: usize) -> Result<(), GitAiError> {
+        if from_version >= MIGRATIONS.len() {
+            return Err(GitAiError::Generic(format!(
+                "No migration defined for version {} -> {}",
+                from_version,
+                from_version + 1
+            )));
+        }
+
+        let migration_sql = MIGRATIONS[from_version];
+
+        // Execute migration in a transaction for atomicity
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(migration_sql)?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    /// Upsert a prompt record
+    pub fn upsert_prompt(&mut self, record: &PromptDbRecord) -> Result<(), GitAiError> {
+        let messages_json = serde_json::to_string(&record.messages)?;
+
+        self.conn.execute(
+            r#"
+            INSERT INTO prompts (
+                id, workdir, tool, model, external_thread_id,
+                messages, commit_sha, created_at, updated_at,
+                human_author, total_additions, total_deletions,
+                accepted_lines, overridden_lines
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ON CONFLICT(id) DO UPDATE SET
+                workdir = excluded.workdir,
+                model = excluded.model,
+                messages = excluded.messages,
+                commit_sha = excluded.commit_sha,
+                updated_at = excluded.updated_at,
+                human_author = excluded.human_author,
+                total_additions = excluded.total_additions,
+                total_deletions = excluded.total_deletions,
+                accepted_lines = excluded.accepted_lines,
+                overridden_lines = excluded.overridden_lines
+            "#,
+            params![
+                record.id,
+                record.workdir,
+                record.tool,
+                record.model,
+                record.external_thread_id,
+                messages_json,
+                record.commit_sha,
+                record.created_at,
+                record.updated_at,
+                record.human_author,
+                record.total_additions,
+                record.total_deletions,
+                record.accepted_lines,
+                record.overridden_lines,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Batch upsert multiple prompts (for post-commit)
+    pub fn batch_upsert_prompts(&mut self, records: &[PromptDbRecord]) -> Result<(), GitAiError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+
+        for record in records {
+            let messages_json = serde_json::to_string(&record.messages)?;
+
+            tx.execute(
+                r#"
+                INSERT INTO prompts (
+                    id, workdir, tool, model, external_thread_id,
+                    messages, commit_sha, created_at, updated_at,
+                    human_author, total_additions, total_deletions,
+                    accepted_lines, overridden_lines
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                ON CONFLICT(id) DO UPDATE SET
+                    workdir = excluded.workdir,
+                    model = excluded.model,
+                    messages = excluded.messages,
+                    commit_sha = excluded.commit_sha,
+                    updated_at = excluded.updated_at,
+                    human_author = excluded.human_author,
+                    total_additions = excluded.total_additions,
+                    total_deletions = excluded.total_deletions,
+                    accepted_lines = excluded.accepted_lines,
+                    overridden_lines = excluded.overridden_lines
+                "#,
+                params![
+                    record.id,
+                    record.workdir,
+                    record.tool,
+                    record.model,
+                    record.external_thread_id,
+                    messages_json,
+                    record.commit_sha,
+                    record.created_at,
+                    record.updated_at,
+                    record.human_author,
+                    record.total_additions,
+                    record.total_deletions,
+                    record.accepted_lines,
+                    record.overridden_lines,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get a prompt by ID
+    pub fn get_prompt(&self, id: &str) -> Result<Option<PromptDbRecord>, GitAiError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workdir, tool, model, external_thread_id, messages, commit_sha, created_at, updated_at,
+                    human_author, total_additions, total_deletions, accepted_lines, overridden_lines
+             FROM prompts WHERE id = ?1"
+        )?;
+
+        let result = stmt.query_row(params![id], |row| {
+            let messages_json: String = row.get(5)?;
+            let messages: AiTranscript = serde_json::from_str(&messages_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
+            Ok(PromptDbRecord {
+                id: row.get(0)?,
+                workdir: row.get(1)?,
+                tool: row.get(2)?,
+                model: row.get(3)?,
+                external_thread_id: row.get(4)?,
+                messages,
+                commit_sha: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                human_author: row.get(9)?,
+                total_additions: row.get(10)?,
+                total_deletions: row.get(11)?,
+                accepted_lines: row.get(12)?,
+                overridden_lines: row.get(13)?,
+            })
+        });
+
+        match result {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get all prompts for a given commit (future use)
+    #[allow(dead_code)]
+    pub fn get_prompts_by_commit(
+        &self,
+        commit_sha: &str,
+    ) -> Result<Vec<PromptDbRecord>, GitAiError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workdir, tool, model, external_thread_id, messages, commit_sha, created_at, updated_at,
+                    human_author, total_additions, total_deletions, accepted_lines, overridden_lines
+             FROM prompts WHERE commit_sha = ?1"
+        )?;
+
+        let rows = stmt.query_map(params![commit_sha], |row| {
+            let messages_json: String = row.get(5)?;
+            let messages: AiTranscript = serde_json::from_str(&messages_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
+            Ok(PromptDbRecord {
+                id: row.get(0)?,
+                workdir: row.get(1)?,
+                tool: row.get(2)?,
+                model: row.get(3)?,
+                external_thread_id: row.get(4)?,
+                messages,
+                commit_sha: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                human_author: row.get(9)?,
+                total_additions: row.get(10)?,
+                total_deletions: row.get(11)?,
+                accepted_lines: row.get(12)?,
+                overridden_lines: row.get(13)?,
+            })
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+
+        Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authorship::transcript::Message;
+    use tempfile::TempDir;
+
+    fn create_test_db() -> (InternalDatabase, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+
+        let mut db = InternalDatabase {
+            conn,
+            _db_path: db_path.clone(),
+        };
+        db.initialize_schema().unwrap();
+
+        (db, temp_dir)
+    }
+
+    fn create_test_record() -> PromptDbRecord {
+        let mut transcript = AiTranscript::new();
+        transcript.add_message(Message::User {
+            text: "Test message".to_string(),
+            timestamp: None,
+        });
+
+        PromptDbRecord {
+            id: "abc123def456gh78".to_string(),
+            workdir: Some("/test/repo".to_string()),
+            tool: "cursor".to_string(),
+            model: "claude-sonnet-4.5".to_string(),
+            external_thread_id: "test-session-123".to_string(),
+            messages: transcript,
+            commit_sha: None,
+            created_at: 1234567890,
+            updated_at: 1234567890,
+            human_author: Some("John Doe".to_string()),
+            total_additions: Some(10),
+            total_deletions: Some(5),
+            accepted_lines: None,
+            overridden_lines: None,
+        }
+    }
+
+    #[test]
+    fn test_initialize_schema() {
+        let (db, _temp_dir) = create_test_db();
+
+        // Verify tables exist
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='prompts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // Verify schema_metadata exists
+        let version: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1");
+    }
+
+    #[test]
+    fn test_upsert_prompt() {
+        let (mut db, _temp_dir) = create_test_db();
+        let record = create_test_record();
+
+        // Insert
+        db.upsert_prompt(&record).unwrap();
+
+        // Verify inserted
+        let retrieved = db.get_prompt(&record.id).unwrap().unwrap();
+        assert_eq!(retrieved.id, record.id);
+        assert_eq!(retrieved.tool, record.tool);
+        assert_eq!(retrieved.model, record.model);
+        assert_eq!(retrieved.external_thread_id, record.external_thread_id);
+
+        // Update
+        let mut updated_record = record.clone();
+        updated_record.model = "claude-opus-4".to_string();
+        updated_record.commit_sha = Some("commit123".to_string());
+        updated_record.updated_at = 1234567900;
+
+        db.upsert_prompt(&updated_record).unwrap();
+
+        // Verify updated
+        let retrieved = db.get_prompt(&updated_record.id).unwrap().unwrap();
+        assert_eq!(retrieved.model, "claude-opus-4");
+        assert_eq!(retrieved.commit_sha, Some("commit123".to_string()));
+        assert_eq!(retrieved.updated_at, 1234567900);
+    }
+
+    #[test]
+    fn test_batch_upsert_prompts() {
+        let (mut db, _temp_dir) = create_test_db();
+
+        let mut records = Vec::new();
+        for i in 0..5 {
+            let mut record = create_test_record();
+            record.id = format!("prompt{:016}", i);
+            record.external_thread_id = format!("session-{}", i);
+            records.push(record);
+        }
+
+        // Batch insert
+        db.batch_upsert_prompts(&records).unwrap();
+
+        // Verify all inserted
+        for record in &records {
+            let retrieved = db.get_prompt(&record.id).unwrap();
+            assert!(retrieved.is_some());
+            assert_eq!(retrieved.unwrap().external_thread_id, record.external_thread_id);
+        }
+    }
+
+    #[test]
+    fn test_get_prompt_not_found() {
+        let (db, _temp_dir) = create_test_db();
+        let result = db.get_prompt("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_prompts_by_commit() {
+        let (mut db, _temp_dir) = create_test_db();
+
+        let commit_sha = "abc123commit";
+
+        // Create multiple records with same commit_sha
+        let mut records = Vec::new();
+        for i in 0..3 {
+            let mut record = create_test_record();
+            record.id = format!("prompt{:016}", i);
+            record.commit_sha = Some(commit_sha.to_string());
+            records.push(record);
+        }
+
+        // Insert records
+        db.batch_upsert_prompts(&records).unwrap();
+
+        // Query by commit
+        let retrieved = db.get_prompts_by_commit(commit_sha).unwrap();
+        assert_eq!(retrieved.len(), 3);
+
+        // Verify all have correct commit_sha
+        for record in retrieved {
+            assert_eq!(record.commit_sha, Some(commit_sha.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_database_path() {
+        let path = InternalDatabase::database_path().unwrap();
+        assert!(path.to_string_lossy().contains(".git-ai"));
+        assert!(path.to_string_lossy().contains("internal"));
+        assert!(path.to_string_lossy().ends_with("db"));
+    }
+
+    #[test]
+    fn test_stats_fields_populated() {
+        use crate::authorship::working_log::{AgentId, Checkpoint, CheckpointKind, CheckpointLineStats};
+
+        let (mut db, _temp_dir) = create_test_db();
+
+        // Create a checkpoint with stats
+        let mut checkpoint = Checkpoint::new(
+            CheckpointKind::AiAgent,
+            "test diff".to_string(),
+            "John Doe".to_string(),
+            vec![],
+        );
+
+        let mut transcript = AiTranscript::new();
+        transcript.add_message(Message::User {
+            text: "Test".to_string(),
+            timestamp: None,
+        });
+
+        checkpoint.agent_id = Some(AgentId {
+            tool: "cursor".to_string(),
+            id: "test-session".to_string(),
+            model: "claude-sonnet-4.5".to_string(),
+        });
+        checkpoint.transcript = Some(transcript);
+        checkpoint.line_stats = CheckpointLineStats {
+            additions: 42,
+            deletions: 13,
+            additions_sloc: 35,
+            deletions_sloc: 10,
+        };
+
+        // Create record from checkpoint
+        let record = PromptDbRecord::from_checkpoint(&checkpoint, Some("/test/repo".to_string()), None)
+            .expect("Failed to create record from checkpoint");
+
+        // Verify stats fields are populated
+        assert_eq!(record.human_author, Some("John Doe".to_string()));
+        assert_eq!(record.total_additions, Some(42));
+        assert_eq!(record.total_deletions, Some(13));
+        assert_eq!(record.accepted_lines, None);
+        assert_eq!(record.overridden_lines, None);
+
+        // Upsert and verify persistence
+        db.upsert_prompt(&record).unwrap();
+        let retrieved = db.get_prompt(&record.id).unwrap().unwrap();
+
+        assert_eq!(retrieved.human_author, Some("John Doe".to_string()));
+        assert_eq!(retrieved.total_additions, Some(42));
+        assert_eq!(retrieved.total_deletions, Some(13));
+        assert_eq!(retrieved.accepted_lines, None);
+        assert_eq!(retrieved.overridden_lines, None);
+    }
+}

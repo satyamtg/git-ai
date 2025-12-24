@@ -1,8 +1,8 @@
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
-use crate::authorship::secrets::{redact_secrets_from_prompts, strip_prompt_messages};
+use crate::authorship::secrets::{redact_secrets_from_prompts};
 use crate::authorship::stats::{stats_for_commit_stats, write_stats_to_terminal};
 use crate::authorship::virtual_attribution::VirtualAttributions;
-use crate::authorship::working_log::Checkpoint;
+use crate::authorship::working_log::{Checkpoint, CheckpointKind};
 use crate::commands::checkpoint_agent::agent_presets::{
     ClaudePreset, ContinueCliPreset, CursorPreset, GeminiPreset, GithubCopilotPreset,
 };
@@ -42,6 +42,22 @@ pub fn post_commit(
     // Update prompts/transcripts to their latest versions and persist to disk
     // Do this BEFORE filtering so that all checkpoints (including untracked files) are updated
     update_prompts_to_latest(&mut parent_working_log)?;
+
+    // Batch upsert all prompts to database after refreshing (non-fatal if it fails)
+    if let Err(e) = batch_upsert_prompts_to_db(&parent_working_log, &working_log, &commit_sha) {
+        debug_log(&format!(
+            "[Warning] Failed to batch upsert prompts to database: {}",
+            e
+        ));
+        crate::observability::log_error(
+            &e,
+            Some(serde_json::json!({
+                "operation": "post_commit_batch_upsert",
+                "commit_sha": commit_sha
+            })),
+        );
+    }
+
     working_log.write_all_checkpoints(&parent_working_log)?;
 
     // Filter out untracked files from the working log
@@ -371,6 +387,61 @@ fn update_prompts_to_latest(checkpoints: &mut [Checkpoint]) -> Result<(), GitAiE
             }
         }
     }
+
+    Ok(())
+}
+
+/// Strip messages from prompts when sharing is not enabled for this repository.
+/// This is called only in post_commit when writing prompts to git history.
+fn strip_prompt_messages(prompts: &mut std::collections::BTreeMap<String, PromptRecord>) {
+    for record in prompts.values_mut() {
+        record.messages.clear();
+    }
+}
+
+/// Batch upsert all prompts from checkpoints to the internal database
+fn batch_upsert_prompts_to_db(
+    checkpoints: &[Checkpoint],
+    working_log: &crate::git::repo_storage::PersistedWorkingLog,
+    commit_sha: &str,
+) -> Result<(), GitAiError> {
+    use crate::authorship::internal_db::{InternalDatabase, PromptDbRecord};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let workdir = working_log.repo_workdir.to_string_lossy().to_string();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let mut records = Vec::new();
+
+    for checkpoint in checkpoints {
+        if checkpoint.kind == CheckpointKind::Human {
+            continue;
+        }
+
+        if let Some(mut record) = PromptDbRecord::from_checkpoint(
+            checkpoint,
+            Some(workdir.clone()),
+            Some(commit_sha.to_string()),
+        ) {
+            // Update timestamp to current time
+            record.updated_at = now;
+            records.push(record);
+        }
+    }
+
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    let db = InternalDatabase::global()?;
+    let mut db_guard = db
+        .lock()
+        .map_err(|e| GitAiError::Generic(format!("Failed to lock database: {}", e)))?;
+
+    db_guard.batch_upsert_prompts(&records)?;
 
     Ok(())
 }

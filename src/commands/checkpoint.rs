@@ -328,6 +328,29 @@ pub fn run(
             checkpoint_create_start.elapsed()
         ));
 
+        // Upsert prompt to database (non-fatal if it fails)
+        if kind != CheckpointKind::Human && checkpoint.agent_id.is_some() {
+            if checkpoint.transcript.is_some() {
+                if let Err(e) = upsert_checkpoint_prompt_to_db(
+                    &checkpoint,
+                    working_log.repo_workdir.to_string_lossy().to_string(),
+                    None, // commit_sha is None at checkpoint stage
+                ) {
+                    debug_log(&format!(
+                        "[Warning] Failed to upsert prompt to database: {}",
+                        e
+                    ));
+                    crate::observability::log_error(
+                        &e,
+                        Some(serde_json::json!({
+                            "operation": "checkpoint_prompt_upsert",
+                            "agent_tool": checkpoint.agent_id.as_ref().map(|a| a.tool.as_str())
+                        })),
+                    );
+                }
+            }
+        }
+
         // Append checkpoint to the working log
         let append_start = Instant::now();
         working_log.append_checkpoint(&checkpoint)?;
@@ -1519,4 +1542,27 @@ fn is_text_file_in_head(repo: &Repository, path: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Upsert a checkpoint prompt to the internal database
+fn upsert_checkpoint_prompt_to_db(
+    checkpoint: &Checkpoint,
+    workdir: String,
+    commit_sha: Option<String>,
+) -> Result<(), GitAiError> {
+    use crate::authorship::internal_db::{InternalDatabase, PromptDbRecord};
+
+    let record = PromptDbRecord::from_checkpoint(checkpoint, Some(workdir), commit_sha)
+        .ok_or_else(|| {
+            GitAiError::Generic("Failed to create prompt record from checkpoint".to_string())
+        })?;
+
+    let db = InternalDatabase::global()?;
+    let mut db_guard = db
+        .lock()
+        .map_err(|e| GitAiError::Generic(format!("Failed to lock database: {}", e)))?;
+
+    db_guard.upsert_prompt(&record)?;
+
+    Ok(())
 }

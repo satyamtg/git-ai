@@ -7,6 +7,7 @@ use crate::{
     observability::log_error,
 };
 use chrono::{TimeZone, Utc};
+use dirs;
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -852,9 +853,9 @@ impl CursorPreset {
         #[cfg(target_os = "macos")]
         {
             // macOS: ~/Library/Application Support/Cursor/User
-            let home = env::var("HOME")
-                .map_err(|e| GitAiError::Generic(format!("HOME not set: {}", e)))?;
-            Ok(Path::new(&home)
+            let home = dirs::home_dir()
+                .ok_or_else(|| GitAiError::Generic("Could not determine home directory".to_string()))?;
+            Ok(home
                 .join("Library")
                 .join("Application Support")
                 .join("Cursor")
