@@ -52,6 +52,20 @@ A PR Bot aggregates `git-ai` data at the PR, Repository and Organization levels:
 
 ![alt](https://github.com/acunniffe/git-ai/raw/main/assets/docs/bot.jpg)
 
+## Prompt Saving
+By default Git AI does not save prompts in AI Authorship Notes. To start saving prompts and link them to the lines of code generated, run: 
+
+```bash
+git-ai config set --add share_prompts_in_repositories "*"
+```
+
+*or for specific repositories like this*
+
+```bash
+git-ai config set --add share_prompts_in_repositories https://github.com/org/repo.git
+git-ai config set --add share_prompts_in_repositories /path/to/repo  
+```
+
 ## Goals of `git-ai` project
 
 🤖 **Track AI code in a Multi-Agent** world. Because developers get to choose their tools, engineering teams need a **vendor agnostic** way to track AI impact in their repos.
@@ -69,20 +83,6 @@ A PR Bot aggregates `git-ai` data at the PR, Repository and Organization levels:
 - How Git AI Works and its Limitations [▶️ Video](https://www.youtube.com/watch?v=b_DZTC1PKHI) [🗺️ Diagram](https://usegitai.com/docs/how-git-ai-works)
 - [Git AI Commands](https://usegitai.com/docs/reference)
 - [Configuring Git AI for the enterprise](https://usegitai.com/docs/administration/enterprise-configuration)
-
-## Prompt Saving
-By default Git AI does not save prompts in AI Authorship Notes. You can start saving/sharing by running the following command
-
-*from within a repository*
-
-```bash
-git-ai config set share_prompts_in_repositories .  --add
-```
-*with an explicit remote*
-
-```bash
-git-ai config set share_prompts_in_repositories https://github.com/org/repo.git  --add
-```
 
 ## Agent Support
 
