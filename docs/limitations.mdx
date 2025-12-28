@@ -17,15 +17,14 @@ keywords: git ai compatibility, supported agents, cursor support, claude code su
 | Category | Feature | Status |
 | --- | --- | --- |
 | **Agent Mode** | Attribute LOC added with Write \| Edit \| MultiEdit tools (default) | ✅ |
-| **Tab Completion** | Attribute LOC from tab completions | ❌ |
+| **Tab Completion** | Attribute LOC from tab completions | ✅ (beta support) |
 | **Editing** | Human edits of AI LOC move attribution to that developer | ✅ |
 | **Editing** | AI edits of human LOC move attribution to the AI | ✅ |
 | **Editing** | Adding code before or after AI Hunks does not break attribution (line shifting works) | ✅ |
-| **Editing** | Undo / Redo operations correctly preserve attribution | ❌ |
-| **Editing** | Restoring to a local checkpoint in your IDE restores that file's attribution to its old state | ❌ |
+| **Editing** | Undo / Redo operations correctly preserve attribution | ✅ |
 | **Editing** | Copy / Pasting AI LOC within the same file keeps them attributed to AI | ✅ |
-| **Editing** | Copy / Pasting AI LOC across files keeps them attributed to AI | ❌ |
-| **Editing** | Code Formatting tools do not break attribution | ❌ |
+| **Editing** | Copy / Pasting AI LOC across files keeps them attributed to AI | ✅ |
+| **Editing** | Code Formatting tools do not break attribution | ✅ |
 
 ## Supported Git Workflows
 
@@ -44,7 +43,7 @@ keywords: git ai compatibility, supported agents, cursor support, claude code su
 | reset `--soft` and `--mixed` maintains correct attribution | ✅ |
 | Cherrypick correctly merges attribution | ✅ |
 | `mv` (move or rename files) moves AI attribution to the new file | ❌ |
-| Stash / Pop maintain correct attribution | ❌ |
+| Stash / Pop maintain correct attribution | ✅ |
 
 ### Server-Side
 
@@ -55,7 +54,8 @@ We'll be publishing CI scripts and Apps to assist with this soon.
 
 | Platform | Operation | Status |
 | --- | --- | --- |
-| GitHub | Rebase / Merge | ⚠️ Requires GitHub Action or Webhook |
-| GitHub | Squash and Merge | ⚠️ Requires GitHub Action or Webhook |
-| GitLab | Squash and Merge | ⚠️ Requires CI Runner or Webhook |
-| BitBucket Cloud | Squash and Merge | ⚠️ Requires CI Runner or Webhook |
+| GitHub | Rebase / Merge | ✅ [Requires GitHub Action or Webhook](https://usegitai.com/docs/metrics/github-actions) |
+| GitHub | Squash and Merge | ✅ [Requires GitHub Action or Webhook](https://usegitai.com/docs/metrics/github-actions) |
+| GitLab | Squash and Merge | ⚠️ [In Development](https://usegitai.com/docs/metrics/gitlab-runners) |
+| BitBucket Cloud | Squash and Merge | ⚠️ [In Development](https://usegitai.com/docs/metrics/bitbucket-pipelines) |
+| Azure Repos Pipelines | Squash and Merge | ⚠️ [In Development](https://usegitai.com/docs/metrics/azure-pipelines) |
