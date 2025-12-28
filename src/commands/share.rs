@@ -6,18 +6,32 @@ use std::collections::HashMap;
 
 /// Handle the `share` command
 ///
-/// Usage: git-ai share <prompt_id> [--title <title>]
+/// Usage: git-ai share [<prompt_id>] [--title <title>]
 ///
-/// Shares a prompt by creating a bundle via the API.
+/// If prompt_id is provided, uses CLI mode. Otherwise, launches TUI.
 pub fn handle_share(args: &[String]) {
-    let parsed = match parse_args(args) {
-        Ok(p) => p,
+    match parse_args(args) {
+        Ok(parsed) => {
+            // Has prompt_id - use CLI mode
+            handle_share_cli(parsed);
+        }
+        Err(e) if e.contains("requires a prompt ID") => {
+            // No prompt_id - launch TUI
+            if let Err(tui_err) = crate::commands::share_tui::run_tui() {
+                eprintln!("TUI error: {}", tui_err);
+                std::process::exit(1);
+            }
+        }
         Err(e) => {
+            // Other parsing error
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
-    };
+    }
+}
 
+/// CLI mode for share command (when prompt_id is provided)
+fn handle_share_cli(parsed: ParsedArgs) {
     // Try to find repository (optional - prompt might be in DB)
     let repo = find_repository(&Vec::<String>::new()).ok();
 
@@ -39,24 +53,8 @@ pub fn handle_share(args: &[String]) {
         )
     });
 
-    // Create bundle request
-    let mut prompts = HashMap::new();
-    prompts.insert(parsed.prompt_id.clone(), prompt_record);
-
-    let bundle_request = CreateBundleRequest {
-        title,
-        data: BundleData {
-            prompts,
-            files: HashMap::new(),
-        },
-    };
-
-    // Create API client (uses default URL from env or default)
-    let context = ApiContext::new(None);
-    let client = ApiClient::new(context);
-
-    // Create the bundle
-    match client.create_bundle(bundle_request) {
+    // Create bundle using helper (single prompt only in CLI mode)
+    match create_bundle(parsed.prompt_id, prompt_record, title, false) {
         Ok(response) => {
             println!("Bundle created successfully!");
             println!("ID: {}", response.id);
@@ -104,5 +102,52 @@ pub fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
     let prompt_id = prompt_id.ok_or("share requires a prompt ID")?;
 
     Ok(ParsedArgs { prompt_id, title })
+}
+
+/// Create a bundle from a prompt, optionally including all prompts in the commit
+pub fn create_bundle(
+    prompt_id: String,
+    prompt_record: crate::authorship::authorship_log::PromptRecord,
+    title: String,
+    include_all_in_commit: bool,
+) -> Result<crate::api::CreateBundleResponse, crate::error::GitAiError> {
+    let mut prompts = HashMap::new();
+    prompts.insert(prompt_id.clone(), prompt_record.clone());
+
+    // If include_all_in_commit, fetch all prompts with same commit_sha
+    if include_all_in_commit {
+        // Get commit_sha from the prompt record - we need to look it up in the database
+        use crate::authorship::internal_db::InternalDatabase;
+
+        let db = InternalDatabase::global()?;
+        let db_guard = db.lock().map_err(|e| {
+            crate::error::GitAiError::Generic(format!("Failed to lock database: {}", e))
+        })?;
+
+        // Get the original database record to access commit_sha
+        if let Some(db_record) = db_guard.get_prompt(&prompt_id)? {
+            if let Some(commit_sha) = &db_record.commit_sha {
+                // Get all prompts for this commit
+                let commit_prompts = db_guard.get_prompts_by_commit(commit_sha)?;
+
+                for p in commit_prompts {
+                    prompts.insert(p.id.clone(), p.to_prompt_record());
+                }
+            }
+        }
+    }
+
+    // Create bundle with prompts
+    let bundle_request = CreateBundleRequest {
+        title,
+        data: BundleData {
+            prompts,
+            files: HashMap::new(),
+        },
+    };
+
+    let context = ApiContext::new(None);
+    let client = ApiClient::new(context);
+    client.create_bundle(bundle_request)
 }
 

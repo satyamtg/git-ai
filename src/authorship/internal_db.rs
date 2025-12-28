@@ -138,6 +138,116 @@ impl PromptDbRecord {
             overriden_lines: self.overridden_lines.unwrap_or(0),
         }
     }
+
+    /// Extract first user message snippet, truncated to max_length
+    pub fn first_message_snippet(&self, max_length: usize) -> String {
+        use crate::authorship::transcript::Message;
+
+        for message in &self.messages.messages {
+            if let Message::User { text, .. } = message {
+                if text.len() <= max_length {
+                    return text.clone();
+                } else {
+                    return format!("{}...", &text[..max_length.min(text.len())]);
+                }
+            }
+        }
+
+        // Fallback: if no user message, try first assistant message
+        for message in &self.messages.messages {
+            if let Message::Assistant { text, .. } = message {
+                if text.len() <= max_length {
+                    return text.clone();
+                } else {
+                    return format!("{}...", &text[..max_length.min(text.len())]);
+                }
+            }
+        }
+
+        "(No messages)".to_string()
+    }
+
+    /// Count total messages in transcript
+    pub fn message_count(&self) -> usize {
+        self.messages.messages.len()
+    }
+
+    /// Format relative time ("1 day ago", "5 days ago", etc.)
+    pub fn relative_time(&self) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let diff = now - self.updated_at;
+
+        if diff < 60 {
+            return format!("{} second{} ago", diff, if diff == 1 { "" } else { "s" });
+        }
+
+        let minutes = diff / 60;
+        if minutes < 60 {
+            return format!("{} minute{} ago", minutes, if minutes == 1 { "" } else { "s" });
+        }
+
+        let hours = minutes / 60;
+        if hours < 24 {
+            return format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" });
+        }
+
+        let days = hours / 24;
+        if days < 7 {
+            return format!("{} day{} ago", days, if days == 1 { "" } else { "s" });
+        }
+
+        let weeks = days / 7;
+        if weeks < 4 {
+            return format!("{} week{} ago", weeks, if weeks == 1 { "" } else { "s" });
+        }
+
+        let months = days / 30;
+        if months < 12 {
+            return format!("{} month{} ago", months, if months == 1 { "" } else { "s" });
+        }
+
+        let years = days / 365;
+        format!("{} year{} ago", years, if years == 1 { "" } else { "s" })
+    }
+
+    /// Compute branch name from commit_sha using git API
+    /// Returns None if no commit_sha or no branch found
+    /// Favors default branches (main, master) over others
+    pub fn compute_branch(&self, repo: &crate::git::repository::Repository) -> Option<String> {
+        use crate::git::repository::exec_git;
+
+        let commit_sha = self.commit_sha.as_ref()?;
+
+        // Use git for-each-ref to find branches containing this commit
+        let mut args = repo.global_args_for_exec();
+        args.push("for-each-ref".to_string());
+        args.push("--points-at".to_string());
+        args.push(commit_sha.clone());
+        args.push("--format=%(refname:short)".to_string());
+        args.push("refs/heads/".to_string());
+
+        let output = exec_git(&args).ok()?;
+        let output_str = String::from_utf8(output.stdout).ok()?;
+        let branches: Vec<&str> = output_str.lines().collect();
+
+        if branches.is_empty() {
+            return None;
+        }
+
+        // Favor default branches (main, master)
+        for branch in &branches {
+            if *branch == "main" || *branch == "master" {
+                return Some(branch.to_string());
+            }
+        }
+
+        // Return first branch found
+        Some(branches[0].to_string())
+    }
 }
 
 /// CAS sync queue record
@@ -483,6 +593,131 @@ impl InternalDatabase {
         )?;
 
         let rows = stmt.query_map(params![commit_sha], |row| {
+            let messages_json: String = row.get(5)?;
+            let messages: AiTranscript = serde_json::from_str(&messages_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
+            Ok(PromptDbRecord {
+                id: row.get(0)?,
+                workdir: row.get(1)?,
+                tool: row.get(2)?,
+                model: row.get(3)?,
+                external_thread_id: row.get(4)?,
+                messages,
+                commit_sha: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                human_author: row.get(9)?,
+                total_additions: row.get(10)?,
+                total_deletions: row.get(11)?,
+                accepted_lines: row.get(12)?,
+                overridden_lines: row.get(13)?,
+            })
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+
+        Ok(records)
+    }
+
+    /// List prompts with optional workdir filter, ordered by updated_at DESC
+    pub fn list_prompts(
+        &self,
+        workdir: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PromptDbRecord>, GitAiError> {
+        let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match workdir {
+            Some(wd) => (
+                "SELECT id, workdir, tool, model, external_thread_id, messages, commit_sha, created_at, updated_at,
+                        human_author, total_additions, total_deletions, accepted_lines, overridden_lines
+                 FROM prompts WHERE workdir = ?1 ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3".to_string(),
+                vec![Box::new(wd.to_string()), Box::new(limit as i64), Box::new(offset as i64)],
+            ),
+            None => (
+                "SELECT id, workdir, tool, model, external_thread_id, messages, commit_sha, created_at, updated_at,
+                        human_author, total_additions, total_deletions, accepted_lines, overridden_lines
+                 FROM prompts ORDER BY updated_at DESC LIMIT ?1 OFFSET ?2".to_string(),
+                vec![Box::new(limit as i64), Box::new(offset as i64)],
+            ),
+        };
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt.query_map(&params_refs[..], |row| {
+            let messages_json: String = row.get(5)?;
+            let messages: AiTranscript = serde_json::from_str(&messages_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
+            Ok(PromptDbRecord {
+                id: row.get(0)?,
+                workdir: row.get(1)?,
+                tool: row.get(2)?,
+                model: row.get(3)?,
+                external_thread_id: row.get(4)?,
+                messages,
+                commit_sha: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                human_author: row.get(9)?,
+                total_additions: row.get(10)?,
+                total_deletions: row.get(11)?,
+                accepted_lines: row.get(12)?,
+                overridden_lines: row.get(13)?,
+            })
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+
+        Ok(records)
+    }
+
+    /// Search prompts by message content with optional workdir filter
+    pub fn search_prompts(
+        &self,
+        search_query: &str,
+        workdir: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PromptDbRecord>, GitAiError> {
+        let search_pattern = format!("%{}%", search_query);
+
+        let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match workdir {
+            Some(wd) => (
+                "SELECT id, workdir, tool, model, external_thread_id, messages, commit_sha, created_at, updated_at,
+                        human_author, total_additions, total_deletions, accepted_lines, overridden_lines
+                 FROM prompts WHERE messages LIKE ?1 AND workdir = ?2 ORDER BY updated_at DESC LIMIT ?3 OFFSET ?4".to_string(),
+                vec![Box::new(search_pattern), Box::new(wd.to_string()), Box::new(limit as i64), Box::new(offset as i64)],
+            ),
+            None => (
+                "SELECT id, workdir, tool, model, external_thread_id, messages, commit_sha, created_at, updated_at,
+                        human_author, total_additions, total_deletions, accepted_lines, overridden_lines
+                 FROM prompts WHERE messages LIKE ?1 ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3".to_string(),
+                vec![Box::new(search_pattern), Box::new(limit as i64), Box::new(offset as i64)],
+            ),
+        };
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt.query_map(&params_refs[..], |row| {
             let messages_json: String = row.get(5)?;
             let messages: AiTranscript = serde_json::from_str(&messages_json).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
