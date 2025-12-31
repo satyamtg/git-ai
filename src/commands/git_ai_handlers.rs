@@ -1,3 +1,5 @@
+use serde_json::json;
+
 use crate::authorship::range_authorship;
 use crate::authorship::stats::stats_command;
 use crate::authorship::working_log::{AgentId, CheckpointKind};
@@ -11,8 +13,8 @@ use crate::config;
 use crate::git::find_repository;
 use crate::git::find_repository_in_path;
 use crate::git::repository::CommitRange;
-use crate::observability;
 use crate::observability::wrapper_performance_targets::log_performance_for_checkpoint;
+use crate::observability::{self, log_message};
 use std::env;
 use std::io::IsTerminal;
 use std::io::Read;

@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, id_file_path};
 use crate::git::find_repository_in_path;
 use futures::stream::{self, StreamExt};
 use serde_json::{Value, json};
@@ -7,6 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 /// Handle the flush-logs command
 pub fn handle_flush_logs(args: &[String]) {
@@ -31,6 +32,26 @@ pub fn handle_flush_logs(args: &[String]) {
                 .filter(|s| !s.is_empty())
         });
 
+    // Check for PostHog configuration: runtime env var takes precedence over build-time value
+    let posthog_api_key = std::env::var("POSTHOG_API_KEY")
+        .ok()
+        .or_else(|| option_env!("POSTHOG_API_KEY").map(|s| s.to_string()))
+        .filter(|s| !s.is_empty());
+
+    let posthog_host = std::env::var("POSTHOG_HOST")
+        .ok()
+        .or_else(|| option_env!("POSTHOG_HOST").map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://us.i.posthog.com".to_string());
+
+    // Find the .git/ai/logs directory
+    let (repo_root, logs_dir) = match find_logs_directory() {
+        Some(result) => result,
+        None => {
+            std::process::exit(1);
+        }
+    };
+
     // Check for OSS DSN: runtime env var takes precedence over build-time value
     // Can be explicitly disabled with empty string
     // Skip OSS DSN if OSS telemetry is disabled in config
@@ -44,17 +65,9 @@ pub fn handle_flush_logs(args: &[String]) {
     };
 
     // Need at least one DSN to proceed
-    if oss_dsn.is_none() && enterprise_dsn.is_none() {
+    if oss_dsn.is_none() && enterprise_dsn.is_none() && posthog_api_key.is_none() {
         std::process::exit(1);
     }
-
-    // Find the .git/ai/logs directory
-    let logs_dir = match find_logs_directory() {
-        Some(dir) => dir,
-        None => {
-            std::process::exit(1);
-        }
-    };
 
     // Get current PID to exclude our own log file
     let current_pid = std::process::id();
@@ -84,17 +97,26 @@ pub fn handle_flush_logs(args: &[String]) {
     }
 
     // Try to get repository info for metadata
-    let repo = find_repository_in_path(&logs_dir.to_string_lossy()).ok();
+    let repo = find_repository_in_path(&repo_root.to_string_lossy()).ok();
     let remotes_info = repo
         .as_ref()
         .and_then(|r| r.remotes_with_urls().ok())
         .unwrap_or_default();
 
+    // Get or create distinct_id from ~/.git-ai/distinct_id
+    let distinct_id = get_or_create_distinct_id();
+
     // Initialize Sentry clients
     let (oss_client, enterprise_client) = initialize_sentry_clients(oss_dsn, enterprise_dsn);
 
+    // Initialize PostHog client
+    let posthog_client = posthog_api_key
+        .as_ref()
+        .map(|api_key| PostHogClient::new(api_key.clone(), posthog_host.clone()));
+
     // Check if clients are present (needed for cleanup logic later)
-    let has_clients = oss_client.is_some() || enterprise_client.is_some();
+    let has_clients =
+        oss_client.is_some() || enterprise_client.is_some() || posthog_client.is_some();
 
     eprintln!(
         "Processing {} log files (max 10 concurrent)...",
@@ -105,13 +127,17 @@ pub fn handle_flush_logs(args: &[String]) {
     let results = smol::block_on(async {
         let oss_client = Arc::new(oss_client);
         let enterprise_client = Arc::new(enterprise_client);
+        let posthog_client = Arc::new(posthog_client);
         let remotes_info = Arc::new(remotes_info);
+        let distinct_id = Arc::new(distinct_id);
 
         stream::iter(log_files)
             .map(|log_file| {
                 let oss_client = Arc::clone(&oss_client);
                 let enterprise_client = Arc::clone(&enterprise_client);
+                let posthog_client = Arc::clone(&posthog_client);
                 let remotes_info = Arc::clone(&remotes_info);
+                let distinct_id = Arc::clone(&distinct_id);
 
                 smol::unblock(move || {
                     let file_name = log_file
@@ -123,7 +149,9 @@ pub fn handle_flush_logs(args: &[String]) {
                         &log_file,
                         &oss_client,
                         &enterprise_client,
+                        &posthog_client,
                         &remotes_info,
+                        &distinct_id,
                     ) {
                         Ok(count) if count > 0 => {
                             eprintln!("  ✓ {} - sent {} events", file_name, count);
@@ -231,7 +259,7 @@ fn cleanup_old_logs(logs_dir: &PathBuf) {
     }
 }
 
-fn find_logs_directory() -> Option<PathBuf> {
+fn find_logs_directory() -> Option<(PathBuf, PathBuf)> {
     let mut current = std::env::current_dir().ok()?;
 
     loop {
@@ -239,7 +267,7 @@ fn find_logs_directory() -> Option<PathBuf> {
         if git_dir.exists() && git_dir.is_dir() {
             let logs_dir = git_dir.join("ai").join("logs");
             if logs_dir.exists() && logs_dir.is_dir() {
-                return Some(logs_dir);
+                return Some((current.clone(), logs_dir));
             }
         }
 
@@ -254,6 +282,11 @@ fn find_logs_directory() -> Option<PathBuf> {
 struct SentryClient {
     endpoint: String,
     public_key: String,
+}
+
+struct PostHogClient {
+    api_key: String,
+    endpoint: String,
 }
 
 impl SentryClient {
@@ -306,6 +339,30 @@ impl SentryClient {
     }
 }
 
+impl PostHogClient {
+    fn new(api_key: String, host: String) -> Self {
+        let endpoint = format!("{}/capture/", host.trim_end_matches('/'));
+        PostHogClient { api_key, endpoint }
+    }
+
+    fn send_event(&self, event: Value) -> Result<(), Box<dyn std::error::Error>> {
+        let body = serde_json::to_string(&event)?;
+
+        let response = minreq::post(&self.endpoint)
+            .with_header("Content-Type", "application/json")
+            .with_body(body)
+            .send()?;
+
+        let status = response.status_code;
+
+        if status >= 200 && status < 300 {
+            Ok(())
+        } else {
+            Err(format!("PostHog returned status {}", status).into())
+        }
+    }
+}
+
 fn initialize_sentry_clients(
     oss_dsn: Option<String>,
     enterprise_dsn: Option<String>,
@@ -320,7 +377,9 @@ fn process_log_file(
     path: &PathBuf,
     oss_client: &Option<SentryClient>,
     enterprise_client: &Option<SentryClient>,
+    posthog_client: &Option<PostHogClient>,
     remotes_info: &[(String, String)],
+    distinct_id: &str,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(path)?;
     let mut count = 0;
@@ -336,14 +395,21 @@ fn process_log_file(
 
                 // Send to OSS if configured
                 if let Some(client) = oss_client {
-                    if send_envelope_to_sentry(&envelope, client, remotes_info) {
+                    if send_envelope_to_sentry(&envelope, client, remotes_info, distinct_id) {
                         sent = true;
                     }
                 }
 
                 // Send to Enterprise if configured
                 if let Some(client) = enterprise_client {
-                    if send_envelope_to_sentry(&envelope, client, remotes_info) {
+                    if send_envelope_to_sentry(&envelope, client, remotes_info, distinct_id) {
+                        sent = true;
+                    }
+                }
+
+                // Send to PostHog if configured
+                if let Some(client) = posthog_client {
+                    if send_envelope_to_posthog(&envelope, client, remotes_info, distinct_id) {
                         sent = true;
                     }
                 }
@@ -363,6 +429,7 @@ fn send_envelope_to_sentry(
     envelope: &Value,
     client: &SentryClient,
     remotes_info: &[(String, String)],
+    distinct_id: &str,
 ) -> bool {
     let event_type = envelope.get("type").and_then(|t| t.as_str());
     let timestamp = envelope
@@ -374,6 +441,7 @@ fn send_envelope_to_sentry(
     let mut tags = BTreeMap::new();
     tags.insert("os".to_string(), json!(std::env::consts::OS));
     tags.insert("arch".to_string(), json!(std::env::consts::ARCH));
+    tags.insert("distinct_id".to_string(), json!(distinct_id));
     for (remote_name, remote_url) in remotes_info {
         tags.insert(format!("remote.{}", remote_name), json!(remote_url));
     }
@@ -476,4 +544,99 @@ fn send_envelope_to_sentry(
         Ok(_) => true,
         Err(_) => false,
     }
+}
+
+fn send_envelope_to_posthog(
+    envelope: &Value,
+    client: &PostHogClient,
+    remotes_info: &[(String, String)],
+    distinct_id: &str,
+) -> bool {
+    let event_type = envelope.get("type").and_then(|t| t.as_str());
+
+    // Only send log messages to PostHog, not errors or performance
+    if event_type != Some("message") {
+        return false;
+    }
+
+    let timestamp = envelope.get("timestamp").and_then(|t| t.as_str());
+
+    // Build properties
+    let mut properties = BTreeMap::new();
+    properties.insert("os".to_string(), json!(std::env::consts::OS));
+    properties.insert("arch".to_string(), json!(std::env::consts::ARCH));
+    properties.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+
+    for (remote_name, remote_url) in remotes_info {
+        properties.insert(format!("remote_{}", remote_name), json!(remote_url));
+    }
+
+    let message = envelope
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("Unknown message");
+    let level = envelope
+        .get("level")
+        .and_then(|l| l.as_str())
+        .unwrap_or("info");
+    let context = envelope.get("context");
+
+    properties.insert("message".to_string(), json!(message));
+    properties.insert("level".to_string(), json!(level));
+
+    if let Some(ctx) = context {
+        if let Some(obj) = ctx.as_object() {
+            for (key, value) in obj {
+                properties.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    let mut event = json!({
+        "api_key": client.api_key,
+        "event": "log_message",
+        "properties": properties,
+        "distinct_id": distinct_id,
+    });
+
+    if let Some(ts) = timestamp {
+        event["timestamp"] = json!(ts);
+    }
+
+    match client.send_event(event) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+/// Get or create the distinct_id (UUID) from ~/.git-ai/distinct_id
+/// If the file doesn't exist, generates a new UUID and writes it to the file
+fn get_or_create_distinct_id() -> String {
+    let id_path = match id_file_path() {
+        Some(path) => path,
+        None => return "unknown".to_string(),
+    };
+
+    // Try to read existing ID
+    if let Ok(existing_id) = fs::read_to_string(&id_path) {
+        let trimmed = existing_id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    // Generate new UUID
+    let new_id = Uuid::new_v4().to_string();
+
+    // Ensure directory exists
+    if let Some(parent) = id_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    // Write the new ID to file
+    if let Err(e) = fs::write(&id_path, &new_id) {
+        eprintln!("Warning: Failed to write distinct_id file: {}", e);
+    }
+
+    new_id
 }

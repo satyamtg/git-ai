@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -38,6 +39,8 @@ struct PerformanceEnvelope {
     duration_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -148,13 +151,19 @@ pub fn log_error(error: &dyn std::error::Error, context: Option<serde_json::Valu
 }
 
 /// Log a performance metric to Sentry
-pub fn log_performance(operation: &str, duration: Duration, context: Option<serde_json::Value>) {
+pub fn log_performance(
+    operation: &str,
+    duration: Duration,
+    context: Option<serde_json::Value>,
+    tags: Option<HashMap<String, String>>,
+) {
     let envelope = PerformanceEnvelope {
         event_type: "performance".to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         operation: operation.to_string(),
         duration_ms: duration.as_millis(),
         context,
+        tags,
     };
 
     append_envelope(LogEnvelope::Performance(envelope));

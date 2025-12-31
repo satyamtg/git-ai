@@ -1,4 +1,4 @@
-use std::{ops::Add, time::Duration};
+use std::{collections::HashMap, ops::Add, time::Duration};
 
 use serde_json::json;
 
@@ -77,12 +77,15 @@ pub fn log_performance_target_if_violated(
             "performance_target_violated",
             total_duration,
             Some(json!({
-                "command": command,
                 "total_duration": total_duration.as_millis(),
                 "git_duration": git_duration.as_millis(),
                 "pre_command": pre_command.as_millis(),
                 "post_command": post_command.as_millis(),
             })),
+            Some(HashMap::from([(
+                "command".to_string(),
+                command.to_string(),
+            )])),
         );
     } else {
         debug_performance_log(&format!(
@@ -124,6 +127,10 @@ pub fn log_performance_for_checkpoint(
                 "checkpoint_kind": checkpoint_kind.to_string(),
                 "duration": duration.as_millis(),
             })),
+            Some(HashMap::from([(
+                "checkpoint_kind".to_string(),
+                checkpoint_kind.to_string(),
+            )])),
         );
 
         debug_performance_log(&format!(

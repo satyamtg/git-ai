@@ -451,6 +451,20 @@ pub fn config_file_path_public() -> Option<PathBuf> {
     config_file_path()
 }
 
+/// Public accessor for ID file path
+pub fn id_file_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let home = env::var("USERPROFILE").ok()?;
+        Some(Path::new(&home).join(".git-ai").join("distinct_id"))
+    }
+    #[cfg(not(windows))]
+    {
+        let home = env::var("HOME").ok()?;
+        Some(Path::new(&home).join(".git-ai").join("distinct_id"))
+    }
+}
+
 /// Load the raw file config
 pub fn load_file_config_public() -> Result<FileConfig, String> {
     let path =
