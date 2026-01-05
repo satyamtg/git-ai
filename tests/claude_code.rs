@@ -211,19 +211,18 @@ fn test_parse_claude_code_jsonl_with_thinking() {
     }
 
     // Verify message types and count
-    // Expected messages:
+    // Expected messages (tool_result is skipped as it's not human-authored):
     // 1. User: "add another hello world console log to @index.ts "
     // 2. Assistant: thinking message (should be parsed as Assistant)
     // 3. Assistant: "I'll add another hello world console log to the file."
     // 4. ToolUse: Edit
-    // 5. User: tool result
-    // 6. Assistant: thinking message (should be parsed as Assistant)
-    // 7. Assistant: "Done! I've added another `console.log('hello world')` statement at index.ts:21."
+    // 5. Assistant: thinking message (should be parsed as Assistant)
+    // 6. Assistant: "Done! I've added another `console.log('hello world')` statement at index.ts:21."
 
     assert_eq!(
         transcript.messages().len(),
-        7,
-        "Expected 7 messages (1 user + 2 thinking + 2 text + 1 tool_use + 1 tool_result)"
+        6,
+        "Expected 6 messages (1 user + 2 thinking + 2 text + 1 tool_use, tool_result skipped)"
     );
 
     // Check first message is User
@@ -259,21 +258,97 @@ fn test_parse_claude_code_jsonl_with_thinking() {
         assert_eq!(name, "Edit", "Tool should be Edit");
     }
 
-    // Check fifth message is User (tool result)
+    // Check fifth message is Assistant (thinking) - tool_result was skipped
     assert!(
-        matches!(transcript.messages()[4], Message::User { .. }),
-        "Fifth message should be User (tool result)"
+        matches!(transcript.messages()[4], Message::Assistant { .. }),
+        "Fifth message should be Assistant (thinking)"
     );
 
-    // Check sixth message is Assistant (thinking)
+    // Check sixth message is Assistant (text)
     assert!(
         matches!(transcript.messages()[5], Message::Assistant { .. }),
-        "Sixth message should be Assistant (thinking)"
+        "Sixth message should be Assistant (text)"
+    );
+}
+
+#[test]
+fn test_tool_results_are_not_parsed_as_user_messages() {
+    // This test verifies that tool_result content blocks in user messages
+    // are not incorrectly parsed as human-authored user messages.
+    // Tool results are system-generated responses to tool calls, not human input.
+
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    // Create a JSONL with a user message containing only a tool_result
+    let jsonl_content = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_123","type":"tool_result","content":"File created successfully"}]},"timestamp":"2025-01-01T00:00:00Z"}
+{"type":"assistant","message":{"model":"claude-sonnet-4-20250514","role":"assistant","content":[{"type":"text","text":"Done!"}]},"timestamp":"2025-01-01T00:00:01Z"}"#;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file.write_all(jsonl_content.as_bytes()).unwrap();
+    let temp_path = temp_file.path().to_str().unwrap();
+
+    let (transcript, _model) =
+        ClaudePreset::transcript_and_model_from_claude_code_jsonl(temp_path)
+            .expect("Failed to parse JSONL");
+
+    // Should only have 1 message (the assistant response)
+    // The tool_result should be skipped entirely
+    assert_eq!(
+        transcript.messages().len(),
+        1,
+        "Tool results should not be parsed as user messages"
     );
 
-    // Check seventh message is Assistant (text)
+    // The only message should be the assistant response
     assert!(
-        matches!(transcript.messages()[6], Message::Assistant { .. }),
-        "Seventh message should be Assistant (text)"
+        matches!(transcript.messages()[0], Message::Assistant { .. }),
+        "Only message should be Assistant"
+    );
+    if let Message::Assistant { text, .. } = &transcript.messages()[0] {
+        assert_eq!(text, "Done!");
+    }
+}
+
+#[test]
+fn test_user_text_content_blocks_are_parsed_correctly() {
+    // This test verifies that user messages with text content blocks
+    // (as opposed to simple string content) are parsed correctly.
+
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    // Create a JSONL with a user message containing a text content block
+    let jsonl_content = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello, can you help me?"}]},"timestamp":"2025-01-01T00:00:00Z"}
+{"type":"assistant","message":{"model":"claude-sonnet-4-20250514","role":"assistant","content":[{"type":"text","text":"Of course!"}]},"timestamp":"2025-01-01T00:00:01Z"}"#;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    temp_file.write_all(jsonl_content.as_bytes()).unwrap();
+    let temp_path = temp_file.path().to_str().unwrap();
+
+    let (transcript, _model) =
+        ClaudePreset::transcript_and_model_from_claude_code_jsonl(temp_path)
+            .expect("Failed to parse JSONL");
+
+    // Should have 2 messages (user + assistant)
+    assert_eq!(
+        transcript.messages().len(),
+        2,
+        "Should have user and assistant messages"
+    );
+
+    // First message should be User with the correct text
+    assert!(
+        matches!(transcript.messages()[0], Message::User { .. }),
+        "First message should be User"
+    );
+    if let Message::User { text, .. } = &transcript.messages()[0] {
+        assert_eq!(text, "Hello, can you help me?");
+    }
+
+    // Second message should be Assistant
+    assert!(
+        matches!(transcript.messages()[1], Message::Assistant { .. }),
+        "Second message should be Assistant"
     );
 }

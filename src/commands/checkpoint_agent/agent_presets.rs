@@ -182,14 +182,21 @@ impl ClaudePreset {
                         } else if let Some(content_array) =
                             raw_entry["message"]["content"].as_array()
                         {
-                            // Handle user messages with content array (like tool results)
+                            // Handle user messages with content array
                             for item in content_array {
-                                if let Some(text) = item["content"].as_str() {
-                                    if !text.trim().is_empty() {
-                                        transcript.add_message(Message::User {
-                                            text: text.to_string(),
-                                            timestamp: timestamp.clone(),
-                                        });
+                                // Skip tool_result items - those are system-generated responses, not human input
+                                if item["type"].as_str() == Some("tool_result") {
+                                    continue;
+                                }
+                                // Handle text content blocks from actual user input
+                                if item["type"].as_str() == Some("text") {
+                                    if let Some(text) = item["text"].as_str() {
+                                        if !text.trim().is_empty() {
+                                            transcript.add_message(Message::User {
+                                                text: text.to_string(),
+                                                timestamp: timestamp.clone(),
+                                            });
+                                        }
                                     }
                                 }
                             }
