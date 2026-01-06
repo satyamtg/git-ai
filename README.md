@@ -36,7 +36,7 @@ After you commit, `git-ai` adds a git note to track which lines were AI-authored
 
 <img src="https://github.com/acunniffe/git-ai/raw/main/assets/docs/graph.jpg" width="400" />
 
-## Installing the Stats Bot (currently in-development)
+## Installing the Stats Bot (early access)
 
 Aggregate `git-ai` data at the PR, developer, Repository and Organization levels:
 
