@@ -1,6 +1,7 @@
 use crate::api::client::ApiContext;
 use crate::config::{self, UpdateChannel};
 use crate::observability::log_message;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -17,10 +18,6 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
-const INSTALL_SCRIPT_URL: &str = "https://usegitai.com/install.sh";
-#[cfg(windows)]
-const INSTALL_SCRIPT_PS1_URL: &str =
-    "https://raw.githubusercontent.com/acunniffe/git-ai/main/install.ps1";
 const GIT_AI_RELEASE_ENV: &str = "GIT_AI_RELEASE_TAG";
 const BACKGROUND_SPAWN_THROTTLE_SECS: u64 = 60;
 
@@ -50,6 +47,7 @@ impl UpgradeAction {
 struct ChannelRelease {
     tag: String,
     semver: String,
+    checksum: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,9 +80,7 @@ impl UpdateCache {
 #[derive(Debug, Deserialize)]
 struct ChannelInfo {
     version: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    checksum: Option<String>,
+    checksum: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +175,115 @@ fn releases_endpoint() -> &'static str {
     "/worker/releases"
 }
 
+fn verify_sha256(content: &[u8], expected_hash: &str) -> Result<(), String> {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    let actual_hash = format!("{:x}", hasher.finalize());
+
+    if actual_hash.eq_ignore_ascii_case(expected_hash) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Checksum mismatch: expected {}, got {}",
+            expected_hash, actual_hash
+        ))
+    }
+}
+
+/// Parse SHA256SUMS file content into a map of filename → hash.
+/// Format: `<hash>  <filename>` (two spaces between hash and filename)
+fn parse_checksums(content: &str) -> HashMap<String, String> {
+    let mut checksums = HashMap::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Format: "<hash>  <filename>" (two spaces)
+        if let Some((hash, filename)) = line.split_once("  ") {
+            checksums.insert(filename.to_string(), hash.to_string());
+        }
+    }
+
+    checksums
+}
+
+/// Fetch SHA256SUMS from the releases API and verify against expected checksum.
+fn fetch_and_verify_checksums(
+    api_base_url: &str,
+    channel: &str,
+    expected_checksum: &str,
+) -> Result<HashMap<String, String>, String> {
+    let endpoint = format!("/worker/releases/{}/download/SHA256SUMS", channel);
+
+    let response = minreq::get(format!("{}{}", api_base_url, endpoint))
+        .with_header("User-Agent", format!("git-ai/{}", env!("CARGO_PKG_VERSION")))
+        .with_timeout(30)
+        .send()
+        .map_err(|e| format!("Failed to fetch SHA256SUMS: {}", e))?;
+
+    if response.status_code != 200 {
+        return Err(format!(
+            "Failed to fetch SHA256SUMS: HTTP {}",
+            response.status_code
+        ));
+    }
+
+    let content = response
+        .as_bytes();
+
+    verify_sha256(content, expected_checksum)
+        .map_err(|e| format!("SHA256SUMS verification failed: {}", e))?;
+
+    let content_str = std::str::from_utf8(content)
+        .map_err(|e| format!("SHA256SUMS is not valid UTF-8: {}", e))?;
+
+    Ok(parse_checksums(content_str))
+}
+
+/// Fetch install script from the releases API and verify against checksums.
+fn fetch_and_verify_install_script(
+    api_base_url: &str,
+    channel: &str,
+    checksums: &HashMap<String, String>,
+) -> Result<String, String> {
+    #[cfg(windows)]
+    let script_name = "install.ps1";
+    #[cfg(not(windows))]
+    let script_name = "install.sh";
+
+    let expected_checksum = checksums
+        .get(script_name)
+        .ok_or_else(|| format!("Checksum for {} not found in SHA256SUMS", script_name))?;
+
+    let endpoint = format!("/worker/releases/{}/download/{}", channel, script_name);
+
+    let response = minreq::get(format!("{}{}", api_base_url, endpoint))
+        .with_header("User-Agent", format!("git-ai/{}", env!("CARGO_PKG_VERSION")))
+        .with_timeout(30)
+        .send()
+        .map_err(|e| format!("Failed to fetch {}: {}", script_name, e))?;
+
+    if response.status_code != 200 {
+        return Err(format!(
+            "Failed to fetch {}: HTTP {}",
+            script_name, response.status_code
+        ));
+    }
+
+    let content = response.as_bytes();
+
+    verify_sha256(content, expected_checksum)
+        .map_err(|e| format!("{} verification failed: {}", script_name, e))?;
+
+    let script = std::str::from_utf8(content)
+        .map_err(|e| format!("{} is not valid UTF-8: {}", script_name, e))?;
+
+    Ok(script.to_string())
+}
+
 fn fetch_release_for_channel(
     api_base_url: &str,
     channel: UpdateChannel,
@@ -224,7 +329,16 @@ fn release_from_response(
         return Err(format!("Unable to parse semver from tag '{}'", tag));
     }
 
-    Ok(ChannelRelease { tag, semver })
+    let checksum = channel_info.checksum.trim().to_string();
+    if checksum.is_empty() {
+        return Err("Checksum not found in response".to_string());
+    }
+
+    Ok(ChannelRelease {
+        tag,
+        semver,
+        checksum,
+    })
 }
 
 #[cfg(test)]
@@ -240,7 +354,7 @@ fn try_mock_releases(
     )
 }
 
-fn run_install_script_for_tag(tag: &str, silent: bool) -> Result<(), String> {
+fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
         // On Windows, we need to run the installer detached because the current git-ai
@@ -259,29 +373,33 @@ fn run_install_script_for_tag(tag: &str, silent: bool) -> Result<(), String> {
         let log_file = log_dir.join(format!("upgrade-{}.log", pid));
         let log_path_str = log_file.to_string_lossy().to_string();
 
-        // Create an empty log file to ensure it exists
+        // Write the install script to a temp file
+        let script_path = log_dir.join(format!("install-{}.ps1", pid));
+        fs::write(&script_path, script_content)
+            .map_err(|e| format!("Failed to write install script: {}", e))?;
+        let script_path_str = script_path.to_string_lossy().to_string();
+
+        // Create log file with initial message
         fs::write(&log_file, format!("Starting upgrade at PID {}\n", pid))
             .map_err(|e| format!("Failed to create log file: {}", e))?;
 
-        // PowerShell script that handles its own logging
-        // The script captures all output using Start-Transcript
-        let ps_script = format!(
+        // PowerShell wrapper that executes the script file with logging
+        let ps_wrapper = format!(
             "$logFile = '{}'; \
              Start-Transcript -Path $logFile -Append -Force | Out-Null; \
-             Write-Host 'Fetching install script from {}'; \
+             Write-Host 'Running verified install script...'; \
              try {{ \
                  $ErrorActionPreference = 'Continue'; \
-                 $script = Invoke-RestMethod -Uri '{}' -UseBasicParsing; \
-                 Write-Host 'Running install script...'; \
-                 Invoke-Expression $script; \
+                 & '{}'; \
                  Write-Host 'Install script completed'; \
              }} catch {{ \
                  Write-Host \"Error: $_\"; \
                  Write-Host \"Stack trace: $($_.ScriptStackTrace)\"; \
              }} finally {{ \
                  Stop-Transcript | Out-Null; \
+                 Remove-Item -Path '{}' -Force -ErrorAction SilentlyContinue; \
              }}",
-            log_path_str, INSTALL_SCRIPT_PS1_URL, INSTALL_SCRIPT_PS1_URL
+            log_path_str, script_path_str, script_path_str
         );
 
         let mut cmd = Command::new("powershell");
@@ -289,7 +407,7 @@ fn run_install_script_for_tag(tag: &str, silent: bool) -> Result<(), String> {
             .arg("-ExecutionPolicy")
             .arg("Bypass")
             .arg("-Command")
-            .arg(&ps_script)
+            .arg(&ps_wrapper)
             .env(GIT_AI_RELEASE_ENV, tag);
 
         // Hide the spawned console to prevent any host/UI bleed-through
@@ -321,16 +439,33 @@ fn run_install_script_for_tag(tag: &str, silent: bool) -> Result<(), String> {
 
     #[cfg(not(windows))]
     {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Write script to a temp file
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join(format!("git-ai-install-{}.sh", std::process::id()));
+
+        // Write and make executable
+        let mut file = fs::File::create(&script_path)
+            .map_err(|e| format!("Failed to create temp script file: {}", e))?;
+        file.write_all(script_content.as_bytes())
+            .map_err(|e| format!("Failed to write install script: {}", e))?;
+        drop(file);
+
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Failed to make script executable: {}", e))?;
+
+        let script_path_str = script_path.to_string_lossy().to_string();
+
         let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg(format!("curl -fsSL {} | bash", INSTALL_SCRIPT_URL))
-            .env(GIT_AI_RELEASE_ENV, tag);
+        cmd.arg(&script_path_str).env(GIT_AI_RELEASE_ENV, tag);
 
         if silent {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
 
-        match cmd.status() {
+        let result = match cmd.status() {
             Ok(status) => {
                 if status.success() {
                     Ok(())
@@ -342,7 +477,12 @@ fn run_install_script_for_tag(tag: &str, silent: bool) -> Result<(), String> {
                 }
             }
             Err(e) => Err(format!("Failed to run installation script: {}", e)),
-        }
+        };
+
+        // Clean up temp script
+        let _ = fs::remove_file(&script_path);
+
+        result
     }
 }
 
@@ -446,10 +586,40 @@ fn run_impl_with_url(
         return action;
     }
 
+    println!("Fetching and verifying release artifacts...");
+
+    // Fetch and verify SHA256SUMS against the release's master checksum
+    let checksums = match fetch_and_verify_checksums(api_base_url, channel.as_str(), &release.checksum) {
+        Ok(checksums) => {
+            println!("\x1b[1;32m✓\x1b[0m SHA256SUMS verified");
+            checksums
+        }
+        Err(err) => {
+            eprintln!("Failed to fetch/verify checksums: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    // Fetch and verify the install script
+    let script_content = match fetch_and_verify_install_script(api_base_url, channel.as_str(), &checksums) {
+        Ok(content) => {
+            #[cfg(windows)]
+            println!("\x1b[1;32m✓\x1b[0m install.ps1 verified");
+            #[cfg(not(windows))]
+            println!("\x1b[1;32m✓\x1b[0m install.sh verified");
+            content
+        }
+        Err(err) => {
+            eprintln!("Failed to fetch/verify install script: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    println!();
     println!("Running installation script...");
     println!();
 
-    match run_install_script_for_tag(&release.tag, false) {
+    match run_install_script(&script_content, &release.tag, false) {
         Ok(()) => {
             // On Windows, we spawn the installer in the background and can't verify success
             #[cfg(not(windows))]
@@ -630,13 +800,15 @@ mod tests {
 
         let mock_url = |body: &str| format!("mock://{}", body);
         let current = env!("CARGO_PKG_VERSION");
+        let test_checksum = "a".repeat(64); // Valid SHA256 length
 
         // Newer version available - should upgrade
         let action = run_impl_with_url(
             false,
-            &mock_url(
-                r#"{"channels":{"latest":{"version":"v999.0.0"},"next":{"version":"v999.0.0-next-deadbeef"}}}"#,
-            ),
+            &mock_url(&format!(
+                r#"{{"channels":{{"latest":{{"version":"v999.0.0","checksum":"{}"}},"next":{{"version":"v999.0.0-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
+            )),
             UpdateChannel::Latest,
             true,
         );
@@ -644,8 +816,8 @@ mod tests {
 
         // Same version without --force - already latest
         let same_version_payload = format!(
-            "{{\"channels\":{{\"latest\":{{\"version\":\"v{}\"}},\"next\":{{\"version\":\"v{}-next-deadbeef\"}}}}}}",
-            current, current
+            "{{\"channels\":{{\"latest\":{{\"version\":\"v{}\",\"checksum\":\"{}\"}},\"next\":{{\"version\":\"v{}-next-deadbeef\",\"checksum\":\"{}\"}}}}}}",
+            current, test_checksum, current, test_checksum
         );
         let action = run_impl_with_url(
             false,
@@ -667,9 +839,10 @@ mod tests {
         // Older version without --force - running newer version
         let action = run_impl_with_url(
             false,
-            &mock_url(
-                r#"{"channels":{"latest":{"version":"v1.0.9"},"next":{"version":"v1.0.9-next-deadbeef"}}}"#,
-            ),
+            &mock_url(&format!(
+                r#"{{"channels":{{"latest":{{"version":"v1.0.9","checksum":"{}"}},"next":{{"version":"v1.0.9-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
+            )),
             UpdateChannel::Latest,
             true,
         );
@@ -678,9 +851,10 @@ mod tests {
         // Older version with --force - force reinstall
         let action = run_impl_with_url(
             true,
-            &mock_url(
-                r#"{"channels":{"latest":{"version":"v1.0.9"},"next":{"version":"v1.0.9-next-deadbeef"}}}"#,
-            ),
+            &mock_url(&format!(
+                r#"{{"channels":{{"latest":{{"version":"v1.0.9","checksum":"{}"}},"next":{{"version":"v1.0.9-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
+            )),
             UpdateChannel::Latest,
             true,
         );
@@ -723,5 +897,95 @@ mod tests {
 
         // Cache doesn't match channel - should check for updates
         assert!(should_check_for_updates(UpdateChannel::Next, Some(&cache)));
+    }
+
+    #[test]
+    fn test_verify_sha256_success() {
+        let content = b"hello world";
+        // SHA256 of "hello world"
+        let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        assert!(verify_sha256(content, expected).is_ok());
+    }
+
+    #[test]
+    fn test_verify_sha256_case_insensitive() {
+        let content = b"hello world";
+        let expected_upper = "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
+        assert!(verify_sha256(content, expected_upper).is_ok());
+    }
+
+    #[test]
+    fn test_verify_sha256_mismatch() {
+        let content = b"hello world";
+        let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let result = verify_sha256(content, wrong_hash);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Checksum mismatch"));
+    }
+
+    #[test]
+    fn test_verify_sha256_empty_content() {
+        let content = b"";
+        // SHA256 of empty string
+        let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(verify_sha256(content, expected).is_ok());
+    }
+
+    #[test]
+    fn test_parse_checksums_valid_format() {
+        let content = "594de6cf107e8ffb6efd9029bf727b465ab55a9b4c4c3995eb3e628c857dc423  git-ai-linux-arm64\n\
+                       88db3c0c7fc62a815579ec0ca42535c2b83ab18d9e3af8efe345dee96677b1d8  git-ai-linux-x64\n\
+                       75d1692d347c3e08a208dc6373df4cee2b5ffd0e2aee62ccb1bb47aae866b2c8  install.sh";
+
+        let checksums = parse_checksums(content);
+        assert_eq!(checksums.len(), 3);
+        assert_eq!(
+            checksums.get("git-ai-linux-arm64"),
+            Some(&"594de6cf107e8ffb6efd9029bf727b465ab55a9b4c4c3995eb3e628c857dc423".to_string())
+        );
+        assert_eq!(
+            checksums.get("git-ai-linux-x64"),
+            Some(&"88db3c0c7fc62a815579ec0ca42535c2b83ab18d9e3af8efe345dee96677b1d8".to_string())
+        );
+        assert_eq!(
+            checksums.get("install.sh"),
+            Some(&"75d1692d347c3e08a208dc6373df4cee2b5ffd0e2aee62ccb1bb47aae866b2c8".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_checksums_with_extensions() {
+        let content = "23c693a25f4f2e99463c911e67d534ae17cbd9b98513aa65f0ae9da861775d54  git-ai-windows-x64.exe\n\
+                       f895af791eb30f6b074b2ab9f0f803e91230b084f5864befcb51ee9ced752adf  install.ps1";
+
+        let checksums = parse_checksums(content);
+        assert_eq!(checksums.len(), 2);
+        assert!(checksums.contains_key("git-ai-windows-x64.exe"));
+        assert!(checksums.contains_key("install.ps1"));
+    }
+
+    #[test]
+    fn test_parse_checksums_empty_input() {
+        let checksums = parse_checksums("");
+        assert!(checksums.is_empty());
+    }
+
+    #[test]
+    fn test_parse_checksums_whitespace_lines() {
+        let content = "  \n\nhash  file\n  \n";
+        let checksums = parse_checksums(content);
+        assert_eq!(checksums.len(), 1);
+        assert_eq!(checksums.get("file"), Some(&"hash".to_string()));
+    }
+
+    #[test]
+    fn test_parse_checksums_ignores_invalid_lines() {
+        // Lines with single space or no space should be ignored
+        let content = "valid  file1\ninvalid file2\nalsovalid  file3";
+        let checksums = parse_checksums(content);
+        assert_eq!(checksums.len(), 2);
+        assert!(checksums.contains_key("file1"));
+        assert!(checksums.contains_key("file3"));
+        assert!(!checksums.contains_key("file2"));
     }
 }
