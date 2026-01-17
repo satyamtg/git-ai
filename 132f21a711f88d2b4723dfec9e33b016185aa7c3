@@ -3,19 +3,5 @@
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.0.34",
   "base_commit_sha": "132f21a711f88d2b4723dfec9e33b016185aa7c3",
-  "prompts": {
-    "52d2be65babe8af0": {
-      "agent_id": {
-        "tool": "DeputyDev",
-        "id": "364726",
-        "model": "CLAUDE_4_POINT_5_SONNET"
-      },
-      "human_author": "Satyam Kumar <satyam.kumar1@1mg.com>",
-      "messages": [],
-      "total_additions": 132,
-      "total_deletions": 2,
-      "accepted_lines": 130,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
