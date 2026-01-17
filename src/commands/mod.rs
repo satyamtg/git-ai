@@ -16,5 +16,8 @@ pub mod share_tui;
 pub mod show;
 pub mod show_prompt;
 pub mod squash_authorship;
+pub mod rebase_authorship_cmd;
+pub mod cherry_pick_authorship_cmd;
+pub mod amend_authorship_cmd;
 pub mod sync_prompts;
 pub mod upgrade;
