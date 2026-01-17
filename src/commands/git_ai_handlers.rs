@@ -125,6 +125,15 @@ pub fn handle_git_ai(args: &[String]) {
         "squash-authorship" => {
             commands::squash_authorship::handle_squash_authorship(&args[1..]);
         }
+        "rebase-authorship" => {
+            commands::rebase_authorship_cmd::handle_rebase_authorship(&args[1..]);
+        }
+        "cherry-pick-authorship" => {
+            commands::cherry_pick_authorship_cmd::handle_cherry_pick_authorship(&args[1..]);
+        }
+        "amend-authorship" => {
+            commands::amend_authorship_cmd::handle_amend_authorship(&args[1..]);
+        }
         "ci" => {
             commands::ci_handlers::handle_ci(&args[1..]);
         }
@@ -233,6 +242,15 @@ fn print_help() {
     eprintln!(
         "    <base_branch> <new_sha> <old_sha>  Required: base branch, new commit SHA, old commit SHA"
     );
+    eprintln!("    --dry-run             Show what would be done without making changes");
+    eprintln!("  rebase-authorship  Rewrite authorship after rebase");
+    eprintln!("    <original_head> --original-commits <sha...> --new-commits <sha...>");
+    eprintln!("    --dry-run             Show what would be done without making changes");
+    eprintln!("  cherry-pick-authorship  Rewrite authorship after cherry-pick");
+    eprintln!("    --source-commits <sha...> --new-commits <sha...>");
+    eprintln!("    --dry-run             Show what would be done without making changes");
+    eprintln!("  amend-authorship   Rewrite authorship after commit amend");
+    eprintln!("    <original_commit> <amended_commit>");
     eprintln!("    --dry-run             Show what would be done without making changes");
     eprintln!("  git-path           Print the path to the underlying git executable");
     eprintln!("  upgrade            Check for updates and install if available");

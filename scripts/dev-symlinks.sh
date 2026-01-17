@@ -8,128 +8,119 @@ if [[ "$#" -gt 0 && "$1" == "--release" ]]; then
     BUILD_TYPE="release"
 fi
 
-# Fixed location for gitwrap symlinks
-GITWRAP_DIR="$HOME/.git-ai-local-dev/gitwrap/bin"
-PROJECT_DIR="$(pwd)"
-PATH_EXPORT_LINE="export PATH=\"$GITWRAP_DIR:\$PATH\""
-PATH_MARKER="# git-ai local dev"
+# Colors for output
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# Determine which shell profile to use
-detect_shell_profile() {
-    local shell_name
-    shell_name=$(basename "$SHELL")
+PROJECT_DIR=$(pwd)
+GITWRAP_BIN="$PROJECT_DIR/target/gitwrap/bin"
+TARGET_BINARY="$PROJECT_DIR/target/$BUILD_TYPE/git-ai"
 
-    case "$shell_name" in
-        zsh)
-            # Prefer .zshrc for interactive shells, fall back to .zprofile
-            if [[ -f "$HOME/.zshrc" ]]; then
-                echo "$HOME/.zshrc"
-            elif [[ -f "$HOME/.zprofile" ]]; then
-                echo "$HOME/.zprofile"
-            else
-                echo "$HOME/.zshrc"
-            fi
-            ;;
-        bash)
-            # On macOS, prefer .bash_profile; on Linux, prefer .bashrc
-            if [[ "$(uname)" == "Darwin" ]]; then
-                if [[ -f "$HOME/.bash_profile" ]]; then
-                    echo "$HOME/.bash_profile"
-                elif [[ -f "$HOME/.bashrc" ]]; then
-                    echo "$HOME/.bashrc"
-                else
-                    echo "$HOME/.bash_profile"
-                fi
-            else
-                if [[ -f "$HOME/.bashrc" ]]; then
-                    echo "$HOME/.bashrc"
-                elif [[ -f "$HOME/.bash_profile" ]]; then
-                    echo "$HOME/.bash_profile"
-                else
-                    echo "$HOME/.bashrc"
-                fi
-            fi
-            ;;
-        *)
-            # Default to .profile for unknown shells
-            echo "$HOME/.profile"
-            ;;
-    esac
-}
+mkdir -p "$GITWRAP_BIN"
 
-SHELL_PROFILE=$(detect_shell_profile)
+# Check if symlinks already exist and point to correct location
+SYMLINK_GIT="$GITWRAP_BIN/debug-git"
+SYMLINK_GIT_AI="$GITWRAP_BIN/debug-git-ai"
 
-# Create gitwrap directory
-mkdir -p "$GITWRAP_DIR"
+NEEDS_UPDATE=false
 
-echo "Creating symlinks in $GITWRAP_DIR pointing to $PROJECT_DIR/target/$BUILD_TYPE"
-ln -sf "$PROJECT_DIR/target/$BUILD_TYPE/git-ai" "$GITWRAP_DIR/git"
-ln -sf "$PROJECT_DIR/target/$BUILD_TYPE/git-ai" "$GITWRAP_DIR/git-ai"
-
-echo "Installing hooks..."
-if ! "$GITWRAP_DIR/git-ai" install-hooks; then
-    echo "Error: Failed to install hooks" >&2
-    exit 1
-fi
-
-# Check and update shell profile
-PROFILE_CHANGED=false
-
-# Create profile if it doesn't exist
-if [[ ! -f "$SHELL_PROFILE" ]]; then
-    touch "$SHELL_PROFILE"
-fi
-
-# Check if any git-ai local dev PATH entry exists
-if grep -q "git-ai-local-dev/gitwrap/bin" "$SHELL_PROFILE" || grep -q "target/gitwrap/bin" "$SHELL_PROFILE"; then
-    # Extract the current PATH line (either old or new format)
-    CURRENT_LINE=$(grep -E "(git-ai-local-dev/gitwrap/bin|target/gitwrap/bin)" "$SHELL_PROFILE" | head -n 1)
-
-    if [[ "$CURRENT_LINE" == "$PATH_EXPORT_LINE" ]]; then
-        echo ""
-        echo "Shell profile ($SHELL_PROFILE) already has the correct PATH configuration."
-        echo "No changes required."
-    else
-        echo ""
-        echo "Updating existing git-ai PATH entry in $SHELL_PROFILE..."
-
-        # Remove old marker comment if present
-        sed -i.bak '/# git-ai local dev/d' "$SHELL_PROFILE"
-        # Remove old PATH lines (both old and new format)
-        sed -i.bak '/git-ai-local-dev\/gitwrap\/bin/d' "$SHELL_PROFILE"
-        sed -i.bak '/target\/gitwrap\/bin/d' "$SHELL_PROFILE"
-
-        # Add new configuration
-        echo "" >> "$SHELL_PROFILE"
-        echo "$PATH_MARKER" >> "$SHELL_PROFILE"
-        echo "$PATH_EXPORT_LINE" >> "$SHELL_PROFILE"
-
-        # Clean up backup files
-        rm -f "$SHELL_PROFILE.bak"
-
-        PROFILE_CHANGED=true
+if [ -L "$SYMLINK_GIT" ]; then
+    CURRENT_TARGET=$(readlink "$SYMLINK_GIT")
+    if [ "$CURRENT_TARGET" != "$TARGET_BINARY" ]; then
+        echo -e "${YELLOW}⚠ debug-git symlink exists but points to wrong target${NC}"
+        echo "  Current: $CURRENT_TARGET"
+        echo "  Expected: $TARGET_BINARY"
+        NEEDS_UPDATE=true
     fi
 else
+    NEEDS_UPDATE=true
+fi
+
+if [ -L "$SYMLINK_GIT_AI" ]; then
+    CURRENT_TARGET=$(readlink "$SYMLINK_GIT_AI")
+    if [ "$CURRENT_TARGET" != "$TARGET_BINARY" ]; then
+        echo -e "${YELLOW}⚠ debug-git-ai symlink exists but points to wrong target${NC}"
+        echo "  Current: $CURRENT_TARGET"
+        echo "  Expected: $TARGET_BINARY"
+        NEEDS_UPDATE=true
+    fi
+else
+    NEEDS_UPDATE=true
+fi
+
+if [ "$NEEDS_UPDATE" = true ]; then
+    echo -e "${BLUE}Creating/updating debug symlinks to target/$BUILD_TYPE${NC}"
+    ln -sf "$TARGET_BINARY" "$SYMLINK_GIT"
+    ln -sf "$TARGET_BINARY" "$SYMLINK_GIT_AI"
     echo ""
-    echo "Adding git-ai PATH configuration to $SHELL_PROFILE..."
+    echo -e "${GREEN}✓ Created/updated symlinks:${NC}"
+    echo "  debug-git     → target/$BUILD_TYPE/git-ai (wrapper mode)"
+    echo "  debug-git-ai  → target/$BUILD_TYPE/git-ai (direct mode)"
+else
+    echo -e "${GREEN}✓ Symlinks already exist and are correct:${NC}"
+    echo "  debug-git     → target/$BUILD_TYPE/git-ai (wrapper mode)"
+    echo "  debug-git-ai  → target/$BUILD_TYPE/git-ai (direct mode)"
+fi
+echo ""
 
-    echo "" >> "$SHELL_PROFILE"
-    echo "$PATH_MARKER" >> "$SHELL_PROFILE"
-    echo "$PATH_EXPORT_LINE" >> "$SHELL_PROFILE"
+# Detect shell config file
+SHELL_CONFIG=""
+if [ -f "$HOME/.zshrc" ]; then
+    SHELL_CONFIG="$HOME/.zshrc"
+elif [ -f "$HOME/.bashrc" ]; then
+    SHELL_CONFIG="$HOME/.bashrc"
+elif [ -f "$HOME/.bash_profile" ]; then
+    SHELL_CONFIG="$HOME/.bash_profile"
+fi
 
-    PROFILE_CHANGED=true
+# Check if already in PATH
+PATH_EXPORT="export PATH=\"$GITWRAP_BIN:\$PATH\""
+ALREADY_IN_PATH=false
+
+if [ -n "$SHELL_CONFIG" ] && [ -f "$SHELL_CONFIG" ]; then
+    if grep -q "$GITWRAP_BIN" "$SHELL_CONFIG" 2>/dev/null; then
+        ALREADY_IN_PATH=true
+    fi
+fi
+
+# Offer to add to PATH
+if [ "$ALREADY_IN_PATH" = true ]; then
+    echo -e "${GREEN}✓ Already in PATH${NC} (found in $SHELL_CONFIG)"
+    echo ""
+    echo "You can use the commands immediately after reloading your shell:"
+    echo -e "  ${YELLOW}source $SHELL_CONFIG${NC}"
+elif [ -n "$SHELL_CONFIG" ]; then
+    echo -e "${YELLOW}Add to PATH?${NC}"
+    echo "Would you like to add debug commands to your PATH in $SHELL_CONFIG? (y/n)"
+    read -r response
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        echo "" >> "$SHELL_CONFIG"
+        echo "# git-ai debug commands (added $(date +%Y-%m-%d))" >> "$SHELL_CONFIG"
+        echo "$PATH_EXPORT" >> "$SHELL_CONFIG"
+        echo ""
+        echo -e "${GREEN}✓ Added to $SHELL_CONFIG${NC}"
+        echo ""
+        echo "Reload your shell to use the commands:"
+        echo -e "  ${YELLOW}source $SHELL_CONFIG${NC}"
+    else
+        echo ""
+        echo -e "${YELLOW}Skipped.${NC} Manually add to your shell profile:"
+        echo "  $PATH_EXPORT"
+    fi
+else
+    echo -e "${YELLOW}Could not detect shell config file.${NC}"
+    echo "Manually add to your shell profile (~/.zshrc or ~/.bashrc):"
+    echo "  $PATH_EXPORT"
 fi
 
 echo ""
-if [[ "$PROFILE_CHANGED" == true ]]; then
-    echo "=========================================="
-    echo "Shell profile has been updated!"
-    echo ""
-    echo "Please restart all your open shells or run:"
-    echo "  source $SHELL_PROFILE"
-    echo ""
-    echo "Make sure to remove any git aliases or artifacts from running 'install.sh'"
-    echo "=========================================="
-else
-    echo "Symlinks updated successfully. Your shell is already configured correctly."
-fi
+echo -e "${BLUE}Usage examples:${NC}"
+echo "  debug-git-ai --version"
+echo "  debug-git-ai rebase-authorship --help"
+echo "  debug-git-ai cherry-pick-authorship --help"
+echo "  debug-git-ai amend-authorship --help"
+echo "  debug-git status  # Acts as git wrapper"
+echo ""
+echo -e "${GREEN}Note:${NC} These commands use the $BUILD_TYPE build. Rebuild with 'cargo build' to update."

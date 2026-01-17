@@ -38,24 +38,49 @@ Thank you for your interest in contributing to `git-ai`. This is a cool moment f
 
 ### (Option 1) Putting a development build on your path
 
-It's often helpful to point your `git` and `git-ai`  to a development build of `git-ai`. 
+The recommended way to test your changes is to use the debug commands (`debug-git-ai` and `debug-git`). This approach doesn't interfere with any installed version of git-ai.
 
-First add the development symlinks and build a debug build:
+Build and create the debug symlinks:
 
 ```bash
-sh scripts/dev-symlinks.sh
-task debug:local 
+cargo build                  # Build debug version
+sh scripts/dev-symlinks.sh   # Create symlinks (no additional build needed)
 ```
 
-This will create symlinks to your development build, allowing you to test your changes with real git repositories.
-
-### (Option 2) Running with Cargo
-
-You can run specific `git-ai` commands directly with cargo. Because you're not addressing `git` or `git-ai` you need to tell `cargo` which codepath it should hit:
+Then add the debug commands to your PATH by adding this to your `~/.zshrc` or `~/.bashrc`:
 
 ```bash
-GIT_AI=git cargo run -- status
-GIT_AI=git-ai cargo run -- checkpoint
+export PATH="/path/to/git-ai/target/gitwrap/bin:$PATH"
+```
+
+After restarting your terminal, you can use:
+
+```bash
+debug-git-ai --version              # Test git-ai commands
+debug-git-ai rebase-authorship --help
+debug-git status                    # Test as git wrapper
+```
+
+**Why this is better:** The symlinks automatically point to your latest build, so just run `cargo build` after making changes - no reinstall needed!
+
+### (Option 1b) Install debug build to ~/.local/bin
+
+Alternatively, you can install the debug build to `~/.local/bin/git-ai`:
+
+```bash
+task debug:local   # Builds AND installs in one command
+```
+
+This installs as `git-ai` (not `debug-git-ai`) and replaces any existing installation in `~/.local/bin`. You'll need to run `task debug:local` again after each code change.
+
+### (Option 2) Running with Cargo directly
+
+You can run specific commands directly with cargo without creating symlinks:
+
+```bash
+GIT_AI=git-ai cargo run -- --version
+GIT_AI=git-ai cargo run -- rebase-authorship --help
+GIT_AI=git cargo run -- status     # Test as git wrapper
 ```
 
 ## Contributing Changes
