@@ -83,7 +83,7 @@ pub fn handle_git_ai(args: &[String]) {
                 eprintln!(
                     "Skipping checkpoint because repository is excluded or not in allow_repositories list"
                 );
-                std::process::exit(1);
+                std::process::exit(0);
             }
             handle_checkpoint(&args[1..]);
         }
@@ -238,22 +238,22 @@ fn handle_checkpoint(args: &[String]) {
                         let mut buffer = String::new();
                         if let Err(e) = stdin.read_to_string(&mut buffer) {
                             eprintln!("Failed to read stdin for hook input: {}", e);
-                            std::process::exit(1);
+                            std::process::exit(0);
                         }
                         if !buffer.trim().is_empty() {
                             hook_input = Some(buffer);
                         } else {
                             eprintln!("No hook input provided (via --hook-input or stdin).");
-                            std::process::exit(1);
+                            std::process::exit(0);
                         }
                     } else if hook_input.as_ref().unwrap().trim().is_empty() {
                         eprintln!("Error: --hook-input requires a value");
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                     i += 2;
                 } else {
                     eprintln!("Error: --hook-input requires a value or 'stdin' to read from stdin");
-                    std::process::exit(1);
+                    std::process::exit(0);
                 }
             }
 
@@ -279,7 +279,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Claude preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -295,7 +295,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Gemini preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -311,7 +311,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Continue CLI preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -327,7 +327,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Error running Cursor preset: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -340,7 +340,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Github Copilot preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -356,7 +356,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("ai_tab preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -369,7 +369,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Agent V1 preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -429,7 +429,7 @@ fn handle_checkpoint(args: &[String]) {
         Ok(repo) => repo,
         Err(e) => {
             eprintln!("Failed to find repository: {}", e);
-            std::process::exit(1);
+            std::process::exit(0);
         }
     };
 
@@ -510,7 +510,7 @@ fn handle_checkpoint(args: &[String]) {
                 "checkpoint_kind": format!("{:?}", checkpoint_kind)
             });
             observability::log_error(&e, Some(context));
-            std::process::exit(1);
+            std::process::exit(0);
         }
     }
 }
