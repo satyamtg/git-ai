@@ -1,0 +1,23 @@
+Cargo.toml
+  6b7fcb617335b1f2 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.0.34",
+  "base_commit_sha": "7b9454927d15d83045915735719c4037711120c3",
+  "prompts": {
+    "6b7fcb617335b1f2": {
+      "agent_id": {
+        "tool": "DeputyDev",
+        "id": "365818",
+        "model": "CLAUDE_4_POINT_5_SONNET"
+      },
+      "human_author": "Satyam Kumar <satyam.kumar1@1mg.com>",
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 2,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
