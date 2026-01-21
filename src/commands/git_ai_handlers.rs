@@ -150,6 +150,9 @@ pub fn handle_git_ai(args: &[String]) {
         "sync-prompts" => {
             commands::sync_prompts::handle_sync_prompts(&args[1..]);
         }
+        "prompts" => {
+            commands::prompts_db::handle_prompts(&args[1..]);
+        }
         #[cfg(debug_assertions)]
         "show-transcript" => {
             handle_show_transcript(&args[1..]);
@@ -214,6 +217,15 @@ fn print_help() {
     eprintln!("  git-path           Print the path to the underlying git executable");
     eprintln!("  upgrade            Check for updates and install if available");
     eprintln!("    --force               Reinstall latest version even if already up to date");
+    eprintln!("  prompts            Create local SQLite database for prompt analysis");
+    eprintln!("    --since <time>        Only include prompts after this time (default: 30d)");
+    eprintln!("    --author <name>       Filter by human author (default: current git user)");
+    eprintln!("    --all-authors         Include prompts from all authors");
+    eprintln!("    --all-repositories    Include prompts from all repositories");
+    eprintln!("    exec \"<SQL>\"          Execute arbitrary SQL on prompts.db");
+    eprintln!("    list                  List prompts as TSV");
+    eprintln!("    next                  Get next prompt as JSON (iterator pattern)");
+    eprintln!("    reset                 Reset iteration pointer to start");
     eprintln!("  version, -v, --version     Print the git-ai version");
     eprintln!("  help, -h, --help           Show this help message");
     eprintln!("");

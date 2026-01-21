@@ -528,19 +528,30 @@ pub fn config_file_path_public() -> Option<PathBuf> {
     config_file_path()
 }
 
-/// Returns the path to the internal state directory (~/.git-ai/internal)
-/// This is where git-ai stores internal files like distinct_id, update_check, etc.
-pub fn internal_dir_path() -> Option<PathBuf> {
+/// Returns the path to the git-ai base directory (~/.git-ai)
+pub fn git_ai_dir_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let home = env::var("USERPROFILE").ok()?;
-        Some(Path::new(&home).join(".git-ai").join("internal"))
+        Some(Path::new(&home).join(".git-ai"))
     }
     #[cfg(not(windows))]
     {
         let home = env::var("HOME").ok()?;
-        Some(Path::new(&home).join(".git-ai").join("internal"))
+        Some(Path::new(&home).join(".git-ai"))
     }
+}
+
+/// Returns the path to the internal state directory (~/.git-ai/internal)
+/// This is where git-ai stores internal files like distinct_id, update_check, etc.
+pub fn internal_dir_path() -> Option<PathBuf> {
+    git_ai_dir_path().map(|dir| dir.join("internal"))
+}
+
+/// Returns the path to the skills directory (~/.git-ai/skills)
+/// This is where git-ai installs skills for Claude Code and other agents
+pub fn skills_dir_path() -> Option<PathBuf> {
+    git_ai_dir_path().map(|dir| dir.join("skills"))
 }
 
 /// Public accessor for ID file path (~/.git-ai/internal/distinct_id)

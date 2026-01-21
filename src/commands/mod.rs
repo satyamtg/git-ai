@@ -11,6 +11,7 @@ pub mod git_handlers;
 pub mod hooks;
 pub mod install_hooks;
 pub mod prompt_picker;
+pub mod prompts_db;
 pub mod share;
 pub mod share_tui;
 pub mod show;
