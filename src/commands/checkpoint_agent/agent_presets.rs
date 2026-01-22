@@ -1299,6 +1299,201 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
     }
 }
 
+impl AgentCheckpointPreset for DroidPreset {
+    fn run(&self, flags: AgentCheckpointFlags) -> Result<AgentRunResult, GitAiError> {
+        // Parse hook_input JSON from Droid
+        let hook_input_json = flags.hook_input.ok_or_else(|| {
+            GitAiError::PresetError("hook_input is required for Droid preset".to_string())
+        })?;
+
+        let hook_data: serde_json::Value = serde_json::from_str(&hook_input_json)
+            .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
+
+        // Extract common fields from Droid hook input
+        // Note: Droid uses camelCase field names
+        // session_id is optional - generate a fallback if not present
+        let session_id = hook_data
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                format!(
+                    "droid-{}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                )
+            });
+
+        // transcript_path is optional - Droid may not always provide it
+        let transcript_path = hook_data
+            .get("transcriptPath")
+            .and_then(|v| v.as_str());
+
+        let cwd = hook_data
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GitAiError::PresetError("cwd not found in hook_input".to_string()))?;
+
+        let hook_event_name = hook_data
+            .get("hookEventName")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                GitAiError::PresetError("hookEventName not found in hook_input".to_string())
+            })?;
+
+        // Extract tool_name and tool_input for tool-related events
+        let tool_name = hook_data
+            .get("tool_name")
+            .and_then(|v| v.as_str());
+
+        // Extract file_path from tool_input if present
+        let file_path_as_vec = hook_data
+            .get("tool_input")
+            .and_then(|ti| ti.get("file_path"))
+            .and_then(|v| v.as_str())
+            .map(|path| vec![path.to_string()]);
+
+        // Parse the Droid transcript JSONL file if path is provided
+        let (transcript, model) = if let Some(path) = transcript_path {
+            match DroidPreset::transcript_and_model_from_droid_jsonl(path) {
+                Ok((transcript, model)) => (transcript, model),
+                Err(e) => {
+                    eprintln!("[Warning] Failed to parse Droid JSONL: {e}");
+                    log_error(
+                        &e,
+                        Some(serde_json::json!({
+                            "agent_tool": "droid",
+                            "operation": "transcript_and_model_from_droid_jsonl"
+                        })),
+                    );
+                    (
+                        crate::authorship::transcript::AiTranscript::new(),
+                        None,
+                    )
+                }
+            }
+        } else {
+            // No transcript path provided, use empty transcript
+            (crate::authorship::transcript::AiTranscript::new(), None)
+        };
+
+        let agent_id = AgentId {
+            tool: "droid".to_string(),
+            id: session_id,
+            model: model.unwrap_or_else(|| "unknown".to_string()),
+        };
+
+        // Store transcript_path in metadata if available
+        let mut agent_metadata = HashMap::new();
+        if let Some(path) = transcript_path {
+            agent_metadata.insert("transcript_path".to_string(), path.to_string());
+        }
+        if let Some(name) = tool_name {
+            agent_metadata.insert("tool_name".to_string(), name.to_string());
+        }
+
+        // Check if this is a PreToolUse event (human checkpoint)
+        if hook_event_name == "PreToolUse" {
+            return Ok(AgentRunResult {
+                agent_id,
+                agent_metadata: None,
+                checkpoint_kind: CheckpointKind::Human,
+                transcript: None,
+                repo_working_dir: Some(cwd.to_string()),
+                edited_filepaths: None,
+                will_edit_filepaths: file_path_as_vec,
+                dirty_files: None,
+            });
+        }
+
+        // PostToolUse event - AI checkpoint
+        Ok(AgentRunResult {
+            agent_id,
+            agent_metadata: Some(agent_metadata),
+            checkpoint_kind: CheckpointKind::AiAgent,
+            transcript: Some(transcript),
+            repo_working_dir: Some(cwd.to_string()),
+            edited_filepaths: file_path_as_vec,
+            will_edit_filepaths: None,
+            dirty_files: None,
+        })
+    }
+}
+
+impl DroidPreset {
+    /// Parse a Droid JSONL transcript file into a transcript and extract model info
+    pub fn transcript_and_model_from_droid_jsonl(
+        transcript_path: &str,
+    ) -> Result<(AiTranscript, Option<String>), GitAiError> {
+        let jsonl_content =
+            std::fs::read_to_string(transcript_path).map_err(|e| GitAiError::IoError(e))?;
+        let mut transcript = AiTranscript::new();
+        let mut model = None;
+
+        for line in jsonl_content.lines() {
+            if !line.trim().is_empty() {
+                // Parse the raw JSONL entry
+                let raw_entry: serde_json::Value = serde_json::from_str(line)?;
+                
+                // Extract timestamp if available
+                let timestamp = raw_entry["ts"].as_i64().map(|ts| {
+                    Utc.timestamp_millis_opt(ts).unwrap().to_rfc3339()
+                });
+
+                // Extract model from metadata if we haven't found it yet
+                if model.is_none() {
+                    if let Some(model_str) = raw_entry["model"].as_str() {
+                        model = Some(model_str.to_string());
+                    }
+                }
+
+                // Extract messages based on the role
+                match raw_entry["role"].as_str() {
+                    Some("user") => {
+                        // Handle user messages
+                        if let Some(content) = raw_entry["text"].as_str() {
+                            if !content.trim().is_empty() {
+                                transcript.add_message(Message::User {
+                                    text: content.to_string(),
+                                    timestamp,
+                                });
+                            }
+                        }
+                    }
+                    Some("assistant") => {
+                        // Handle assistant messages
+                        if let Some(content) = raw_entry["text"].as_str() {
+                            if !content.trim().is_empty() {
+                                transcript.add_message(Message::Assistant {
+                                    text: content.to_string(),
+                                    timestamp,
+                                });
+                            }
+                        }
+                    }
+                    Some("tool") => {
+                        // Handle tool calls
+                        if let Some(tool_name) = raw_entry["name"].as_str() {
+                            let tool_input = raw_entry["input"].clone();
+                            transcript.add_message(Message::ToolUse {
+                                name: tool_name.to_string(),
+                                input: tool_input,
+                                timestamp,
+                            });
+                        }
+                    }
+                    _ => continue, // Skip unknown roles
+                }
+            }
+        }
+
+        Ok((transcript, model))
+    }
+}
+
 impl GithubCopilotPreset {
     /// Translate a GitHub Copilot chat session JSON file into an AiTranscript, optional model, and edited filepaths.
     /// Returns an empty transcript if running in Codespaces or Remote Containers.
@@ -1536,6 +1731,9 @@ impl GithubCopilotPreset {
 }
 
 pub struct AiTabPreset;
+
+// Droid (Factory) to checkpoint preset
+pub struct DroidPreset;
 
 #[derive(Debug, Deserialize)]
 struct AiTabHookInput {
