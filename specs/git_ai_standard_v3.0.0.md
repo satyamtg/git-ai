@@ -505,7 +505,7 @@ When `git reset --hard` is used:
 
 - HEAD, index, and working directory all move to the target commit
 - AI Attributions in your implementation's working state MUST be cleared 
-- AI Authorship Notes SHOUT NOT be deleted. 
+- AI Authorship Notes SHOULD NOT be deleted. 
 
 #### Partial Reset
 
