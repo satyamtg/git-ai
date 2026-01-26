@@ -412,16 +412,6 @@ fn record_commit_metrics(
 ) {
     use crate::metrics::{record, CommittedValues, EventAttributes};
 
-    // Skip if no prompts (no AI involvement)
-    if authorship_log.metadata.prompts.is_empty() {
-        return;
-    }
-
-    // Skip if no AI additions (pure human commit)
-    if stats.ai_additions == 0 && stats.mixed_additions == 0 {
-        return;
-    }
-
     // Build parallel arrays: index 0 = "all" (aggregate), index 1+ = per tool/model
     let mut tool_model_pairs: Vec<String> = vec!["all".to_string()];
     let mut mixed_additions: Vec<u32> = vec![stats.mixed_additions];
