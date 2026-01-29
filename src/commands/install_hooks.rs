@@ -1,3 +1,4 @@
+use crate::commands::flush_metrics_db::spawn_background_metrics_db_flush;
 use crate::error::GitAiError;
 use crate::mdm::agents::get_all_installers;
 use crate::mdm::git_client_installer::GitClientInstallerParams;
@@ -58,6 +59,10 @@ pub fn run(args: &[String]) -> Result<HashMap<String, String>, GitAiError> {
 
     // Run async operations with smol and convert result
     let statuses = smol::block_on(async_run_install(&params, dry_run, verbose))?;
+
+    // Spawn background metrics flush
+    spawn_background_metrics_db_flush();
+
     Ok(to_hashmap(statuses))
 }
 
