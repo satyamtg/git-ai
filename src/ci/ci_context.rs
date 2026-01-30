@@ -1,8 +1,10 @@
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
-use crate::authorship::rebase_authorship::rewrite_authorship_after_squash_or_rebase;
+use crate::authorship::rebase_authorship::{
+    rewrite_authorship_after_rebase_v2, rewrite_authorship_after_squash_or_rebase,
+};
 use crate::error::GitAiError;
 use crate::git::refs::{get_reference_as_authorship_log_v3, show_authorship_note};
-use crate::git::repository::Repository;
+use crate::git::repository::{CommitRange, Repository};
 use crate::git::sync_authorship::fetch_authorship_notes;
 use std::fs;
 use std::path::PathBuf;
@@ -62,6 +64,11 @@ impl CiContext {
             } => {
                 println!("Working repository is in {}", self.repo.path().display());
 
+                println!("Fetching authorship history");
+                // Ensure we have the full authorship history before checking for existing notes
+                fetch_authorship_notes(&self.repo, "origin")?;
+                println!("Fetched authorship history");
+
                 // Check if authorship already exists for this commit
                 match get_reference_as_authorship_log_v3(&self.repo, merge_commit_sha) {
                     Ok(existing_log) => {
@@ -108,19 +115,84 @@ impl CiContext {
                         base_ref, e
                     ))
                 })?;
-                println!("Fetched base branch. Fetching authorship history");
-                // Ensure we have the full authorship history
-                fetch_authorship_notes(&self.repo, "origin")?;
-                println!("Fetched authorship history");
-                // Rewrite authorship
-                rewrite_authorship_after_squash_or_rebase(
-                    &self.repo,
-                    &head_ref,
-                    &base_ref,
-                    &head_sha,
-                    &merge_commit_sha,
-                    false,
-                )?;
+                println!("Fetched base branch.");
+
+                // Detect squash vs rebase merge by counting commits
+                // For squash: N original commits → 1 merge commit
+                // For rebase: N original commits → N rebased commits
+                let merge_base = self
+                    .repo
+                    .merge_base(head_sha.to_string(), base_ref.to_string())
+                    .ok();
+
+                let original_commits = if let Some(ref base) = merge_base {
+                    CommitRange::new_infer_refname(
+                        &self.repo,
+                        base.clone(),
+                        head_sha.to_string(),
+                        None,
+                    )
+                    .map(|r| r.all_commits())
+                    .unwrap_or_else(|_| vec![head_sha.to_string()])
+                } else {
+                    vec![head_sha.to_string()]
+                };
+
+                println!(
+                    "Original commits in PR: {} (from merge base {:?})",
+                    original_commits.len(),
+                    merge_base
+                );
+
+                // For multi-commit PRs, check if this is a rebase merge (multiple new commits)
+                // by walking back from merge_commit_sha
+                if original_commits.len() > 1 {
+                    // Try to find the new rebased commits
+                    // Walk back from merge_commit_sha the same number of commits as original
+                    let new_commits =
+                        self.get_rebased_commits(merge_commit_sha, original_commits.len());
+
+                    if new_commits.len() == original_commits.len() {
+                        println!(
+                            "Detected rebase merge: {} original -> {} new commits",
+                            original_commits.len(),
+                            new_commits.len()
+                        );
+                        // Rebase merge - use v2 which writes authorship to each rebased commit
+                        rewrite_authorship_after_rebase_v2(
+                            &self.repo,
+                            head_sha,
+                            &original_commits,
+                            &new_commits,
+                            "", // human_author not used
+                        )?;
+                    } else {
+                        println!(
+                            "Detected squash merge: {} original commits -> 1 merge commit",
+                            original_commits.len()
+                        );
+                        // Squash merge - use existing function which writes to single merge commit
+                        rewrite_authorship_after_squash_or_rebase(
+                            &self.repo,
+                            head_ref,
+                            base_ref,
+                            head_sha,
+                            merge_commit_sha,
+                            false,
+                        )?;
+                    }
+                } else {
+                    // Single commit - use squash_or_rebase (handles both cases)
+                    println!("Single commit PR, using squash/rebase handler");
+                    rewrite_authorship_after_squash_or_rebase(
+                        &self.repo,
+                        head_ref,
+                        base_ref,
+                        head_sha,
+                        merge_commit_sha,
+                        false,
+                    )?;
+                }
                 println!("Rewrote authorship.");
 
                 // Check if authorship was created for THIS specific commit
@@ -152,5 +224,34 @@ impl CiContext {
         }
         fs::remove_dir_all(self.temp_dir.clone())?;
         Ok(())
+    }
+
+    /// Get the rebased commits by walking back from merge_commit_sha.
+    /// For a rebase merge with N original commits, there should be N new commits
+    /// ending at merge_commit_sha.
+    fn get_rebased_commits(&self, merge_commit_sha: &str, expected_count: usize) -> Vec<String> {
+        let mut commits = Vec::new();
+        let mut current_sha = merge_commit_sha.to_string();
+
+        for _ in 0..expected_count {
+            commits.push(current_sha.clone());
+
+            // Get the parent of current commit
+            match self.repo.find_commit(current_sha.clone()) {
+                Ok(commit) => {
+                    let parents: Vec<_> = commit.parents().collect();
+                    if parents.len() != 1 {
+                        // Not a linear chain (merge commit or root), stop here
+                        break;
+                    }
+                    current_sha = parents[0].id().to_string();
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Reverse to get oldest-to-newest order (same as original_commits)
+        commits.reverse();
+        commits
     }
 }

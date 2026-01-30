@@ -1,7 +1,9 @@
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::post_commit;
 use crate::error::GitAiError;
-use crate::git::authorship_traversal::load_ai_touched_files_for_commits;
+use crate::git::authorship_traversal::{
+    commits_have_authorship_notes, load_ai_touched_files_for_commits,
+};
 use crate::git::refs::get_reference_as_authorship_log_v3;
 use crate::git::repository::{CommitRange, Repository};
 use crate::git::rewrite_log::RewriteLogEvent;
@@ -246,8 +248,20 @@ pub fn rewrite_authorship_after_squash_or_rebase(
         filter_pathspecs_to_ai_touched_files(repo, &source_commits, &changed_files)?;
 
     if changed_files.is_empty() {
-        // No files changed, nothing to do
-        debug_log("No files changed in merge, skipping authorship rewrite");
+        if commits_have_authorship_notes(repo, &source_commits)? {
+            debug_log(
+                "No AI-touched files in merge, but notes exist in source commits; writing empty authorship log",
+            );
+            let mut authorship_log = AuthorshipLog::new();
+            authorship_log.metadata.base_commit_sha = merge_commit_sha.to_string();
+            let authorship_json = authorship_log
+                .serialize_to_string()
+                .map_err(|_| GitAiError::Generic("Failed to serialize authorship log".to_string()))?;
+            crate::git::refs::notes_add(repo, merge_commit_sha, &authorship_json)?;
+        } else {
+            // No files changed, nothing to do
+            debug_log("No files changed in merge, skipping authorship rewrite");
+        }
         return Ok(());
     }
 

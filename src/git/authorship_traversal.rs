@@ -48,6 +48,27 @@ pub async fn load_ai_touched_files_for_commits(
     .await
 }
 
+/// Return true if any of the provided commits has an authorship note attached.
+pub fn commits_have_authorship_notes(
+    repo: &Repository,
+    commit_shas: &[String],
+) -> Result<bool, GitAiError> {
+    if commit_shas.is_empty() {
+        return Ok(false);
+    }
+
+    let global_args = repo.global_args_for_exec();
+    let note_mappings = get_notes_list(&global_args)?;
+    if note_mappings.is_empty() {
+        return Ok(false);
+    }
+
+    let commit_set: HashSet<&str> = commit_shas.iter().map(|s| s.as_str()).collect();
+    Ok(note_mappings
+        .iter()
+        .any(|(_, commit_sha)| commit_set.contains(commit_sha.as_str())))
+}
+
 /// Get all notes as (note_blob_sha, commit_sha) pairs
 fn get_notes_list(global_args: &[String]) -> Result<Vec<(String, String)>, GitAiError> {
     let mut args = global_args.to_vec();
