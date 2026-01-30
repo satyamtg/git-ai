@@ -84,6 +84,9 @@ pub struct CommandHooksContext {
     /// VirtualAttributions captured before a pull --rebase --autostash operation.
     /// Used to preserve uncommitted AI attributions that git's internal stash would lose.
     pub stashed_va: Option<VirtualAttributions>,
+    /// Whether the pull operation uses rebase (--rebase flag or pull.rebase config).
+    /// Used to trigger authorship rewriting for committed changes after pull --rebase.
+    pub is_rebase_pull: bool,
 }
 
 pub fn handle_git(args: &[String]) {
@@ -132,6 +135,7 @@ pub fn handle_git(args: &[String]) {
             stash_sha: None,
             push_authorship_handle: None,
             stashed_va: None,
+            is_rebase_pull: false,
         };
 
         let repository = repository_option.as_mut().unwrap();

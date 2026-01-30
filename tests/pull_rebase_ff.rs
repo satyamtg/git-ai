@@ -201,6 +201,178 @@ fn test_pull_rebase_autostash_via_git_config() {
 }
 
 #[test]
+fn test_pull_rebase_preserves_committed_ai_authorship() {
+    let (local, upstream) = TestRepo::new_with_remote();
+
+    // Make initial commit in local and push
+    let mut readme = local.filename("README.md");
+    readme.set_contents(vec!["# Test Repo".to_string()]);
+    let initial = local
+        .stage_all_and_commit("initial commit")
+        .expect("initial commit should succeed");
+
+    local
+        .git(&["push", "-u", "origin", "HEAD"])
+        .expect("push initial commit should succeed");
+
+    // Create a committed AI-authored change locally
+    let mut ai_file = local.filename("ai_feature.txt");
+    ai_file.set_contents(vec![
+        "AI generated feature line 1".ai(),
+        "AI generated feature line 2".ai(),
+    ]);
+    local
+        .stage_all_and_commit("add AI feature")
+        .expect("AI feature commit should succeed");
+
+    // Simulate upstream advancing: create a second clone, make a commit, push
+    // We do this by going back to initial, making a divergent commit, pushing from
+    // a detached state via the bare upstream directly.
+    // Simpler approach: use the local repo to push a commit to a temp branch,
+    // then reset local back.
+
+    // First, record the AI commit SHA
+    let ai_commit_sha = local
+        .git(&["rev-parse", "HEAD"])
+        .expect("rev-parse should succeed")
+        .trim()
+        .to_string();
+
+    // Create an upstream-only commit by:
+    // 1. Stash our AI commit
+    // 2. Create upstream commit and push
+    // 3. Restore our AI commit
+    // Actually, easier: reset to initial, create upstream commit, push, then cherry-pick AI back.
+
+    // Save current branch name
+    let branch = local.current_branch();
+
+    // Reset to initial to create a divergent upstream commit
+    local
+        .git(&["reset", "--hard", &initial.commit_sha])
+        .expect("reset should succeed");
+
+    let mut upstream_file = local.filename("upstream_change.txt");
+    upstream_file.set_contents(vec!["upstream content".to_string()]);
+    local
+        .stage_all_and_commit("upstream divergent commit")
+        .expect("upstream commit should succeed");
+
+    // Force push this as the upstream state
+    local
+        .git(&["push", "--force", "origin", &format!("HEAD:{}", branch)])
+        .expect("force push upstream commit should succeed");
+
+    // Now reset back to the AI commit (local is ahead with AI work, behind on upstream)
+    local
+        .git(&["reset", "--hard", &ai_commit_sha])
+        .expect("reset to AI commit should succeed");
+
+    // Perform pull --rebase (committed local changes will be rebased onto upstream)
+    local
+        .git(&["pull", "--rebase"])
+        .expect("pull --rebase should succeed");
+
+    // Verify we got upstream changes
+    assert!(
+        local.read_file("upstream_change.txt").is_some(),
+        "Should have upstream_change.txt after pull --rebase"
+    );
+
+    // The AI commit got new SHA after rebase - verify authorship survived
+    let new_head = local
+        .git(&["rev-parse", "HEAD"])
+        .expect("rev-parse should succeed")
+        .trim()
+        .to_string();
+
+    assert_ne!(
+        new_head, ai_commit_sha,
+        "HEAD should have a new SHA after rebase"
+    );
+
+    // Verify AI authorship is preserved on the rebased commit
+    ai_file.assert_lines_and_blame(vec![
+        "AI generated feature line 1".ai(),
+        "AI generated feature line 2".ai(),
+    ]);
+}
+
+#[test]
+fn test_pull_rebase_committed_and_autostash_preserves_all_authorship() {
+    let (local, _upstream) = TestRepo::new_with_remote();
+
+    // Make initial commit in local and push
+    let mut readme = local.filename("README.md");
+    readme.set_contents(vec!["# Test Repo".to_string()]);
+    let initial = local
+        .stage_all_and_commit("initial commit")
+        .expect("initial commit should succeed");
+
+    local
+        .git(&["push", "-u", "origin", "HEAD"])
+        .expect("push initial commit should succeed");
+
+    // Create a committed AI-authored change locally
+    let mut committed_ai = local.filename("committed_ai.txt");
+    committed_ai.set_contents(vec!["Committed AI line".ai()]);
+    local
+        .stage_all_and_commit("committed AI work")
+        .expect("AI commit should succeed");
+
+    let ai_commit_sha = local
+        .git(&["rev-parse", "HEAD"])
+        .expect("rev-parse should succeed")
+        .trim()
+        .to_string();
+
+    let branch = local.current_branch();
+
+    // Create divergent upstream commit
+    local
+        .git(&["reset", "--hard", &initial.commit_sha])
+        .expect("reset should succeed");
+
+    let mut upstream_file = local.filename("upstream.txt");
+    upstream_file.set_contents(vec!["upstream".to_string()]);
+    local
+        .stage_all_and_commit("upstream commit")
+        .expect("upstream commit should succeed");
+
+    local
+        .git(&["push", "--force", "origin", &format!("HEAD:{}", branch)])
+        .expect("force push should succeed");
+
+    // Reset back to AI commit
+    local
+        .git(&["reset", "--hard", &ai_commit_sha])
+        .expect("reset should succeed");
+
+    // Also create uncommitted AI changes (will trigger autostash)
+    let mut uncommitted_ai = local.filename("uncommitted_ai.txt");
+    uncommitted_ai.set_contents(vec!["Uncommitted AI line".ai()]);
+    local
+        .git_ai(&["checkpoint", "mock_ai"])
+        .expect("checkpoint should succeed");
+
+    // Pull --rebase --autostash: both committed and uncommitted AI changes need preservation
+    local
+        .git(&["pull", "--rebase", "--autostash"])
+        .expect("pull --rebase --autostash should succeed");
+
+    // Commit the previously-uncommitted changes
+    local
+        .stage_all_and_commit("commit uncommitted AI work")
+        .expect("commit should succeed");
+
+    // Verify committed AI authorship survived the rebase
+    committed_ai.assert_lines_and_blame(vec!["Committed AI line".ai()]);
+
+    // Verify uncommitted AI authorship survived the autostash cycle
+    uncommitted_ai.assert_lines_and_blame(vec!["Uncommitted AI line".ai()]);
+}
+
+#[test]
 fn test_fast_forward_pull_without_local_changes() {
     let setup = setup_pull_test();
     let local = setup.local;
