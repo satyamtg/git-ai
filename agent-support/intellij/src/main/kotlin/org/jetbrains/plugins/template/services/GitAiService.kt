@@ -88,15 +88,16 @@ class GitAiService {
         val isWindows = System.getProperty("os.name").lowercase().contains("win")
 
         // Known installation locations from install.sh/install.ps1/dev-symlinks.sh
+        // Dev symlinks checked first so developers can test local builds
         val knownPaths = if (isWindows) {
             listOf(
-                "$homeDir\\.git-ai\\bin\\git-ai.exe",           // Production install (install.ps1)
-                "$homeDir\\.git-ai-local-dev\\gitwrap\\bin\\git-ai.exe"  // Dev symlinks
+                "$homeDir\\.git-ai-local-dev\\gitwrap\\bin\\git-ai.exe",  // Dev symlinks (checked first)
+                "$homeDir\\.git-ai\\bin\\git-ai.exe"                      // Production install (install.ps1)
             )
         } else {
             listOf(
-                "$homeDir/.git-ai/bin/git-ai",                  // Production install (install.sh)
-                "$homeDir/.git-ai-local-dev/gitwrap/bin/git-ai" // Dev symlinks (dev-symlinks.sh)
+                "$homeDir/.git-ai-local-dev/gitwrap/bin/git-ai", // Dev symlinks (checked first)
+                "$homeDir/.git-ai/bin/git-ai"                    // Production install (install.sh)
             )
         }
 
