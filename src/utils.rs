@@ -604,4 +604,44 @@ mod tests {
             "🚀🎉.txt"
         );
     }
+
+    // =========================================================================
+    // Phase 7: Special Unicode Characters Tests (math, currency, symbols)
+    // =========================================================================
+
+    #[test]
+    fn test_unescape_math_symbols() {
+        // Math symbols: ∑ (summation) = \342\210\221
+        assert_eq!(
+            unescape_git_path("\"\\342\\210\\221.txt\""),
+            "∑.txt"
+        );
+    }
+
+    #[test]
+    fn test_unescape_currency_symbols() {
+        // Currency: € (euro) = \342\202\254
+        assert_eq!(
+            unescape_git_path("\"\\342\\202\\254.txt\""),
+            "€.txt"
+        );
+    }
+
+    #[test]
+    fn test_unescape_box_drawing() {
+        // Box drawing: ┌ (box drawings light down and right) = \342\224\214
+        assert_eq!(
+            unescape_git_path("\"\\342\\224\\214.txt\""),
+            "┌.txt"
+        );
+    }
+
+    #[test]
+    fn test_unescape_dingbats() {
+        // Dingbats: ✓ (check mark) = \342\234\223
+        assert_eq!(
+            unescape_git_path("\"\\342\\234\\223.txt\""),
+            "✓.txt"
+        );
+    }
 }
