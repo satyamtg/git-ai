@@ -167,12 +167,11 @@
             pkg-config
 
             # Runtime dependencies for testing
-            # NOTE: git is intentionally NOT included here. The system-level
-            # git-ai wrapper (installed via Home Manager) provides git and must
-            # take precedence in PATH so that commits are proxied through
-            # git-ai, which creates refs/notes/ai authorship tracking notes.
-            # Including pkgs.git here shadows the git-ai wrapper and breaks
-            # note creation. Use `git-og` if you need to bypass git-ai.
+            # NOTE: git is NOT included as a package here. Instead, the
+            # shellHook creates wrapper scripts (git, git-ai, git-og) that
+            # point to the locally-built target/debug/git-ai binary, so that
+            # development builds are tested directly. Use `git-og` to bypass
+            # git-ai and call real git.
             sqlite
 
             # Useful development tools
@@ -190,19 +189,70 @@
             # SDK (14.4) and apple-sdk_15 (15.5) baked into the clang wrapper.
             unset DEVELOPER_DIR
 
-            echo "🦀 git-ai development environment"
-            echo "Rust version: $(rustc --version)"
-            echo "Cargo version: $(cargo --version)"
-            echo ""
-            echo "Available commands:"
-            echo "  cargo build          - Build the project"
-            echo "  cargo test           - Run tests"
-            echo "  cargo run            - Run git-ai"
-            echo ""
+            # Set up development git-ai wrappers (replicates scripts/dev-symlinks.sh)
+            BUILD_TYPE="''${GIT_AI_BUILD_TYPE:-debug}"
+            GITWRAP_DIR="$HOME/.git-ai-local-dev/gitwrap/bin"
+            TARGET_DIR="''${CARGO_TARGET_DIR:-$(pwd)/target}"
+            BINARY="$TARGET_DIR/$BUILD_TYPE/git-ai"
+
+            mkdir -p "$GITWRAP_DIR"
+
+            # Create git wrapper (preserves argv[0] as "git" for passthrough mode)
+            cat > "$GITWRAP_DIR/git" <<GITEOF
+#!/bin/bash
+if [ ! -x "$BINARY" ]; then
+  echo "git-ai: dev binary not found at $BINARY" >&2
+  echo "Run 'cargo build' first, then retry." >&2
+  exit 1
+fi
+exec -a git "$BINARY" "\$@"
+GITEOF
+            chmod +x "$GITWRAP_DIR/git"
+
+            # Create git-ai wrapper
+            cat > "$GITWRAP_DIR/git-ai" <<GITAIEOF
+#!/bin/bash
+if [ ! -x "$BINARY" ]; then
+  echo "git-ai: dev binary not found at $BINARY" >&2
+  echo "Run 'cargo build' first, then retry." >&2
+  exit 1
+fi
+exec "$BINARY" "\$@"
+GITAIEOF
+            chmod +x "$GITWRAP_DIR/git-ai"
+
+            # Create git-og wrapper (bypasses git-ai, calls real git directly)
+            cat > "$GITWRAP_DIR/git-og" <<GITOGEOF
+#!/bin/bash
+exec ${pkgs.git}/bin/git "\$@"
+GITOGEOF
+            chmod +x "$GITWRAP_DIR/git-og"
+
+            export PATH="$GITWRAP_DIR:$PATH"
+
+            # Install hooks if binary is already built
+            if [ -x "$BINARY" ]; then
+              "$GITWRAP_DIR/git-ai" install-hooks 2>/dev/null || true
+            fi
 
             # Set up environment for development
             export RUST_BACKTRACE=1
             export RUST_LOG=debug
+
+            echo "git-ai development environment"
+            echo "Rust version: $(rustc --version)"
+            echo "Cargo version: $(cargo --version)"
+            echo ""
+            if [ -x "$BINARY" ]; then
+              echo "Dev binary: $BINARY (ready)"
+              echo "Hooks installed."
+            else
+              echo "Dev binary: $BINARY (not built yet)"
+              echo "Run 'cargo build' to build, then hooks will be installed on next 'nix develop'."
+            fi
+            echo ""
+            echo "git, git-ai, git-og -> wrappers in $GITWRAP_DIR"
+            echo "Set GIT_AI_BUILD_TYPE=release for release builds."
           '';
         };
 
