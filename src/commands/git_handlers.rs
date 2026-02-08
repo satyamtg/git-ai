@@ -41,12 +41,6 @@ static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
 // Windows NTSTATUS for Ctrl+C interruption (STATUS_CONTROL_C_EXIT) from Windows API docs.
 #[cfg(windows)]
 const NTSTATUS_CONTROL_C_EXIT: u32 = 0xC000013A;
-// ExitStatus::code returns Option<i32> on Windows, so cast the unsigned NTSTATUS value.
-#[cfg(windows)]
-const NTSTATUS_CONTROL_C_EXIT_CODE: i32 = NTSTATUS_CONTROL_C_EXIT as i32;
-// Decimal string used to feed cmd /C exit /B for NTSTATUS_CONTROL_C_EXIT in tests.
-#[cfg(windows)]
-const NTSTATUS_CONTROL_C_EXIT_STR: &str = "3221225786";
 
 /// Error type for hook panics
 #[derive(Debug)]
@@ -636,7 +630,7 @@ fn exit_status_was_interrupted(status: &std::process::ExitStatus) -> bool {
 
 #[cfg(windows)]
 fn exit_status_was_interrupted(status: &std::process::ExitStatus) -> bool {
-    status.code() == Some(NTSTATUS_CONTROL_C_EXIT_CODE)
+    status.code().map(|code| code as u32) == Some(NTSTATUS_CONTROL_C_EXIT)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -785,7 +779,7 @@ mod tests {
             .arg("/C")
             .arg("exit")
             .arg("/B")
-            .arg(super::NTSTATUS_CONTROL_C_EXIT_STR)
+            .arg(super::NTSTATUS_CONTROL_C_EXIT.to_string())
             .status()
             .expect("failed to run ctrl+c status test");
         assert!(super::exit_status_was_interrupted(&status));
