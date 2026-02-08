@@ -107,6 +107,27 @@ pub fn is_github_codespaces() -> bool {
 
 /// Get the user's home directory
 pub fn home_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home);
+        }
+    }
+
+    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+        if !userprofile.is_empty() {
+            return PathBuf::from(userprofile);
+        }
+    }
+
+    #[cfg(windows)]
+    if let (Ok(home_drive), Ok(home_path)) =
+        (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH"))
+    {
+        if !home_drive.is_empty() && !home_path.is_empty() {
+            return PathBuf::from(format!("{}{}", home_drive, home_path));
+        }
+    }
+
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
