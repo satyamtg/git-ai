@@ -621,13 +621,16 @@ fn exit_with_status(status: std::process::ExitStatus) -> ! {
 
 #[cfg(unix)]
 fn exit_status_was_interrupted(status: &std::process::ExitStatus) -> bool {
-    matches!(
-        status.signal(),
-        Some(libc::SIGINT | libc::SIGTERM | libc::SIGQUIT | libc::SIGHUP)
-    )
+    matches!(status.signal(), Some(libc::SIGINT))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn exit_status_was_interrupted(status: &std::process::ExitStatus) -> bool {
+    const STATUS_CONTROL_C_EXIT: i32 = 0xC000013A_u32 as i32;
+    matches!(status.code(), Some(code) if code == STATUS_CONTROL_C_EXIT)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn exit_status_was_interrupted(_status: &std::process::ExitStatus) -> bool {
     false
 }
