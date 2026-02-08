@@ -33,10 +33,12 @@ export function findRepoForFile(fileUri: vscode.Uri): GitRepository | undefined 
   }
 
   const filePath = fileUri.fsPath;
-  return git.repositories.find((r) => {
-    const root = r.rootUri.fsPath;
-    return filePath === root || filePath.startsWith(root + path.sep);
-  });
+  return git.repositories
+    .filter((r) => {
+      const root = r.rootUri.fsPath;
+      return filePath === root || filePath.startsWith(root + path.sep);
+    })
+    .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length)[0];
 }
 
 /**
