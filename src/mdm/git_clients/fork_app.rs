@@ -244,10 +244,10 @@ impl GitClientInstaller for ForkAppInstaller {
             }
 
             // Ensure parent directory exists
-            if let Some(parent) = settings_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                }
+            if let Some(parent) = settings_path.parent()
+                && !parent.exists()
+            {
+                fs::create_dir_all(parent)?;
             }
 
             let new_content = serde_json::to_string_pretty(&settings)?;
