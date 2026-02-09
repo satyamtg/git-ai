@@ -89,7 +89,7 @@ fn uninstall_forwarding_handlers() {
 pub struct CommandHooksContext {
     pub pre_commit_hook_result: Option<bool>,
     pub rebase_original_head: Option<String>,
-    pub _rebase_onto: Option<String>,
+    pub rebase_onto: Option<String>,
     pub fetch_authorship_handle: Option<std::thread::JoinHandle<()>>,
     pub stash_sha: Option<String>,
     pub push_authorship_handle: Option<std::thread::JoinHandle<()>>,
@@ -140,7 +140,7 @@ pub fn handle_git(args: &[String]) {
         let mut command_hooks_context = CommandHooksContext {
             pre_commit_hook_result: None,
             rebase_original_head: None,
-            _rebase_onto: None,
+            rebase_onto: None,
             fetch_authorship_handle: None,
             stash_sha: None,
             push_authorship_handle: None,

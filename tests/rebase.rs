@@ -213,6 +213,46 @@ fn test_rebase_fast_forward() {
     feature_file.assert_lines_and_blame(lines!["// AI feature".ai()]);
 }
 
+/// Test rebase where the feature commit is already present upstream (skipped during rebase).
+/// We should detect that no new rebased commits were created and avoid scanning/rewrite work.
+#[test]
+fn test_rebase_skipped_commit_has_zero_new_mappings() {
+    let repo = TestRepo::new();
+
+    // Base commit
+    let mut base_file = repo.filename("base.txt");
+    base_file.set_contents(lines!["base"]);
+    repo.stage_all_and_commit("Initial").unwrap();
+    let default_branch = repo.current_branch();
+
+    // Feature branch with one AI commit
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    let mut feature_file = repo.filename("feature.txt");
+    feature_file.set_contents(lines!["// AI feature".ai()]);
+    let feature_commit = repo.stage_all_and_commit("AI feature").unwrap();
+
+    // Main gets the same patch via cherry-pick, then advances with extra commits.
+    repo.git(&["checkout", &default_branch]).unwrap();
+    repo.git(&["cherry-pick", "-x", &feature_commit.commit_sha])
+        .unwrap();
+
+    let mut main_file = repo.filename("main.txt");
+    main_file.set_contents(lines!["main 1"]);
+    repo.stage_all_and_commit("Main advances 1").unwrap();
+    main_file.set_contents(lines!["main 1", "main 2"]);
+    repo.stage_all_and_commit("Main advances 2").unwrap();
+
+    // Rebase should skip the feature commit (already upstream).
+    repo.git(&["checkout", "feature"]).unwrap();
+    let output = repo.git(&["rebase", &default_branch]).unwrap();
+
+    assert!(
+        output.contains("Commit mapping: 1 original -> 0 new"),
+        "Expected zero new rebased commits in mapping. Output:\n{}",
+        output
+    );
+}
+
 /// Test interactive rebase with commit reordering - verifies interactive rebase works
 #[test]
 fn test_rebase_interactive_reorder() {

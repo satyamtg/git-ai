@@ -315,7 +315,7 @@ fn process_completed_pull_rebase(repository: &mut Repository, original_head: &st
     ));
 
     let (original_commits, new_commits) =
-        match build_rebase_commit_mappings(repository, original_head, new_head) {
+        match build_rebase_commit_mappings(repository, original_head, new_head, None) {
             Ok(mappings) => {
                 debug_log(&format!(
                     "Pull rebase mappings: {} original -> {} new commits",
@@ -332,6 +332,10 @@ fn process_completed_pull_rebase(repository: &mut Repository, original_head: &st
 
     if original_commits.is_empty() {
         debug_log("No committed changes to rewrite authorship for after pull --rebase");
+        return;
+    }
+    if new_commits.is_empty() {
+        debug_log("No newly rebased commits to rewrite authorship for after pull --rebase");
         return;
     }
 

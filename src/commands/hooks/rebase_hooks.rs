@@ -40,6 +40,9 @@ pub fn pre_rebase_hook(
             if let Ok(target) = head.target() {
                 debug_log(&format!("Starting new rebase from HEAD: {}", target));
                 command_hooks_context.rebase_original_head = Some(target.clone());
+                let onto_head = resolve_rebase_onto_head(parsed_args, repository);
+                command_hooks_context.rebase_onto = onto_head.clone();
+                debug_log(&format!("Rebase onto target: {:?}", onto_head));
 
                 // Determine if interactive
                 let is_interactive = parsed_args.has_command_flag("-i")
@@ -49,7 +52,11 @@ pub fn pre_rebase_hook(
 
                 // Log the rebase start event
                 let start_event = RewriteLogEvent::rebase_start(
-                    crate::git::rewrite_log::RebaseStartEvent::new(target.clone(), is_interactive),
+                    crate::git::rewrite_log::RebaseStartEvent::new_with_onto(
+                        target.clone(),
+                        is_interactive,
+                        onto_head,
+                    ),
                 );
 
                 // Write to rewrite log
@@ -98,16 +105,27 @@ pub fn handle_rebase_post_command(
     }
 
     // Rebase is done (completed or aborted)
-    // Try to find the original head from context OR from the rewrite log
+    // Try to find original head / onto from context OR from the rewrite log
+    let start_event_from_log = find_rebase_start_event(repository);
     let original_head_from_context = context.rebase_original_head.clone();
-    let original_head_from_log = find_rebase_start_event_original_head(repository);
+    let original_head_from_log = start_event_from_log
+        .as_ref()
+        .map(|event| event.original_head.clone());
+    let onto_head_from_log = start_event_from_log
+        .as_ref()
+        .and_then(|event| event.onto_head.clone());
+    let onto_head_from_context = context.rebase_onto.clone();
 
     debug_log(&format!(
-        "Original head: context={:?}, log={:?}",
-        original_head_from_context, original_head_from_log
+        "Original head: context={:?}, log={:?}; onto: context={:?}, log={:?}",
+        original_head_from_context,
+        original_head_from_log,
+        onto_head_from_context,
+        onto_head_from_log
     ));
 
     let original_head = original_head_from_context.or(original_head_from_log);
+    let onto_head = onto_head_from_context.or(onto_head_from_log);
 
     if !exit_status.success() {
         // Rebase was aborted or failed - log Abort event
@@ -133,7 +151,12 @@ pub fn handle_rebase_post_command(
             "Processing completed rebase from {}",
             original_head
         ));
-        process_completed_rebase(repository, &original_head, parsed_args);
+        process_completed_rebase(
+            repository,
+            &original_head,
+            onto_head.as_deref(),
+            parsed_args,
+        );
     } else {
         debug_log("⚠ Rebase completed but couldn't determine original head");
     }
@@ -164,15 +187,17 @@ fn has_active_rebase_start_event(repository: &Repository) -> bool {
     false // No rebase events found
 }
 
-/// Find the original head from the most recent Rebase Start event in the log
-fn find_rebase_start_event_original_head(repository: &Repository) -> Option<String> {
+/// Find the most recent Rebase Start event in the log.
+fn find_rebase_start_event(
+    repository: &Repository,
+) -> Option<crate::git::rewrite_log::RebaseStartEvent> {
     let events = repository.storage.read_rewrite_events().ok()?;
 
     // Find the most recent Start event (events are newest-first)
     for event in events {
         match event {
             RewriteLogEvent::RebaseStart { rebase_start } => {
-                return Some(rebase_start.original_head.clone());
+                return Some(rebase_start);
             }
             _ => continue,
         }
@@ -184,6 +209,7 @@ fn find_rebase_start_event_original_head(repository: &Repository) -> Option<Stri
 fn process_completed_rebase(
     repository: &mut Repository,
     original_head: &str,
+    onto_head: Option<&str>,
     parsed_args: &ParsedGitInvocation,
 ) {
     debug_log(&format!(
@@ -221,7 +247,7 @@ fn process_completed_rebase(
         original_head, new_head
     ));
     let (original_commits, new_commits) =
-        match build_rebase_commit_mappings(repository, original_head, &new_head) {
+        match build_rebase_commit_mappings(repository, original_head, &new_head, onto_head) {
             Ok(mappings) => {
                 debug_log(&format!(
                     "✓ Built mappings: {} original commits -> {} new commits",
@@ -238,6 +264,10 @@ fn process_completed_rebase(
 
     if original_commits.is_empty() {
         debug_log("No commits to rewrite authorship for");
+        return;
+    }
+    if new_commits.is_empty() {
+        debug_log("No new rebased commits detected (all commits were skipped/already upstream)");
         return;
     }
 
@@ -282,6 +312,7 @@ pub(crate) fn build_rebase_commit_mappings(
     repository: &Repository,
     original_head: &str,
     new_head: &str,
+    onto_head: Option<&str>,
 ) -> Result<(Vec<String>, Vec<String>), crate::error::GitAiError> {
     // Get commits from new_head and original_head
     let new_head_commit = repository.find_commit(new_head.to_string())?;
@@ -291,26 +322,123 @@ pub(crate) fn build_rebase_commit_mappings(
     let merge_base = repository.merge_base(original_head_commit.id(), new_head_commit.id())?;
 
     // Walk from original_head to merge_base to get the commits that were rebased
-    let original_commits = walk_commits_to_base(repository, original_head, &merge_base)?;
+    let mut original_commits = walk_commits_to_base(repository, original_head, &merge_base)?;
+    original_commits.reverse();
 
-    // Walk from new_head to merge_base to get the actual rebased commits
-    // This correctly handles squashing, dropping, and other interactive rebase operations
-    let new_commits = walk_commits_to_base(repository, new_head, &merge_base)?;
+    // Fast path: if there were no original commits, there is nothing to rewrite and no need
+    // to walk potentially large parts of new history.
+    if original_commits.is_empty() {
+        debug_log(&format!(
+            "Commit mapping: 0 original -> 0 new (merge_base: {})",
+            merge_base
+        ));
+        return Ok((original_commits, Vec::new()));
+    }
+
+    // Prefer the resolved rebase target (onto) as the lower bound for new commits.
+    // This avoids sweeping unrelated target-branch history in skipped/no-op rebases.
+    let new_commits_base = onto_head
+        .filter(|onto| is_ancestor(repository, onto, new_head))
+        .unwrap_or(merge_base.as_str());
+
+    // Walk from new_head to base to get actual rebased commits.
+    let mut new_commits = walk_commits_to_base(repository, new_head, new_commits_base)?;
 
     // Reverse both so they're in chronological order (oldest first)
-    let mut original_commits = original_commits;
-    let mut new_commits = new_commits;
-    original_commits.reverse();
     new_commits.reverse();
 
     debug_log(&format!(
-        "Commit mapping: {} original -> {} new (merge_base: {})",
+        "Commit mapping: {} original -> {} new (merge_base: {}, new_base: {})",
         original_commits.len(),
         new_commits.len(),
-        merge_base
+        merge_base,
+        new_commits_base
     ));
 
     // Always pass all commits through - let the authorship rewriting logic
     // handle many-to-one, one-to-one, and other mapping scenarios properly
     Ok((original_commits, new_commits))
+}
+
+fn resolve_rebase_onto_head(
+    parsed_args: &ParsedGitInvocation,
+    repository: &Repository,
+) -> Option<String> {
+    // These modes do not start a new rebase sequence.
+    for mode in [
+        "--continue",
+        "--abort",
+        "--skip",
+        "--quit",
+        "--show-current-patch",
+    ] {
+        if parsed_args.has_command_flag(mode) {
+            return None;
+        }
+    }
+
+    let args = &parsed_args.command_args;
+    let mut first_positional: Option<&str> = None;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let arg = args[i].as_str();
+
+        if arg == "--" {
+            break;
+        }
+
+        if arg == "--onto" {
+            if i + 1 < args.len() {
+                return resolve_commitish(repository, &args[i + 1]);
+            }
+            return None;
+        }
+        if let Some(spec) = arg.strip_prefix("--onto=") {
+            return resolve_commitish(repository, spec);
+        }
+
+        if arg.starts_with('-') {
+            // Subset of rebase flags that consume a separate value token.
+            let takes_value = matches!(
+                arg,
+                "-s" | "--strategy" | "-X" | "--strategy-option" | "-x" | "--exec" | "--empty"
+            );
+            if takes_value && !arg.contains('=') {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if first_positional.is_none() {
+            first_positional = Some(arg);
+        }
+        i += 1;
+    }
+
+    if let Some(upstream) = first_positional {
+        return resolve_commitish(repository, upstream);
+    }
+
+    // `git rebase` with no explicit upstream uses branch upstream config.
+    resolve_commitish(repository, "@{upstream}")
+}
+
+fn resolve_commitish(repository: &Repository, spec: &str) -> Option<String> {
+    repository
+        .revparse_single(spec)
+        .and_then(|obj| obj.peel_to_commit())
+        .map(|commit| commit.id())
+        .ok()
+}
+
+fn is_ancestor(repository: &Repository, ancestor: &str, descendant: &str) -> bool {
+    let mut args = repository.global_args_for_exec();
+    args.push("merge-base".to_string());
+    args.push("--is-ancestor".to_string());
+    args.push(ancestor.to_string());
+    args.push(descendant.to_string());
+    crate::git::repository::exec_git(&args).is_ok()
 }
