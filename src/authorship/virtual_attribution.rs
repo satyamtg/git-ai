@@ -378,6 +378,12 @@ impl VirtualAttributions {
 
             // Collect attributions from checkpoint entries
             for entry in &checkpoint.entries {
+                // Most human-only pre-commit entries carry no attribution data and can be skipped.
+                // This keeps post-commit work proportional to AI-relevant files.
+                if entry.line_attributions.is_empty() && entry.attributions.is_empty() {
+                    continue;
+                }
+
                 // Get the latest file content from working directory
                 if let Ok(workdir) = repo.workdir() {
                     let abs_path = workdir.join(&entry.file);
@@ -389,9 +395,22 @@ impl VirtualAttributions {
                     file_contents.insert(entry.file.clone(), file_content);
                 }
 
-                // Use the line attributions from the checkpoint
-                let line_attrs = entry.line_attributions.clone();
+                // Prefer persisted line attributions. Fall back to converting char attributions
+                // for compatibility with older checkpoint data.
                 let file_content = file_contents.get(&entry.file).cloned().unwrap_or_default();
+                let line_attrs = if entry.line_attributions.is_empty() {
+                    crate::authorship::attribution_tracker::attributions_to_line_attributions(
+                        &entry.attributions,
+                        &file_content,
+                    )
+                } else {
+                    entry.line_attributions.clone()
+                };
+
+                if line_attrs.is_empty() {
+                    continue;
+                }
+
                 let char_attrs = line_attributions_to_attributions(&line_attrs, &file_content, 0);
 
                 attributions.insert(entry.file.clone(), (char_attrs, line_attrs));

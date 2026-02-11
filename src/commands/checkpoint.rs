@@ -29,6 +29,13 @@ struct FileLineStats {
     deletions_sloc: u32,
 }
 
+/// Latest checkpoint state needed to process a file in the next checkpoint.
+#[derive(Debug, Clone)]
+struct PreviousFileState {
+    blob_sha: String,
+    attributions: Vec<Attribution>,
+}
+
 use crate::authorship::working_log::AgentId;
 
 /// Emit at most one `agent_usage` metric per prompt every 2.5 minutes.
@@ -359,6 +366,7 @@ pub fn run(
         &checkpoints,
         agent_run_result.as_ref(),
         ts,
+        is_pre_commit,
     ))?;
     debug_log(&format!(
         "[BENCHMARK] get_checkpoint_entries generated {} entries, took {:?}",
@@ -775,13 +783,82 @@ fn save_current_file_states(
     Ok(file_content_hashes)
 }
 
+fn get_previous_content_from_head(
+    repo: &Repository,
+    file_path: &str,
+    head_tree_id: &Option<String>,
+) -> String {
+    if let Some(tree_id) = head_tree_id.as_ref() {
+        let head_tree = repo.find_tree(tree_id.clone()).ok();
+        if let Some(tree) = head_tree {
+            match tree.get_path(std::path::Path::new(file_path)) {
+                Ok(entry) => {
+                    if let Ok(blob) = repo.find_blob(entry.id()) {
+                        let blob_content = blob.content().unwrap_or_default();
+                        String::from_utf8_lossy(&blob_content).to_string()
+                    } else {
+                        String::new()
+                    }
+                }
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn working_log_entry_has_non_human_attribution(entry: &WorkingLogEntry) -> bool {
+    entry
+        .line_attributions
+        .iter()
+        .any(|attr| attr.author_id != CheckpointKind::Human.to_str())
+        || entry
+            .attributions
+            .iter()
+            .any(|attr| attr.author_id != CheckpointKind::Human.to_str())
+}
+
+fn build_previous_file_state_maps(
+    previous_checkpoints: &[Checkpoint],
+    initial_attributions: &HashMap<String, Vec<LineAttribution>>,
+) -> (HashMap<String, PreviousFileState>, HashSet<String>) {
+    let mut previous_file_state_by_file: HashMap<String, PreviousFileState> = HashMap::new();
+    let mut ai_touched_files: HashSet<String> = initial_attributions.keys().cloned().collect();
+
+    // Keep only the latest entry for each file.
+    for checkpoint in previous_checkpoints {
+        for entry in &checkpoint.entries {
+            previous_file_state_by_file.insert(
+                entry.file.clone(),
+                PreviousFileState {
+                    blob_sha: entry.blob_sha.clone(),
+                    attributions: entry.attributions.clone(),
+                },
+            );
+
+            if checkpoint.kind != CheckpointKind::Human
+                || working_log_entry_has_non_human_attribution(entry)
+            {
+                ai_touched_files.insert(entry.file.clone());
+            }
+        }
+    }
+
+    (previous_file_state_by_file, ai_touched_files)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn get_checkpoint_entry_for_file(
     file_path: String,
     kind: CheckpointKind,
+    is_pre_commit: bool,
     repo: Repository,
     working_log: PersistedWorkingLog,
-    previous_checkpoints: Arc<Vec<Checkpoint>>,
+    previous_file_state_by_file: Arc<HashMap<String, PreviousFileState>>,
+    ai_touched_files: Arc<HashSet<String>>,
     file_content_hash: String,
     author_id: Arc<String>,
     head_commit_sha: Arc<Option<String>>,
@@ -792,31 +869,58 @@ fn get_checkpoint_entry_for_file(
     let feature_flag_inter_commit_move = Config::get().get_feature_flags().inter_commit_move;
 
     let file_start = Instant::now();
-    let current_content = working_log
-        .read_current_file_content(&file_path)
-        .unwrap_or_default();
-
-    // Try to get previous state from checkpoints first
-    let from_checkpoint = previous_checkpoints.iter().rev().find_map(|checkpoint| {
-        checkpoint
-            .entries
-            .iter()
-            .find(|e| e.file == file_path)
-            .map(|entry| {
-                (
-                    working_log
-                        .get_file_version(&entry.blob_sha)
-                        .unwrap_or_default(),
-                    entry.attributions.clone(),
-                )
-            })
-    });
-
-    // Get INITIAL attributions for this file (needed early for the skip check)
     let initial_attrs_for_file = initial_attributions
         .get(&file_path)
         .cloned()
         .unwrap_or_default();
+
+    let previous_state = previous_file_state_by_file.get(&file_path).cloned();
+    let has_prior_ai_edits = ai_touched_files.contains(&file_path);
+
+    // Pre-commit fast path:
+    // If this file has no prior AI attribution and no INITIAL attribution,
+    // we can skip it entirely. Human-only files do not affect AI authorship.
+    if is_pre_commit
+        && kind == CheckpointKind::Human
+        && !has_prior_ai_edits
+        && initial_attrs_for_file.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let current_content = working_log
+        .read_current_file_content(&file_path)
+        .unwrap_or_default();
+
+    // Non-pre-commit fast path:
+    // Preserve existing `git-ai checkpoint` behavior for human-only files by writing an
+    // attribution-empty entry while still capturing line stats.
+    if kind == CheckpointKind::Human && !has_prior_ai_edits && initial_attrs_for_file.is_empty() {
+        let previous_content = if let Some(state) = previous_state.as_ref() {
+            working_log
+                .get_file_version(&state.blob_sha)
+                .unwrap_or_default()
+        } else {
+            get_previous_content_from_head(&repo, &file_path, head_tree_id.as_ref())
+        };
+
+        if current_content == previous_content {
+            return Ok(None);
+        }
+
+        let stats = compute_file_line_stats(&previous_content, &current_content);
+        let entry = WorkingLogEntry::new(file_path, file_content_hash, Vec::new(), Vec::new());
+        return Ok(Some((entry, stats)));
+    }
+
+    let from_checkpoint = previous_state.as_ref().map(|state| {
+        (
+            working_log
+                .get_file_version(&state.blob_sha)
+                .unwrap_or_default(),
+            state.attributions.clone(),
+        )
+    });
 
     let is_from_checkpoint = from_checkpoint.is_some();
     let (previous_content, prev_attributions) = if let Some((content, attrs)) = from_checkpoint {
@@ -824,27 +928,8 @@ fn get_checkpoint_entry_for_file(
         (content, attrs)
     } else {
         // File doesn't exist in any previous checkpoint - need to initialize from git + INITIAL
-        // Get previous content from HEAD tree
-        let previous_content = if let Some(tree_id) = head_tree_id.as_ref().as_ref() {
-            let head_tree = repo.find_tree(tree_id.clone()).ok();
-            if let Some(tree) = head_tree {
-                match tree.get_path(std::path::Path::new(&file_path)) {
-                    Ok(entry) => {
-                        if let Ok(blob) = repo.find_blob(entry.id()) {
-                            let blob_content = blob.content().unwrap_or_default();
-                            String::from_utf8_lossy(&blob_content).to_string()
-                        } else {
-                            String::new()
-                        }
-                    }
-                    Err(_) => String::new(),
-                }
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
+        let previous_content =
+            get_previous_content_from_head(&repo, &file_path, head_tree_id.as_ref());
 
         // Skip if no changes, UNLESS we have INITIAL attributions for this file
         // (in which case we need to create an entry to record those attributions)
@@ -993,6 +1078,7 @@ async fn get_checkpoint_entries(
     previous_checkpoints: &[Checkpoint],
     agent_run_result: Option<&AgentRunResult>,
     ts: u128,
+    is_pre_commit: bool,
 ) -> Result<(Vec<WorkingLogEntry>, Vec<FileLineStats>), GitAiError> {
     let entries_fn_start = Instant::now();
 
@@ -1003,6 +1089,14 @@ async fn get_checkpoint_entries(
     debug_log(&format!(
         "[BENCHMARK] Reading initial attributions took {:?}",
         initial_read_start.elapsed()
+    ));
+
+    let precompute_start = Instant::now();
+    let (previous_file_state_by_file, ai_touched_files) =
+        build_previous_file_state_maps(previous_checkpoints, &initial_attributions);
+    debug_log(&format!(
+        "[BENCHMARK] Precomputing previous state maps took {:?}",
+        precompute_start.elapsed()
     ));
 
     // Determine author_id based on checkpoint kind and agent_id
@@ -1038,10 +1132,9 @@ async fn get_checkpoint_entries(
     // Create a semaphore to limit concurrent tasks
     let semaphore = Arc::new(smol::lock::Semaphore::new(MAX_CONCURRENT));
 
-    // Move checkpoint data to Arc once, outside the loop to avoid repeated allocations
-    let previous_checkpoints = Arc::new(previous_checkpoints.to_vec());
-
     // Move other repeated allocations outside the loop
+    let previous_file_state_by_file = Arc::new(previous_file_state_by_file);
+    let ai_touched_files = Arc::new(ai_touched_files);
     let author_id = Arc::new(author_id);
     let head_commit_sha = Arc::new(head_commit_sha);
     let head_tree_id = Arc::new(head_tree_id);
@@ -1055,7 +1148,8 @@ async fn get_checkpoint_entries(
         let file_path = file_path.clone();
         let repo = repo.clone();
         let working_log = working_log.clone();
-        let previous_checkpoints = Arc::clone(&previous_checkpoints);
+        let previous_file_state_by_file = Arc::clone(&previous_file_state_by_file);
+        let ai_touched_files = Arc::clone(&ai_touched_files);
         let author_id = Arc::clone(&author_id);
         let head_commit_sha = Arc::clone(&head_commit_sha);
         let head_tree_id = Arc::clone(&head_tree_id);
@@ -1075,9 +1169,11 @@ async fn get_checkpoint_entries(
                 get_checkpoint_entry_for_file(
                     file_path,
                     kind,
+                    is_pre_commit,
                     repo,
                     working_log,
-                    previous_checkpoints,
+                    previous_file_state_by_file,
+                    ai_touched_files,
                     blob_sha,
                     author_id.clone(),
                     head_commit_sha.clone(),
@@ -1702,6 +1798,98 @@ mod tests {
         assert_eq!(
             entries_len_after, 1,
             "Should create 1 entry for new changes after conflict resolution"
+        );
+    }
+
+    #[test]
+    fn test_human_checkpoint_without_ai_history_uses_empty_attributions() {
+        let repo = TmpRepo::new().unwrap();
+        let mut file = repo.write_file("simple.txt", "one\n", true).unwrap();
+
+        repo.trigger_checkpoint_with_author("seed").unwrap();
+        repo.commit_with_message("seed commit").unwrap();
+
+        file.append("two\n").unwrap();
+        repo.trigger_checkpoint_with_author("human").unwrap();
+
+        let gitai_repo =
+            crate::git::repository::find_repository_in_path(repo.path().to_str().unwrap())
+                .expect("Repository should exist");
+        let base_commit = gitai_repo
+            .head()
+            .ok()
+            .and_then(|head| head.target().ok())
+            .unwrap_or_else(|| "initial".to_string());
+        let working_log = gitai_repo.storage.working_log_for_base_commit(&base_commit);
+        let checkpoints = working_log.read_all_checkpoints().unwrap();
+        let latest = checkpoints.last().unwrap();
+        let entry = latest
+            .entries
+            .iter()
+            .find(|entry| entry.file == "simple.txt")
+            .unwrap();
+
+        assert!(
+            entry.attributions.is_empty(),
+            "Human-only file should skip char-level attribution generation"
+        );
+        assert!(
+            entry.line_attributions.is_empty(),
+            "Human-only file should skip line-level attribution generation"
+        );
+        assert!(
+            latest.line_stats.additions > 0,
+            "Fast path should still record line stats"
+        );
+    }
+
+    #[test]
+    fn test_human_checkpoint_keeps_attributions_for_ai_touched_file() {
+        let (repo, mut lines_file, mut alphabet_file) = TmpRepo::new_with_base_commit().unwrap();
+
+        lines_file.append("ai change\n").unwrap();
+        repo.trigger_checkpoint_with_ai("mock_ai", None, None)
+            .unwrap();
+
+        lines_file.append("human after ai\n").unwrap();
+        alphabet_file.append("human only\n").unwrap();
+        repo.trigger_checkpoint_with_author("human").unwrap();
+
+        let gitai_repo =
+            crate::git::repository::find_repository_in_path(repo.path().to_str().unwrap())
+                .expect("Repository should exist");
+        let base_commit = gitai_repo
+            .head()
+            .ok()
+            .and_then(|head| head.target().ok())
+            .unwrap_or_else(|| "initial".to_string());
+        let working_log = gitai_repo.storage.working_log_for_base_commit(&base_commit);
+        let checkpoints = working_log.read_all_checkpoints().unwrap();
+        let latest = checkpoints.last().unwrap();
+
+        let ai_touched_entry = latest
+            .entries
+            .iter()
+            .find(|entry| entry.file == "lines.md")
+            .unwrap();
+        assert!(
+            !ai_touched_entry.attributions.is_empty()
+                || !ai_touched_entry.line_attributions.is_empty(),
+            "AI-touched file should keep attribution tracking"
+        );
+
+        let human_only_entry = latest
+            .entries
+            .iter()
+            .find(|entry| entry.file == "alphabet.md")
+            .unwrap();
+        assert!(
+            human_only_entry.attributions.is_empty(),
+            "Human-only file should use fast path with empty char attributions"
+        );
+        assert!(
+            human_only_entry.line_attributions.is_empty(),
+            "Human-only file should use fast path with empty line attributions"
         );
     }
 

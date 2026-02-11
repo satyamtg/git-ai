@@ -4,7 +4,7 @@ use crate::authorship::prompt_utils::{PromptUpdateResult, update_prompt_from_too
 use crate::authorship::secrets::{redact_secrets_from_prompts, strip_prompt_messages};
 use crate::authorship::stats::{stats_for_commit_stats, write_stats_to_terminal};
 use crate::authorship::virtual_attribution::VirtualAttributions;
-use crate::authorship::working_log::{Checkpoint, CheckpointKind};
+use crate::authorship::working_log::{Checkpoint, CheckpointKind, WorkingLogEntry};
 use crate::config::{Config, PromptStorageMode};
 use crate::error::GitAiError;
 use crate::git::refs::notes_add;
@@ -26,6 +26,24 @@ struct StatsCostEstimate {
     files_with_additions: usize,
     added_lines: usize,
     hunk_ranges: usize,
+}
+
+fn checkpoint_entry_requires_post_processing(
+    checkpoint: &Checkpoint,
+    entry: &WorkingLogEntry,
+) -> bool {
+    if checkpoint.kind != CheckpointKind::Human {
+        return true;
+    }
+
+    entry
+        .line_attributions
+        .iter()
+        .any(|attr| attr.author_id != CheckpointKind::Human.to_str() || attr.overrode.is_some())
+        || entry
+            .attributions
+            .iter()
+            .any(|attr| attr.author_id != CheckpointKind::Human.to_str())
 }
 
 pub fn post_commit(
@@ -82,13 +100,17 @@ pub fn post_commit(
         Some(human_author.clone()),
     )?;
 
-    // Get pathspecs for files in the working log - include ALL files from checkpoints,
-    // not just committed files. This ensures uncommitted files get proper INITIAL attributions.
-    // See issue #356: batch commits lose attribution for files committed later.
-    let mut pathspecs: HashSet<String> = parent_working_log
-        .iter()
-        .flat_map(|cp| cp.entries.iter().map(|e| e.file.clone()))
-        .collect();
+    // Build pathspecs from AI-relevant checkpoint entries only.
+    // Human-only entries with no AI attribution do not affect authorship output and should not
+    // trigger expensive post-commit diff work across large commits.
+    let mut pathspecs: HashSet<String> = HashSet::new();
+    for checkpoint in &parent_working_log {
+        for entry in &checkpoint.entries {
+            if checkpoint_entry_requires_post_processing(checkpoint, entry) {
+                pathspecs.insert(entry.file.clone());
+            }
+        }
+    }
 
     // Also include files from INITIAL attributions (uncommitted files from previous commits)
     // These files may not have checkpoints but still need their attribution preserved
