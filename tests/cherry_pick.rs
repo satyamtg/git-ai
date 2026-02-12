@@ -1,7 +1,34 @@
 #[macro_use]
 mod repos;
+use git_ai::authorship::authorship_log::PromptRecord;
+use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
+use git_ai::authorship::working_log::AgentId;
+use git_ai::git::refs::notes_add;
 use repos::test_file::ExpectedLineExt;
 use repos::test_repo::TestRepo;
+use std::process::Command;
+
+fn read_authorship_note(repo: &TestRepo, commit_sha: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo.path().to_str().expect("valid repo path"),
+            "--no-pager",
+            "notes",
+            "--ref=ai",
+            "show",
+            commit_sha,
+        ])
+        .output()
+        .expect("failed to run git notes show");
+
+    if output.status.success() {
+        let note = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if note.is_empty() { None } else { Some(note) }
+    } else {
+        None
+    }
+}
 
 /// Test cherry-picking a single AI-authored commit
 #[test]
@@ -71,6 +98,125 @@ fn test_single_commit_cherry_pick() {
         total_accepted, stats.ai_accepted,
         "Sum of accepted_lines should match ai_accepted stat"
     );
+}
+
+#[test]
+fn test_cherry_pick_preserves_human_only_commit_note_metadata() {
+    let repo = TestRepo::new();
+
+    let mut base = repo.filename("base.txt");
+    base.set_contents(lines!["base"]);
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let main_branch = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    let mut feature_file = repo.filename("feature.txt");
+    feature_file.set_contents(lines!["human-only change"]);
+    let source_commit = repo
+        .stage_all_and_commit("human-only commit")
+        .expect("create source commit");
+
+    let source_note = read_authorship_note(&repo, &source_commit.commit_sha)
+        .expect("source commit should have a metadata-only note");
+    let source_log =
+        AuthorshipLog::deserialize_from_string(&source_note).expect("parse source note");
+    assert!(source_log.attestations.is_empty());
+    assert!(source_log.metadata.prompts.is_empty());
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    repo.git(&["cherry-pick", &source_commit.commit_sha])
+        .unwrap();
+    let new_commit = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    let new_note = read_authorship_note(&repo, &new_commit)
+        .expect("cherry-picked commit should preserve metadata-only note");
+    let new_log = AuthorshipLog::deserialize_from_string(&new_note).expect("parse new note");
+    assert!(new_log.attestations.is_empty());
+    assert!(new_log.metadata.prompts.is_empty());
+    assert_eq!(new_log.metadata.base_commit_sha, new_commit);
+}
+
+#[test]
+fn test_cherry_pick_preserves_prompt_only_commit_note_metadata() {
+    let repo = TestRepo::new();
+
+    let mut base = repo.filename("base.txt");
+    base.set_contents(lines!["base"]);
+    repo.stage_all_and_commit("Initial commit").unwrap();
+    let main_branch = repo.current_branch();
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    let mut feature_file = repo.filename("feature.txt");
+    feature_file.set_contents(lines!["human-only change"]);
+    let source_commit = repo
+        .stage_all_and_commit("human-only commit")
+        .expect("create source commit");
+
+    let source_note = read_authorship_note(&repo, &source_commit.commit_sha)
+        .expect("source commit should have authorship note");
+    let mut source_log =
+        AuthorshipLog::deserialize_from_string(&source_note).expect("parse source note");
+    assert!(
+        source_log.attestations.is_empty(),
+        "precondition: source should start metadata-only"
+    );
+    assert!(
+        source_log.metadata.prompts.is_empty(),
+        "precondition: source commit should not have prompts before test mutation"
+    );
+
+    source_log.metadata.prompts.insert(
+        "prompt-only-session".to_string(),
+        PromptRecord {
+            agent_id: AgentId {
+                tool: "mock_ai".to_string(),
+                id: "session-1".to_string(),
+                model: "test-model".to_string(),
+            },
+            human_author: Some("Test User <test@example.com>".to_string()),
+            messages: vec![],
+            total_additions: 11,
+            total_deletions: 2,
+            accepted_lines: 0,
+            overriden_lines: 0,
+            messages_url: None,
+        },
+    );
+
+    let mutated_source_note = source_log
+        .serialize_to_string()
+        .expect("serialize mutated source note");
+    let git_ai_repo = git_ai::git::find_repository_in_path(repo.path().to_str().unwrap())
+        .expect("find repository");
+    notes_add(
+        &git_ai_repo,
+        &source_commit.commit_sha,
+        &mutated_source_note,
+    )
+    .expect("overwrite source note with prompt-only metadata");
+
+    repo.git(&["checkout", &main_branch]).unwrap();
+    repo.git(&["cherry-pick", &source_commit.commit_sha])
+        .unwrap();
+    let new_commit = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+    let new_note = read_authorship_note(&repo, &new_commit)
+        .expect("cherry-picked commit should preserve prompt-only note");
+    let new_log = AuthorshipLog::deserialize_from_string(&new_note).expect("parse new note");
+    assert!(new_log.attestations.is_empty());
+    assert_eq!(new_log.metadata.prompts.len(), 1);
+    assert_eq!(new_log.metadata.base_commit_sha, new_commit);
+
+    let prompt = new_log
+        .metadata
+        .prompts
+        .get("prompt-only-session")
+        .expect("prompt metadata should be preserved");
+    assert_eq!(prompt.agent_id.tool, "mock_ai");
+    assert_eq!(prompt.agent_id.id, "session-1");
+    assert_eq!(prompt.agent_id.model, "test-model");
+    assert_eq!(prompt.total_additions, 11);
+    assert_eq!(prompt.total_deletions, 2);
 }
 
 /// Test cherry-picking multiple commits in sequence
