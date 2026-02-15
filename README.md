@@ -1,3 +1,23 @@
+# git-ai 
+
+<img src="https://github.com/git-ai-project/git-ai/raw/main/assets/docs/git-ai.png" align="right"
+     alt="Git AI Logo" width="178" height="178">
+
+Git AI is an open source git extension that keeps track of the AI-generated code in your repositories. While you work each AI line is transparently linked to the agent, model plan/prompts; so that the intent, requirements and architecture decisions is preserved. 
+
+* **Cross Agent AI Blame** - our [open standard](https://github.com/git-ai-project/git-ai/blob/main/specs/git_ai_standard_v3.0.0.md) for tracking AI-attribution is supported by every major coding agent. 
+* **Save your prompts** - saving the context behind every line makes it possible to review, maintain and build on top of AI-generated code. Securely store your team's prompts on your own infrastructure. 
+* **No workflow changes** - Just prompt, edit and commit. Git AI accuratly tracks AI-code without making AI-commits or making you change your workflow. Attributions live in Git Notes and survive squash, rebase, reset, stash/pop cherry-pick etc.
+
+
+
+
+
+
+
+
+
+
 <div>
 <img src="https://github.com/git-ai-project/git-ai/raw/main/assets/docs/git-ai.png" align="right"
      alt="Git AI by git-ai-project/git-ai" width="100" height="100" />
