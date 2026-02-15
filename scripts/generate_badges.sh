@@ -9,11 +9,11 @@ OUT_DIR="$REPO_ROOT/assets/docs/badges"
 
 mkdir -p "$OUT_DIR"
 
-width=80
-height=35
-left_width=54
+width=120
+height=50
+left_width=82
 right_width=$(( width - left_width ))
-icon_size=33
+icon_size=46
 icon_pad_x=$(( (left_width - icon_size) / 2 ))
 icon_pad_y=$(( (height - icon_size) / 2 ))
 radius=8
@@ -47,7 +47,7 @@ for ((i = 0; i < count; i++)); do
   </g>
   <image x="${icon_pad_x}" y="${icon_pad_y}" width="${icon_size}" height="${icon_size}" xlink:href="data:image/png;base64,${b64}"/>
   <polyline points="$(( check_cx - 6 )),${check_cy} $(( check_cx - 2 )),$(( check_cy + 5 )) $(( check_cx + 7 )),$(( check_cy - 5 ))" fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <rect width="${width}" height="${height}" rx="${radius}" ry="${radius}" fill="none" stroke="#F97316" stroke-width="1.5"/>
+  <rect width="${width}" height="${height}" rx="${radius}" ry="${radius}" fill="none" stroke="#334155" stroke-width="1.5"/>
 </svg>
 SVGEOF
 
