@@ -47,10 +47,44 @@ fe2c4c8 (claude-4.5-opus [prompt_id]   2025-12-02 19:25:13 -0500  142)          
 
 <table>
 <tr>
-<td><b>Commit (normal git)</b></td>
 <td><b>Git Note</b> <code>refs/notes/ai #&lt;commitsha&gt;</code></td>
+<td><b>Commit (normal git)</b></td>
 </tr>
 <tr>
+<td>
+
+```json
+{
+  "files": {
+    "hooks/post_clone_hook.rs": {
+      "promptid1": "6-8",
+      "promptid2": "16,21,25"
+    }
+  },
+  "prompts": {
+    "promptid1": {
+      "agent_id": {
+        "tool": "copilot",
+        "model": "Codex 5.2"
+      },
+      "human_author": "Alice Person",
+      "messages_url": "https://your-git-ai-prompt-store.dev/cas/promptid1_content_hash",
+      "summary": "GitHub #821: Guard note fetching on successful clone."
+    },
+    "promptid2": {
+      "agent_id": {
+        "tool": "cursor",
+        "model": "Sonnet 4.5"
+      },
+      "human_author": "Jeff Coder",
+      "messages_url": "https://your-git-ai-prompt-store.dev/cas/promptid2_content_hash",
+      "summary": "Match Git Clone output style for notes fetch status."
+    }
+  }
+}
+```
+
+</td>
 <td>
 
 ```rust
@@ -83,40 +117,6 @@ pub fn post_clone_hook(
     }
 
     Some(())
-}
-```
-
-</td>
-<td>
-
-```json
-{
-  "files": {
-    "hooks/post_clone_hook.rs": {
-      "promptid1": "6-8",
-      "promptid2": "16,21,25"
-    }
-  },
-  "prompts": {
-    "promptid1": {
-      "agent_id": {
-        "tool": "copilot",
-        "model": "Codex 5.2"
-      },
-      "human_author": "Alice Person",
-      "messages_url": "https://your-git-ai-prompt-store.dev/cas/promptid1_content_hash",
-      "summary": "GitHub #821: Guard note fetching on successful clone."
-    },
-    "promptid2": {
-      "agent_id": {
-        "tool": "cursor",
-        "model": "Sonnet 4.5"
-      },
-      "human_author": "Jeff Coder",
-      "messages_url": "https://your-git-ai-prompt-store.dev/cas/promptid2_content_hash",
-      "summary": "Match Git Clone output style for notes fetch status."
-    }
-  }
 }
 ```
 
