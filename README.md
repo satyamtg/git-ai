@@ -257,7 +257,7 @@ git-ai stats --json
 }
 ```
 
-For team-wide visibility, the [Git AI Enterprise](https://usegitai.com/enterprise) aggregates data at the PR, repository, and organization level:
+For team-wide visibility, [Git AI Enterprise](https://usegitai.com/enterprise) aggregates data at the PR, repository, and organization level:
 
 - **AI code composition** — track what percentage of code is AI-generated across your org
 - **Track full lifecycle of AI-code** — how much is accepted? Committed? Rewritten during Code Review? Deployed to production? How durable is that code once it ships? Is it the cause of any alerts / incidents?
@@ -266,9 +266,6 @@ For team-wide visibility, the [Git AI Enterprise](https://usegitai.com/enterpris
 - **Agent + model comparison** — see accepted-rate and output quality by agent and model
   
 **[Get early access](https://calendly.com/acunniffe/meeting-with-git-ai-authors)**
-
-
-## 
 
 # License 
 Apache 2.0
