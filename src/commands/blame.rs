@@ -1,11 +1,3 @@
-//! Git blame with AI authorship overlay.
-//!
-//! Extends standard git blame output by resolving AI-assisted lines to their
-//! originating tool/prompt and the human author who directed the AI. Supports
-//! all standard git-blame output formats (default, porcelain, incremental, JSON)
-//! and can split hunks when different lines within a single commit were authored
-//! by different humans working with AI.
-
 use crate::authorship::authorship_log::PromptRecord;
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::working_log::CheckpointKind;

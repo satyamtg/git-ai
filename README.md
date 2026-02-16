@@ -229,11 +229,13 @@ Agents make fewer mistakes, and produce more maintainable code, when they unders
 
 ## Cross Agent Observability
 
-Measure the % of AI-generated code, accepted-rate by agent and model, and human override rate — for any commit or range of commits.
+Git AI collects cross-agent telemetry from prompt to production. Track how much AI code actually gets accepted, committed, through code review, and into production — so you can figure out which tools and practices work best for your team.
 
 ```bash
 git-ai stats --json
 ```
+
+Learn more: [Stats command reference docs](https://usegitai.com/docs/cli/reference#stats)
 
 ```json
 {
@@ -266,6 +268,9 @@ For team-wide visibility, [Git AI Enterprise](https://usegitai.com/enterprise) a
 - **Agent + model comparison** — see accepted-rate and output quality by agent and model
   
 **[Get early access](https://calendly.com/acunniffe/meeting-with-git-ai-authors)**
+
+![alt](https://github.com/git-ai-project/git-ai/raw/main/assets/docs/dashboard.png)
+
 
 # License 
 Apache 2.0
