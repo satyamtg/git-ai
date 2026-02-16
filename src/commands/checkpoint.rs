@@ -135,6 +135,8 @@ pub fn run(
         ));
     }
 
+    crate::commands::git_hook_handlers::ensure_repo_level_hooks_for_checkpoint(repo);
+
     let ignore_patterns = effective_ignore_patterns(repo, &[], &[]);
     let ignore_matcher = build_ignore_matcher(&ignore_patterns);
 
