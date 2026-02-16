@@ -36,6 +36,24 @@ fe2c4c8 (claude-4.5-opus [prompt_id]   2025-12-02 19:25:13 -0500  142)          
 - **Git Native & Open Standard** — Git AI created the [open standard](https://github.com/git-ai-project/git-ai/blob/main/specs/git_ai_standard_v3.0.0.md) for tracking AI-generated code with Git Notes.
 - **Prompts stay out of Git** — Git Notes reference prompts and agent sessions, but prompt content is never stored in your repository — keeping repos lean, free of API keys + sensitive information, and giving you access controls over prompt data.
 
+## Install
+
+Mac, Linux, Windows (WSL)
+
+```bash
+curl -sSL https://usegitai.com/install.sh | bash
+```
+
+Windows (non-WSL)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://usegitai.com/install.ps1 | iex"
+```
+
+🎊 That's it! **No per-repo setup.**
+
+
+
 <details>
 <summary>How does Git AI work?</summary>
 
@@ -127,22 +145,6 @@ fe2c4c8 (claude-4.5-opus [prompt_id]   2025-12-02 19:25:13 -0500  142)          
 The format of the notes is outlined in the [Git AI Standard v3.0.0](https://github.com/git-ai-project/git-ai/blob/main/specs/git_ai_standard_v3.0.0.md).
 
 </details>
-
-## Install
-
-Mac, Linux, Windows (WSL)
-
-```bash
-curl -sSL https://usegitai.com/install.sh | bash
-```
-
-Windows (non-WSL)
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://usegitai.com/install.ps1 | iex"
-```
-
-🎊 That's it! **No per-repo setup.**
 
 --- 
 
