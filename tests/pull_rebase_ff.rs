@@ -240,8 +240,13 @@ fn test_fast_forward_pull_preserves_ai_attribution() {
         .stage_all_and_commit("AI work commit")
         .expect("commit should succeed");
 
-    // Perform fast-forward pull
-    local.git(&["pull"]).expect("pull should succeed");
+    // Configure git pull behavior
+    local
+        .git(&["config", "pull.rebase", "false"])
+        .expect("config should succeed");
+
+    // Perform pull with merge (can't fast-forward due to divergent history)
+    local.git(&["pull", "--no-ff"]).expect("pull should succeed");
 
     // Verify AI attribution is preserved through the ff pull
     ai_file.assert_lines_and_blame(vec!["AI generated line 1".ai(), "AI generated line 2".ai()]);
@@ -251,6 +256,11 @@ fn test_fast_forward_pull_preserves_ai_attribution() {
 fn test_fast_forward_pull_without_local_changes() {
     let setup = setup_pull_test();
     let local = setup.local;
+
+    // Configure git pull behavior
+    local
+        .git(&["config", "pull.ff", "only"])
+        .expect("config should succeed");
 
     // No local changes - just a clean fast-forward pull
     local.git(&["pull"]).expect("pull should succeed");
