@@ -40,7 +40,7 @@ keyring = ["dep:keyring"]
 
 [dev-dependencies]
 git-ai = { path = ".", features = ["test-support"] }
-rustls-native-certs = "0.6"
+rustls-native-certs = "0.8"
 tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
