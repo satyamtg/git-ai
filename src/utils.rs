@@ -792,4 +792,142 @@ mod tests {
             "Ångström.txt"
         );
     }
+
+    // =========================================================================
+    // Phase 9: Escape Sequence Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn test_unescape_incomplete_octal() {
+        // Incomplete octal at end of string
+        assert_eq!(unescape_git_path("\"file\\34\""), "file\x1c");
+        assert_eq!(unescape_git_path("\"file\\3\""), "file\x03");
+    }
+
+    #[test]
+    fn test_unescape_invalid_octal() {
+        // Invalid octal digit (8 and 9 are not valid octal)
+        assert_eq!(unescape_git_path("\"file\\389.txt\""), "file\x038\u{0039}.txt");
+    }
+
+    #[test]
+    fn test_unescape_backslash_only() {
+        // Backslash at end without following character
+        assert_eq!(unescape_git_path("\"file\\\""), "file\\");
+    }
+
+    #[test]
+    fn test_unescape_mixed_escapes() {
+        // Mix of different escape types
+        assert_eq!(
+            unescape_git_path("\"path\\nwith\\ttab\\\\and\\344\\270\\255.txt\""),
+            "path\nwith\ttab\\and中.txt"
+        );
+    }
+
+    #[test]
+    fn test_unescape_empty_quoted() {
+        // Empty quoted string
+        assert_eq!(unescape_git_path("\"\""), "");
+    }
+
+    #[test]
+    fn test_unescape_unmatched_quotes() {
+        // Unmatched quotes - returned as-is
+        assert_eq!(unescape_git_path("\"unmatched"), "\"unmatched");
+        assert_eq!(unescape_git_path("unmatched\""), "unmatched\"");
+    }
+
+    // =========================================================================
+    // normalize_to_posix Tests
+    // =========================================================================
+
+    #[test]
+    fn test_normalize_to_posix_no_change() {
+        // Already POSIX paths
+        assert_eq!(normalize_to_posix("path/to/file.txt"), "path/to/file.txt");
+        assert_eq!(normalize_to_posix("src/main.rs"), "src/main.rs");
+    }
+
+    #[test]
+    fn test_normalize_to_posix_windows() {
+        // Windows paths
+        assert_eq!(
+            normalize_to_posix("path\\to\\file.txt"),
+            "path/to/file.txt"
+        );
+        assert_eq!(normalize_to_posix("C:\\Users\\file"), "C:/Users/file");
+    }
+
+    #[test]
+    fn test_normalize_to_posix_mixed() {
+        // Mixed separators
+        assert_eq!(
+            normalize_to_posix("path/to\\some\\file.txt"),
+            "path/to/some/file.txt"
+        );
+    }
+
+    #[test]
+    fn test_normalize_to_posix_empty() {
+        assert_eq!(normalize_to_posix(""), "");
+    }
+
+    // =========================================================================
+    // Debug Logging Tests
+    // =========================================================================
+
+    #[test]
+    fn test_debug_log_no_panic() {
+        // Debug logging should not panic
+        debug_log("test message");
+    }
+
+    #[test]
+    fn test_debug_performance_log_no_panic() {
+        debug_performance_log("test performance message");
+    }
+
+    #[test]
+    fn test_debug_performance_log_structured_no_panic() {
+        use serde_json::json;
+        debug_performance_log_structured(json!({
+            "operation": "test",
+            "duration_ms": 100,
+        }));
+    }
+
+    // =========================================================================
+    // current_git_ai_exe Tests
+    // =========================================================================
+
+    #[test]
+    fn test_current_git_ai_exe_returns_path() {
+        // Should return a path (either current exe or git-ai)
+        let result = current_git_ai_exe();
+        assert!(result.is_ok(), "current_git_ai_exe should not fail");
+        let path = result.unwrap();
+        assert!(!path.as_os_str().is_empty(), "path should not be empty");
+    }
+
+    // =========================================================================
+    // is_interactive_terminal Tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_interactive_terminal() {
+        // Just call it to ensure it doesn't panic
+        let _ = is_interactive_terminal();
+    }
+
+    // =========================================================================
+    // Platform-specific constants
+    // =========================================================================
+
+    #[cfg(windows)]
+    #[test]
+    fn test_create_no_window_constant() {
+        // Verify the Windows constant is correct
+        assert_eq!(CREATE_NO_WINDOW, 0x08000000);
+    }
 }

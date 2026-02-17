@@ -264,4 +264,132 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn test_load_ai_touched_files_empty_commits() {
+        smol::block_on(async {
+            let repo = find_repository_in_path(".").unwrap();
+
+            let files = load_ai_touched_files_for_commits(&repo, vec![])
+                .await
+                .unwrap();
+
+            assert!(files.is_empty(), "Should return empty set for empty input");
+        });
+    }
+
+    #[test]
+    fn test_commits_have_authorship_notes_empty() {
+        let repo = find_repository_in_path(".").unwrap();
+
+        let result = commits_have_authorship_notes(&repo, &[]).unwrap();
+
+        assert!(!result, "Empty list should return false");
+    }
+
+    #[test]
+    fn test_commits_have_authorship_notes_nonexistent() {
+        let repo = find_repository_in_path(".").unwrap();
+
+        let fake_commits = vec![
+            "0000000000000000000000000000000000000000".to_string(),
+            "1111111111111111111111111111111111111111".to_string(),
+        ];
+
+        let result = commits_have_authorship_notes(&repo, &fake_commits).unwrap();
+
+        // Non-existent commits don't have notes
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch_output_empty() {
+        let result = parse_cat_file_batch_output_with_oids(b"").unwrap();
+        assert!(result.is_empty(), "Empty input should return empty map");
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch_output_missing() {
+        let data = b"abc123 missing\n";
+        let result = parse_cat_file_batch_output_with_oids(data).unwrap();
+        assert!(
+            result.is_empty(),
+            "Missing blobs should not be included in result"
+        );
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch_output_single_blob() {
+        let data = b"abc123 blob 11\nhello world\n";
+        let result = parse_cat_file_batch_output_with_oids(data).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get("abc123"), Some(&"hello world".to_string()));
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch_output_multiple_blobs() {
+        let data = b"abc123 blob 5\nhello\ndef456 blob 5\nworld\n";
+        let result = parse_cat_file_batch_output_with_oids(data).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("abc123"), Some(&"hello".to_string()));
+        assert_eq!(result.get("def456"), Some(&"world".to_string()));
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch_output_truncated() {
+        // Size says 20 bytes but only 5 provided
+        let data = b"abc123 blob 20\nhello";
+        let result = parse_cat_file_batch_output_with_oids(data);
+        assert!(result.is_err(), "Truncated content should return error");
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch_output_invalid_size() {
+        let data = b"abc123 blob notanumber\n";
+        let result = parse_cat_file_batch_output_with_oids(data);
+        assert!(result.is_err(), "Invalid size should return error");
+    }
+
+    #[test]
+    fn test_parse_cat_file_batch_output_malformed_header() {
+        let data = b"abc123\n";
+        let result = parse_cat_file_batch_output_with_oids(data).unwrap();
+        assert!(
+            result.is_empty(),
+            "Malformed header should skip that entry"
+        );
+    }
+
+    #[test]
+    fn test_batch_read_blobs_with_oids_empty() {
+        let repo = find_repository_in_path(".").unwrap();
+        let result = batch_read_blobs_with_oids(&repo.global_args_for_exec(), &[]).unwrap();
+        assert!(result.is_empty(), "Empty OID list should return empty map");
+    }
+
+    #[test]
+    fn test_extract_file_paths_from_note_empty() {
+        let mut files = HashSet::new();
+        extract_file_paths_from_note("", &mut files);
+        assert!(files.is_empty(), "Empty note should extract no files");
+    }
+
+    #[test]
+    fn test_extract_file_paths_from_note_no_divider() {
+        let mut files = HashSet::new();
+        extract_file_paths_from_note("some content without divider", &mut files);
+        assert!(
+            files.is_empty(),
+            "Note without divider should extract no files"
+        );
+    }
+
+    #[test]
+    fn test_extract_file_paths_from_note_invalid_format() {
+        let mut files = HashSet::new();
+        let content = "invalid attestation\n---\n{\"metadata\":\"test\"}";
+        extract_file_paths_from_note(content, &mut files);
+        // Should not crash, might extract nothing or handle gracefully
+        // This tests error handling path
+    }
 }
