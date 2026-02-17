@@ -1,10 +1,12 @@
+use crate::authorship::authorship_log::LineRange;
+use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
 use crate::authorship::transcript::Message;
 use crate::error::GitAiError;
 use crate::git::refs::get_authorship;
 use crate::git::repository::Repository;
-use crate::{authorship::authorship_log::LineRange, utils::debug_log};
+use crate::utils::debug_log;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolModelHeadlineStats {
@@ -22,7 +24,7 @@ pub struct ToolModelHeadlineStats {
     pub time_waiting_for_ai: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommitStats {
     #[serde(default)]
     pub human_additions: u32, // Number of lines committed with human attribution (full and/or mixed)
@@ -46,23 +48,6 @@ pub struct CommitStats {
     pub tool_model_breakdown: BTreeMap<String, ToolModelHeadlineStats>,
 }
 
-impl Default for CommitStats {
-    fn default() -> Self {
-        Self {
-            human_additions: 0,
-            mixed_additions: 0,
-            ai_additions: 0,
-            ai_accepted: 0,
-            total_ai_additions: 0,
-            total_ai_deletions: 0,
-            time_waiting_for_ai: 0,
-            git_diff_deleted_lines: 0,
-            git_diff_added_lines: 0,
-            tool_model_breakdown: BTreeMap::new(),
-        }
-    }
-}
-
 pub fn stats_command(
     repo: &Repository,
     commit_sha: Option<&str>,
@@ -75,7 +60,7 @@ pub fn stats_command(
             Ok(commit_obj) => {
                 // For a specific commit, we don't have a refname, so use the commit SHA
                 let full_sha = commit_obj.id();
-                (full_sha, format!("{}", sha))
+                (full_sha, sha.to_string())
             }
             Err(GitAiError::GitCliError { .. }) => {
                 return Err(GitAiError::Generic(format!("No commit found: {}", sha)));
@@ -307,7 +292,7 @@ pub fn write_stats_to_terminal(stats: &CommitStats, print: bool) -> String {
             println!("{}", ai_acceptance_str);
         }
     }
-    return output;
+    output
 }
 
 #[allow(dead_code)]
@@ -392,7 +377,7 @@ pub fn write_stats_to_markdown(stats: &CommitStats) -> String {
         0
     };
 
-    output.push_str("Stats powered by [Git AI](https://github.com/acunniffe/git-ai)\n\n");
+    output.push_str("Stats powered by [Git AI](https://github.com/git-ai-project/git-ai)\n\n");
     // Build the fenced code block
     output.push_str("```text\n");
 
@@ -443,22 +428,21 @@ pub fn write_stats_to_markdown(stats: &CommitStats) -> String {
     };
     output.push_str(&format!("- {} waiting for AI \n", time_str));
     // Find top model by accepted lines
-    if !stats.tool_model_breakdown.is_empty() {
-        if let Some((model_name, model_stats)) = stats
+    if !stats.tool_model_breakdown.is_empty()
+        && let Some((model_name, model_stats)) = stats
             .tool_model_breakdown
             .iter()
             .max_by_key(|(_, stats)| stats.ai_accepted)
-        {
-            output.push_str(&format!(
-                "- Top model: {} ({} accepted lines, {} generated lines)\n",
-                model_name, model_stats.ai_accepted, model_stats.total_ai_additions
-            ));
-        }
+    {
+        output.push_str(&format!(
+            "- Top model: {} ({} accepted lines, {} generated lines)\n",
+            model_name, model_stats.ai_accepted, model_stats.total_ai_additions
+        ));
     }
 
     output.push_str("\n</details>");
 
-    return output;
+    output
 }
 
 /// Calculate commit stats from an authorship log
@@ -467,12 +451,14 @@ pub fn stats_from_authorship_log(
     authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
     git_diff_added_lines: u32,
     git_diff_deleted_lines: u32,
+    ai_accepted: u32,
+    ai_accepted_by_tool: &BTreeMap<String, u32>,
 ) -> CommitStats {
     let mut commit_stats = CommitStats {
         human_additions: 0,
         mixed_additions: 0,
         ai_additions: 0,
-        ai_accepted: 0,
+        ai_accepted,
         total_ai_additions: 0,
         total_ai_deletions: 0,
         time_waiting_for_ai: 0,
@@ -483,34 +469,6 @@ pub fn stats_from_authorship_log(
 
     // Process authorship log if present
     if let Some(log) = authorship_log {
-        // Count lines by author type
-        for file_attestation in &log.attestations {
-            for entry in &file_attestation.entries {
-                // Count lines in this entry
-                let lines_in_entry: u32 = entry
-                    .line_ranges
-                    .iter()
-                    .map(|range| match range {
-                        LineRange::Single(_) => 1,
-                        LineRange::Range(start, end) => end - start + 1,
-                    })
-                    .sum();
-
-                // Check if this is an AI-generated entry
-                if let Some(prompt_record) = log.metadata.prompts.get(&entry.hash) {
-                    // Count accepted lines (lines that were accepted by the user without any human edits)
-                    commit_stats.ai_accepted += lines_in_entry;
-
-                    let key = format!(
-                        "{}::{}",
-                        prompt_record.agent_id.tool, prompt_record.agent_id.model
-                    );
-                    let tool_stats = commit_stats.tool_model_breakdown.entry(key).or_default();
-                    tool_stats.ai_accepted += lines_in_entry;
-                }
-            }
-        }
-
         for prompt_record in log.metadata.prompts.values() {
             commit_stats.total_ai_additions += prompt_record.total_additions;
             commit_stats.total_ai_deletions += prompt_record.total_deletions;
@@ -534,17 +492,30 @@ pub fn stats_from_authorship_log(
             commit_stats.time_waiting_for_ai += waiting;
             tool_stats.time_waiting_for_ai += waiting;
         }
+    }
 
-        // AI additions are the sum of mixed and accepted lines, capped at the total git diff added lines
-        commit_stats.ai_additions = std::cmp::min(
-            commit_stats.mixed_additions + commit_stats.ai_accepted,
-            git_diff_added_lines,
-        );
+    // TODO: Mixed additions come from prompt overrides and can exceed the final diff when we
+    // compute ai_accepted from diff/blame. Cap to remaining added lines until we improve mixed tracking.
+    let max_mixed = git_diff_added_lines.saturating_sub(commit_stats.ai_accepted);
+    if commit_stats.mixed_additions > max_mixed {
+        commit_stats.mixed_additions = max_mixed;
+    }
 
-        // Calculate ai_additions for each tool following the same contract: ai_additions = ai_accepted + mixed_additions
-        for tool_stats in commit_stats.tool_model_breakdown.values_mut() {
-            tool_stats.ai_additions = tool_stats.ai_accepted + tool_stats.mixed_additions;
-        }
+    // Update tool-level accepted counts using diff-based attribution.
+    for (tool_model, accepted) in ai_accepted_by_tool {
+        let tool_stats = commit_stats
+            .tool_model_breakdown
+            .entry(tool_model.clone())
+            .or_default();
+        tool_stats.ai_accepted = *accepted;
+    }
+
+    // AI additions are the sum of mixed and accepted lines.
+    commit_stats.ai_additions = commit_stats.mixed_additions + commit_stats.ai_accepted;
+
+    // Calculate ai_additions for each tool following the same contract: ai_additions = ai_accepted + mixed_additions
+    for tool_stats in commit_stats.tool_model_breakdown.values_mut() {
+        tool_stats.ai_additions = tool_stats.ai_accepted + tool_stats.mixed_additions;
     }
 
     // Human additions are the difference between total git diff and AI accepted lines (ensure non-negative)
@@ -562,6 +533,8 @@ pub fn stats_for_commit_stats(
     commit_sha: &str,
     ignore_patterns: &[String],
 ) -> Result<CommitStats, GitAiError> {
+    let commit_obj = repo.revparse_single(commit_sha)?.peel_to_commit()?;
+
     // Step 1: get the diff between this commit and its parent ON refname (if more than one parent)
     // If initial than everything is additions
     // We want the count here git shows +111 -55
@@ -569,14 +542,103 @@ pub fn stats_for_commit_stats(
         get_git_diff_stats(repo, commit_sha, ignore_patterns)?;
 
     // Step 2: get the authorship log for this commit
-    let authorship_log = get_authorship(repo, &commit_sha);
+    let authorship_log = get_authorship(repo, commit_sha);
 
-    // Step 3: Calculate stats from authorship log
+    // Step 3: get line numbers added by this specific commit, then intersect with attestations.
+    // This keeps accepted stats scoped to the target commit while avoiding expensive blame traversal.
+    let parent_count = commit_obj.parent_count()?;
+    let is_merge_commit = parent_count > 1;
+    let mut added_lines_by_file: HashMap<String, Vec<u32>> = if is_merge_commit {
+        HashMap::new()
+    } else {
+        let from_ref = if parent_count == 0 {
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string()
+        } else {
+            commit_obj.parent(0)?.id()
+        };
+        repo.diff_added_lines(&from_ref, commit_sha, None)?
+    };
+    let ignore_matcher = build_ignore_matcher(ignore_patterns);
+    added_lines_by_file
+        .retain(|file_path, _| !should_ignore_file_with_matcher(file_path, &ignore_matcher));
+    for lines in added_lines_by_file.values_mut() {
+        lines.sort_unstable();
+        lines.dedup();
+    }
+
+    // Step 4: derive accepted lines directly from note attestations for lines added in this commit.
+    let (ai_accepted, ai_accepted_by_tool) = accepted_lines_from_attestations(
+        authorship_log.as_ref(),
+        &added_lines_by_file,
+        is_merge_commit,
+    );
+
+    // Step 5: Calculate stats from authorship log
     Ok(stats_from_authorship_log(
         authorship_log.as_ref(),
         git_diff_added_lines,
         git_diff_deleted_lines,
+        ai_accepted,
+        &ai_accepted_by_tool,
     ))
+}
+
+fn accepted_lines_from_attestations(
+    authorship_log: Option<&crate::authorship::authorship_log_serialization::AuthorshipLog>,
+    added_lines_by_file: &HashMap<String, Vec<u32>>,
+    is_merge_commit: bool,
+) -> (u32, BTreeMap<String, u32>) {
+    if is_merge_commit {
+        return (0, BTreeMap::new());
+    }
+
+    let mut total_ai_accepted = 0u32;
+    let mut per_tool_model = BTreeMap::new();
+
+    let Some(log) = authorship_log else {
+        return (0, per_tool_model);
+    };
+
+    for file_attestation in &log.attestations {
+        let Some(added_lines) = added_lines_by_file.get(&file_attestation.file_path) else {
+            continue;
+        };
+
+        for entry in &file_attestation.entries {
+            let accepted = entry
+                .line_ranges
+                .iter()
+                .map(|line_range| line_range_overlap_len(line_range, added_lines))
+                .sum::<u32>();
+
+            if accepted == 0 {
+                continue;
+            }
+
+            total_ai_accepted += accepted;
+
+            if let Some(prompt_record) = log.metadata.prompts.get(&entry.hash) {
+                let tool_model = format!(
+                    "{}::{}",
+                    prompt_record.agent_id.tool, prompt_record.agent_id.model
+                );
+                *per_tool_model.entry(tool_model).or_insert(0) += accepted;
+            }
+        }
+    }
+
+    (total_ai_accepted, per_tool_model)
+}
+
+fn line_range_overlap_len(range: &LineRange, added_lines: &[u32]) -> u32 {
+    match range {
+        LineRange::Single(line) => u32::from(added_lines.binary_search(line).is_ok()),
+        LineRange::Range(start, end) => {
+            let start_idx = added_lines.partition_point(|line| *line < *start);
+            let end_idx = added_lines.partition_point(|line| *line <= *end);
+            end_idx.saturating_sub(start_idx) as u32
+        }
+    }
 }
 
 /// Get git diff statistics between commit and its parent
@@ -593,10 +655,11 @@ pub fn get_git_diff_stats(
     args.push(commit_sha.to_string());
 
     let output = crate::git::repository::exec_git(&args)?;
-    let stdout = String::from_utf8(output.stdout)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut added_lines = 0u32;
     let mut deleted_lines = 0u32;
+    let ignore_matcher = build_ignore_matcher(ignore_patterns);
 
     // Parse numstat output
     for line in stdout.lines() {
@@ -605,7 +668,7 @@ pub fn get_git_diff_stats(
         }
 
         // Skip the commit message lines (they don't start with numbers)
-        if !line.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        if !line.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             continue;
         }
 
@@ -614,7 +677,7 @@ pub fn get_git_diff_stats(
         if parts.len() >= 3 {
             // Check if this file should be ignored
             let filename = parts[2];
-            if crate::authorship::range_authorship::should_ignore_file(filename, ignore_patterns) {
+            if should_ignore_file_with_matcher(filename, &ignore_matcher) {
                 continue;
             }
 
@@ -624,10 +687,10 @@ pub fn get_git_diff_stats(
             }
 
             // Parse deleted lines (handle "-" for binary files)
-            if parts[1] != "-" {
-                if let Ok(deleted) = parts[1].parse::<u32>() {
-                    deleted_lines += deleted;
-                }
+            if parts[1] != "-"
+                && let Ok(deleted) = parts[1].parse::<u32>()
+            {
+                deleted_lines += deleted;
             }
         }
     }
@@ -659,6 +722,14 @@ fn calculate_waiting_time(transcript: &crate::authorship::transcript::AiTranscri
                 ..
             },
             Message::Assistant {
+                timestamp: Some(ai_ts),
+                ..
+            }
+            | Message::Thinking {
+                timestamp: Some(ai_ts),
+                ..
+            }
+            | Message::Plan {
                 timestamp: Some(ai_ts),
                 ..
             },
@@ -892,7 +963,7 @@ mod tests {
         let head_sha = tmp_repo.get_head_commit_sha().unwrap();
 
         // Test our stats function
-        let stats = stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
+        let stats = stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
 
         // Verify the stats
         assert_eq!(
@@ -944,7 +1015,7 @@ mod tests {
         tmp_repo.commit_with_message("Mixed commit").unwrap();
 
         let head_sha = tmp_repo.get_head_commit_sha().unwrap();
-        let stats = stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
+        let stats = stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
 
         // Verify the stats
         assert_eq!(stats.human_additions, 2, "Human added 2 lines");
@@ -975,7 +1046,7 @@ mod tests {
         tmp_repo.commit_with_message("Initial commit").unwrap();
 
         let head_sha = tmp_repo.get_head_commit_sha().unwrap();
-        let stats = stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
+        let stats = stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
 
         // For initial commit, everything should be additions
         assert_eq!(
@@ -1023,13 +1094,13 @@ mod tests {
 
         // Test WITHOUT ignore - should count lockfile
         let stats_with_lockfile =
-            stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
+            stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
         assert_eq!(stats_with_lockfile.git_diff_added_lines, 1001); // 1 source + 1000 lockfile
 
         // Test WITH ignore - should exclude lockfile
         let ignore_patterns = vec!["Cargo.lock".to_string()];
         let stats_without_lockfile =
-            stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &ignore_patterns).unwrap();
+            stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &ignore_patterns).unwrap();
         assert_eq!(stats_without_lockfile.git_diff_added_lines, 1); // Only 1 source line
         assert_eq!(stats_without_lockfile.ai_additions, 1);
     }
@@ -1068,7 +1139,7 @@ mod tests {
         let head_sha = tmp_repo.get_head_commit_sha().unwrap();
 
         // Test WITHOUT ignore - counts all files (1501 lines)
-        let stats_all = stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
+        let stats_all = stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
         assert_eq!(stats_all.git_diff_added_lines, 1501);
 
         // Test WITH ignore - only counts README (1 line)
@@ -1078,7 +1149,7 @@ mod tests {
             "yarn.lock".to_string(),
         ];
         let stats_filtered =
-            stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &ignore_patterns).unwrap();
+            stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &ignore_patterns).unwrap();
         assert_eq!(stats_filtered.git_diff_added_lines, 1);
         assert_eq!(stats_filtered.human_additions, 1);
     }
@@ -1108,13 +1179,13 @@ mod tests {
         let head_sha = tmp_repo.get_head_commit_sha().unwrap();
 
         // Test WITHOUT ignore - shows 2000 lines
-        let stats_with = stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
+        let stats_with = stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
         assert_eq!(stats_with.git_diff_added_lines, 2000);
 
         // Test WITH ignore - shows 0 lines (lockfile-only commit)
         let ignore_patterns = vec!["Cargo.lock".to_string()];
         let stats_without =
-            stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &ignore_patterns).unwrap();
+            stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &ignore_patterns).unwrap();
         assert_eq!(stats_without.git_diff_added_lines, 0);
         assert_eq!(stats_without.ai_additions, 0);
         assert_eq!(stats_without.human_additions, 0);
@@ -1143,7 +1214,7 @@ mod tests {
         let head_sha = tmp_repo.get_head_commit_sha().unwrap();
 
         // Test with empty patterns - should behave same as no filtering
-        let stats = stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
+        let stats = stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
         assert_eq!(stats.git_diff_added_lines, 2);
         assert_eq!(stats.ai_additions, 2);
     }
@@ -1193,7 +1264,7 @@ mod tests {
         let head_sha = tmp_repo.get_head_commit_sha().unwrap();
 
         // Test WITHOUT ignore - all files included (2001 lines)
-        let stats_all = stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
+        let stats_all = stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &[]).unwrap();
         assert_eq!(stats_all.git_diff_added_lines, 2001);
 
         // Test WITH glob patterns - only source code (1 line)
@@ -1203,8 +1274,234 @@ mod tests {
             "*.generated.*".to_string(), // Matches *.generated.ts, *.generated.js
         ];
         let stats_filtered =
-            stats_for_commit_stats(&tmp_repo.gitai_repo(), &head_sha, &glob_patterns).unwrap();
+            stats_for_commit_stats(tmp_repo.gitai_repo(), &head_sha, &glob_patterns).unwrap();
         assert_eq!(stats_filtered.git_diff_added_lines, 1);
         assert_eq!(stats_filtered.ai_additions, 1);
+    }
+    #[test]
+    fn test_accepted_lines_no_authorship_log() {
+        let added_lines: HashMap<String, Vec<u32>> = HashMap::new();
+        let (accepted, per_tool) = accepted_lines_from_attestations(None, &added_lines, false);
+        assert_eq!(accepted, 0);
+        assert!(per_tool.is_empty());
+    }
+
+    #[test]
+    fn test_accepted_lines_merge_commit() {
+        // Even with a real authorship log, merge commits should short-circuit to (0, empty)
+        let mut log = crate::authorship::authorship_log_serialization::AuthorshipLog::new();
+        let agent_id = crate::authorship::working_log::AgentId {
+            tool: "cursor".to_string(),
+            id: "session_1".to_string(),
+            model: "claude-3-sonnet".to_string(),
+        };
+        let hash = crate::authorship::authorship_log_serialization::generate_short_hash(
+            &agent_id.id,
+            &agent_id.tool,
+        );
+        log.metadata.prompts.insert(
+            hash.clone(),
+            crate::authorship::authorship_log::PromptRecord {
+                agent_id,
+                human_author: None,
+                messages: vec![],
+                total_additions: 5,
+                total_deletions: 0,
+                accepted_lines: 5,
+                overriden_lines: 0,
+                messages_url: None,
+            },
+        );
+
+        let mut file_att = crate::authorship::authorship_log_serialization::FileAttestation::new(
+            "foo.rs".to_string(),
+        );
+        file_att.add_entry(
+            crate::authorship::authorship_log_serialization::AttestationEntry::new(
+                hash,
+                vec![crate::authorship::authorship_log::LineRange::Range(1, 3)],
+            ),
+        );
+        log.attestations.push(file_att);
+
+        let mut added_lines: HashMap<String, Vec<u32>> = HashMap::new();
+        added_lines.insert("foo.rs".to_string(), vec![1, 2, 3]);
+
+        let (accepted, per_tool) = accepted_lines_from_attestations(Some(&log), &added_lines, true);
+        assert_eq!(accepted, 0);
+        assert!(per_tool.is_empty());
+    }
+
+    #[test]
+    fn test_accepted_lines_no_matching_files() {
+        let mut log = crate::authorship::authorship_log_serialization::AuthorshipLog::new();
+        let agent_id = crate::authorship::working_log::AgentId {
+            tool: "cursor".to_string(),
+            id: "session_2".to_string(),
+            model: "claude-3-sonnet".to_string(),
+        };
+        let hash = crate::authorship::authorship_log_serialization::generate_short_hash(
+            &agent_id.id,
+            &agent_id.tool,
+        );
+        log.metadata.prompts.insert(
+            hash.clone(),
+            crate::authorship::authorship_log::PromptRecord {
+                agent_id,
+                human_author: None,
+                messages: vec![],
+                total_additions: 3,
+                total_deletions: 0,
+                accepted_lines: 3,
+                overriden_lines: 0,
+                messages_url: None,
+            },
+        );
+
+        let mut file_att = crate::authorship::authorship_log_serialization::FileAttestation::new(
+            "foo.rs".to_string(),
+        );
+        file_att.add_entry(
+            crate::authorship::authorship_log_serialization::AttestationEntry::new(
+                hash,
+                vec![crate::authorship::authorship_log::LineRange::Range(1, 3)],
+            ),
+        );
+        log.attestations.push(file_att);
+
+        // added_lines has "bar.rs" but NOT "foo.rs"
+        let mut added_lines: HashMap<String, Vec<u32>> = HashMap::new();
+        added_lines.insert("bar.rs".to_string(), vec![1, 2, 3]);
+
+        let (accepted, per_tool) =
+            accepted_lines_from_attestations(Some(&log), &added_lines, false);
+        assert_eq!(accepted, 0);
+        assert!(per_tool.is_empty());
+    }
+
+    #[test]
+    fn test_accepted_lines_basic_match() {
+        let mut log = crate::authorship::authorship_log_serialization::AuthorshipLog::new();
+        let agent_id = crate::authorship::working_log::AgentId {
+            tool: "cursor".to_string(),
+            id: "session_3".to_string(),
+            model: "claude-3-sonnet".to_string(),
+        };
+        let hash = crate::authorship::authorship_log_serialization::generate_short_hash(
+            &agent_id.id,
+            &agent_id.tool,
+        );
+        log.metadata.prompts.insert(
+            hash.clone(),
+            crate::authorship::authorship_log::PromptRecord {
+                agent_id,
+                human_author: None,
+                messages: vec![],
+                total_additions: 3,
+                total_deletions: 0,
+                accepted_lines: 3,
+                overriden_lines: 0,
+                messages_url: None,
+            },
+        );
+
+        let mut file_att = crate::authorship::authorship_log_serialization::FileAttestation::new(
+            "foo.rs".to_string(),
+        );
+        file_att.add_entry(
+            crate::authorship::authorship_log_serialization::AttestationEntry::new(
+                hash.clone(),
+                vec![crate::authorship::authorship_log::LineRange::Range(1, 3)],
+            ),
+        );
+        log.attestations.push(file_att);
+
+        let mut added_lines: HashMap<String, Vec<u32>> = HashMap::new();
+        added_lines.insert("foo.rs".to_string(), vec![1, 2, 3]);
+
+        let (accepted, per_tool) =
+            accepted_lines_from_attestations(Some(&log), &added_lines, false);
+        assert_eq!(accepted, 3);
+
+        // Verify per-tool breakdown contains the right key
+        let expected_key = "cursor::claude-3-sonnet".to_string();
+        assert_eq!(per_tool.get(&expected_key), Some(&3));
+    }
+
+    // --- line_range_overlap_len tests ---
+
+    #[test]
+    fn test_overlap_single_hit() {
+        let count = line_range_overlap_len(&LineRange::Single(5), &[3, 5, 7]);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_overlap_single_miss() {
+        let count = line_range_overlap_len(&LineRange::Single(4), &[3, 5, 7]);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_overlap_range_full() {
+        let count = line_range_overlap_len(&LineRange::Range(3, 7), &[3, 4, 5, 6, 7]);
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_overlap_range_partial() {
+        // Range [4, 8] intersected with [3, 5, 7, 9]: only 5 and 7 are in range
+        let count = line_range_overlap_len(&LineRange::Range(4, 8), &[3, 5, 7, 9]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_overlap_range_miss() {
+        let count = line_range_overlap_len(&LineRange::Range(10, 20), &[1, 2, 3]);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_overlap_range_empty_added() {
+        let count = line_range_overlap_len(&LineRange::Range(1, 10), &[]);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_stats_for_merge_commit_skips_ai_acceptance() {
+        let tmp_repo = TmpRepo::new().unwrap();
+
+        tmp_repo.write_file("test.txt", "base\n", true).unwrap();
+        tmp_repo
+            .trigger_checkpoint_with_author("test_user")
+            .unwrap();
+        tmp_repo.commit_with_message("Initial commit").unwrap();
+
+        let default_branch = tmp_repo.current_branch().unwrap();
+        tmp_repo.create_branch("feature").unwrap();
+        tmp_repo
+            .write_file("test.txt", "base\nfeature line\n", true)
+            .unwrap();
+        tmp_repo
+            .trigger_checkpoint_with_ai("Claude", Some("claude-3-sonnet"), Some("cursor"))
+            .unwrap();
+        tmp_repo.commit_with_message("Feature change").unwrap();
+
+        tmp_repo.switch_branch(&default_branch).unwrap();
+        tmp_repo
+            .write_file("main.txt", "main line\n", true)
+            .unwrap();
+        tmp_repo
+            .trigger_checkpoint_with_author("test_user")
+            .unwrap();
+        tmp_repo.commit_with_message("Main change").unwrap();
+
+        tmp_repo.merge_branch("feature", "Merge feature").unwrap();
+
+        let merge_sha = tmp_repo.get_head_commit_sha().unwrap();
+        let stats = stats_for_commit_stats(tmp_repo.gitai_repo(), &merge_sha, &[]).unwrap();
+
+        assert_eq!(stats.ai_accepted, 0);
+        assert_eq!(stats.ai_additions, stats.mixed_additions);
     }
 }

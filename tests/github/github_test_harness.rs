@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 
 /// Merge strategy for pull requests
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum MergeStrategy {
     /// Squash all commits into one
     Squash,
@@ -24,7 +25,7 @@ pub fn is_gh_cli_available() -> bool {
             return false;
         }
 
-        let auth_check = Command::new("gh").args(&["auth", "status"]).output();
+        let auth_check = Command::new("gh").args(["auth", "status"]).output();
 
         auth_check.is_ok() && auth_check.unwrap().status.success()
     })
@@ -82,7 +83,7 @@ impl GitHubTestRepo {
 
         // Create GitHub repository
         let output = Command::new("gh")
-            .args(&[
+            .args([
                 "repo",
                 "create",
                 &self.github_repo_name,
@@ -126,7 +127,7 @@ impl GitHubTestRepo {
         let repo_path = self.repo.path();
 
         let output = Command::new("gh")
-            .args(&["pr", "create", "--title", title, "--body", body])
+            .args(["pr", "create", "--title", title, "--body", body])
             .current_dir(repo_path)
             .output()
             .map_err(|e| format!("Failed to execute gh pr create: {}", e))?;
@@ -154,7 +155,7 @@ impl GitHubTestRepo {
         };
 
         let output = Command::new("gh")
-            .args(&["pr", "merge", pr_number, strategy_flag, "--delete-branch"])
+            .args(["pr", "merge", pr_number, strategy_flag, "--delete-branch"])
             .current_dir(repo_path)
             .output()
             .map_err(|e| format!("Failed to execute gh pr merge: {}", e))?;
@@ -175,7 +176,7 @@ impl GitHubTestRepo {
 
     /// Get the PR number from a PR URL
     pub fn extract_pr_number(&self, pr_url: &str) -> Option<String> {
-        pr_url.split('/').last().map(|s| s.to_string())
+        pr_url.split('/').next_back().map(|s| s.to_string())
     }
 
     /// Get the default branch name from the remote repository
@@ -184,7 +185,7 @@ impl GitHubTestRepo {
         let full_repo = format!("{}/{}", self.github_owner, self.github_repo_name);
 
         let output = Command::new("gh")
-            .args(&[
+            .args([
                 "repo",
                 "view",
                 &full_repo,
@@ -241,7 +242,7 @@ impl GitHubTestRepo {
         let full_repo = format!("{}/{}", self.github_owner, self.github_repo_name);
 
         let output = Command::new("gh")
-            .args(&["run", "view", run_id, "--repo", &full_repo, "--log"])
+            .args(["run", "view", run_id, "--repo", &full_repo, "--log"])
             .current_dir(repo_path)
             .output()
             .map_err(|e| format!("Failed to get workflow logs: {}", e))?;
@@ -281,7 +282,7 @@ impl GitHubTestRepo {
 
             // Get all workflow runs for the repository
             let output = Command::new("gh")
-                .args(&[
+                .args([
                     "run",
                     "list",
                     "--repo",
@@ -388,7 +389,7 @@ impl GitHubTestRepo {
         let full_repo = format!("{}/{}", self.github_owner, self.github_repo_name);
 
         let output = Command::new("gh")
-            .args(&["repo", "delete", &full_repo, "--yes"])
+            .args(["repo", "delete", &full_repo, "--yes"])
             .output()
             .map_err(|e| format!("Failed to execute gh repo delete: {}", e))?;
 
@@ -460,7 +461,7 @@ fn generate_repo_name(test_name: &str) -> String {
 /// Get the authenticated GitHub user
 fn get_authenticated_user() -> Option<String> {
     let output = Command::new("gh")
-        .args(&["api", "user", "--jq", ".login"])
+        .args(["api", "user", "--jq", ".login"])
         .output()
         .ok()?;
 

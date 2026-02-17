@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::authorship::diff_ai_accepted::diff_ai_accepted_stats;
+use crate::authorship::ignore::{build_ignore_matcher, should_ignore_file_with_matcher};
 use crate::authorship::stats::{CommitStats, stats_for_commit_stats, stats_from_authorship_log};
 use crate::error::GitAiError;
 use crate::git::refs::{CommitAuthorship, get_commits_with_notes_from_list};
@@ -18,25 +20,9 @@ const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Check if a file path should be ignored based on the provided patterns
 /// Supports both exact matches and glob patterns (e.g., "*.lock", "**/*.generated.js")
+#[allow(dead_code)] // Kept for downstream compatibility.
 pub fn should_ignore_file(path: &str, ignore_patterns: &[String]) -> bool {
-    use glob::Pattern;
-
-    let filename = std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-
-    ignore_patterns.iter().any(|pattern| {
-        // Try to parse as glob pattern
-        if let Ok(glob_pattern) = Pattern::new(pattern) {
-            // Match against both the full path and just the filename
-            // This allows patterns like "*.lock" (filename) and "**/target/**" (path)
-            glob_pattern.matches(path) || glob_pattern.matches(filename)
-        } else {
-            // Fallback to exact filename match if pattern is invalid
-            filename == pattern
-        }
-    })
+    crate::authorship::ignore::should_ignore_file(path, ignore_patterns)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,9 +45,7 @@ pub fn range_authorship(
     pre_fetch_contents: bool,
     ignore_patterns: &[String],
 ) -> Result<RangeAuthorshipStats, GitAiError> {
-    if let Err(e) = commit_range.is_valid() {
-        return Err(e);
-    }
+    commit_range.is_valid()?;
 
     // Fetch the branch if pre_fetch_contents is true
     if pre_fetch_contents {
@@ -195,11 +179,12 @@ fn create_authorship_log_for_range(
 
     // Step 1: Get list of changed files between the two commits
     let all_changed_files = repo.diff_changed_files(start_sha, end_sha)?;
+    let ignore_matcher = build_ignore_matcher(ignore_patterns);
 
     // Filter out ignored files from the changed files
     let changed_files: Vec<String> = all_changed_files
         .into_iter()
-        .filter(|file| !should_ignore_file(file, ignore_patterns))
+        .filter(|file| !should_ignore_file_with_matcher(file, &ignore_matcher))
         .collect();
 
     // Note: We intentionally do NOT filter to AI-touched files here.
@@ -264,25 +249,30 @@ fn create_authorship_log_for_range(
     }
 
     // Step 2: Create VirtualAttributions for start commit (older)
+    // Pass start_sha as blame_start_commit to limit blame scope to the range,
+    // avoiding expensive traversal of the entire repository history
     let repo_clone = repo.clone();
+    let start_sha_limit = Some(start_sha.to_string());
     let mut start_va = smol::block_on(async {
         VirtualAttributions::new_for_base_commit(
             repo_clone,
             start_sha.to_string(),
             &changed_files,
-            None,
+            start_sha_limit,
         )
         .await
     })?;
 
     // Step 3: Create VirtualAttributions for end commit (newer)
+    // Pass start_sha as blame_start_commit to limit blame scope to the range
     let repo_clone = repo.clone();
+    let start_sha_limit = Some(start_sha.to_string());
     let mut end_va = smol::block_on(async {
         VirtualAttributions::new_for_base_commit(
             repo_clone,
             end_sha.to_string(),
             &changed_files,
-            None,
+            start_sha_limit,
         )
         .await
     })?;
@@ -361,10 +351,11 @@ fn get_git_diff_stats_for_range(
     args.push(format!("{}..{}", start_sha, end_sha));
 
     let output = crate::git::repository::exec_git(&args)?;
-    let stdout = String::from_utf8(output.stdout)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
     let mut added_lines = 0u32;
     let mut deleted_lines = 0u32;
+    let ignore_matcher = build_ignore_matcher(ignore_patterns);
 
     // Parse numstat output
     for line in stdout.lines() {
@@ -377,7 +368,7 @@ fn get_git_diff_stats_for_range(
         if parts.len() >= 3 {
             // Check if this file should be ignored and skip it
             let filename = parts[2];
-            if should_ignore_file(filename, ignore_patterns) {
+            if should_ignore_file_with_matcher(filename, &ignore_matcher) {
                 continue;
             }
 
@@ -387,10 +378,10 @@ fn get_git_diff_stats_for_range(
             }
 
             // Parse deleted lines (handle "-" for binary files)
-            if parts[1] != "-" {
-                if let Ok(deleted) = parts[1].parse::<u32>() {
-                    deleted_lines += deleted;
-                }
+            if parts[1] != "-"
+                && let Ok(deleted) = parts[1].parse::<u32>()
+            {
+                deleted_lines += deleted;
             }
         }
     }
@@ -416,6 +407,8 @@ fn calculate_range_stats_direct(
     let (git_diff_added_lines, git_diff_deleted_lines) =
         get_git_diff_stats_for_range(repo, &start_sha, &end_sha, ignore_patterns)?;
 
+    let diff_ai_stats = diff_ai_accepted_stats(repo, &start_sha, &end_sha, None, ignore_patterns)?;
+
     // Step 2: Create in-memory authorship log for the range, filtered to only commits in the range
     let commit_shas = commit_range.clone().all_commits();
     let authorship_log =
@@ -426,6 +419,8 @@ fn calculate_range_stats_direct(
         Some(&authorship_log),
         git_diff_added_lines,
         git_diff_deleted_lines,
+        diff_ai_stats.total_ai_accepted,
+        &diff_ai_stats.per_tool_model,
     );
 
     Ok(stats)
@@ -435,7 +430,7 @@ pub fn print_range_authorship_stats(stats: &RangeAuthorshipStats) {
     println!("\n");
 
     // If there's no AI authorship in the range, show the special message
-    if !stats.authorship_stats.commits_with_authorship > stats.authorship_stats.total_commits {
+    if stats.authorship_stats.commits_with_authorship == 0 {
         println!("Committers are not using git-ai");
         return;
     }
@@ -502,7 +497,7 @@ mod tests {
 
         // Test range authorship from first to second commit
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             first_sha.clone(),
             second_sha.clone(),
             "HEAD".to_string(),
@@ -546,7 +541,7 @@ mod tests {
 
         // Test range authorship from empty tree to HEAD
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             EMPTY_TREE_HASH.to_string(),
             head_sha.clone(),
             "HEAD".to_string(),
@@ -565,7 +560,7 @@ mod tests {
         assert_eq!(stats.authorship_stats.commits_with_authorship, 2);
         // When using empty tree, the range stats show the diff from empty to HEAD
         // The AI additions count is based on the filtered attributions for commits in range
-        assert_eq!(stats.range_stats.ai_additions, 2);
+        assert_eq!(stats.range_stats.ai_additions, 3);
         assert_eq!(stats.range_stats.git_diff_added_lines, 3);
     }
 
@@ -590,7 +585,7 @@ mod tests {
 
         // Test range authorship for single commit (start == end)
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             head_sha.clone(),
             head_sha.clone(),
             "HEAD".to_string(),
@@ -647,7 +642,7 @@ mod tests {
 
         // Test range authorship from first to head
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             first_sha.clone(),
             head_sha.clone(),
             "HEAD".to_string(),
@@ -666,8 +661,8 @@ mod tests {
         assert_eq!(stats.authorship_stats.commits_with_authorship, 3);
         // Range authorship merges attributions from start to end, filtering to commits in range
         // The exact AI/human split depends on the merge attribution logic
-        assert_eq!(stats.range_stats.ai_additions, 1);
-        assert_eq!(stats.range_stats.human_additions, 2);
+        assert_eq!(stats.range_stats.ai_additions, 2);
+        assert_eq!(stats.range_stats.human_additions, 1);
         assert_eq!(stats.range_stats.git_diff_added_lines, 3);
     }
 
@@ -685,7 +680,7 @@ mod tests {
 
         // Test range authorship with same start and end (already tested above but worth verifying)
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             sha.clone(),
             sha.clone(),
             "HEAD".to_string(),
@@ -724,7 +719,7 @@ mod tests {
 
         // Test range authorship from empty tree
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             EMPTY_TREE_HASH.to_string(),
             head_sha.clone(),
             "HEAD".to_string(),
@@ -784,7 +779,7 @@ mod tests {
 
         // Test range authorship
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             first_sha.clone(),
             second_sha.clone(),
             "HEAD".to_string(),
@@ -855,7 +850,7 @@ mod tests {
 
         // Test range authorship
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             first_sha.clone(),
             head_sha.clone(),
             "HEAD".to_string(),
@@ -918,7 +913,7 @@ mod tests {
 
         // Test range authorship
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             first_sha.clone(),
             second_sha.clone(),
             "HEAD".to_string(),
@@ -976,7 +971,7 @@ mod tests {
 
         // Test range authorship
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             first_sha.clone(),
             second_sha.clone(),
             "HEAD".to_string(),
@@ -1416,7 +1411,7 @@ mod tests {
         let second_sha = tmp_repo.get_head_commit_sha().unwrap();
 
         let commit_range = CommitRange::new(
-            &tmp_repo.gitai_repo(),
+            tmp_repo.gitai_repo(),
             first_sha.clone(),
             second_sha.clone(),
             "HEAD".to_string(),

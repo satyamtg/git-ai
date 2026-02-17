@@ -39,13 +39,12 @@ fn test_initial_only_no_blame_data() {
 
     // IMPORTANT: Write INITIAL file BEFORE making any file changes
     let mut initial_attributions = HashMap::new();
-    let mut line_attrs = Vec::new();
-    line_attrs.push(LineAttribution {
+    let line_attrs = vec![LineAttribution {
         start_line: 1,
         end_line: 3,
         author_id: "initial-ai-123".to_string(),
         overrode: None,
-    });
+    }];
     initial_attributions.insert("newfile.txt".to_string(), line_attrs);
 
     let mut prompts = HashMap::new();
@@ -128,13 +127,12 @@ fn test_initial_wins_overlaps() {
 
     // IMPORTANT: Write INITIAL file BEFORE creating the file
     let mut initial_attributions = HashMap::new();
-    let mut line_attrs = Vec::new();
-    line_attrs.push(LineAttribution {
+    let line_attrs = vec![LineAttribution {
         start_line: 1,
         end_line: 2,
         author_id: "initial-override-456".to_string(),
         overrode: None,
-    });
+    }];
     initial_attributions.insert("example.txt".to_string(), line_attrs);
 
     let mut prompts = HashMap::new();
@@ -198,19 +196,20 @@ fn test_initial_and_blame_merge() {
     // IMPORTANT: Write INITIAL file BEFORE creating the file
     // INITIAL covers lines 1-3 and 5, blame will be used for lines 4, 6, 7
     let mut initial_attributions = HashMap::new();
-    let mut line_attrs = Vec::new();
-    line_attrs.push(LineAttribution {
-        start_line: 1,
-        end_line: 3,
-        author_id: "initial-123".to_string(),
-        overrode: None,
-    });
-    line_attrs.push(LineAttribution {
-        start_line: 5,
-        end_line: 5,
-        author_id: "initial-456".to_string(),
-        overrode: None,
-    });
+    let line_attrs = vec![
+        LineAttribution {
+            start_line: 1,
+            end_line: 3,
+            author_id: "initial-123".to_string(),
+            overrode: None,
+        },
+        LineAttribution {
+            start_line: 5,
+            end_line: 5,
+            author_id: "initial-456".to_string(),
+            overrode: None,
+        },
+    ];
     initial_attributions.insert("example.txt".to_string(), line_attrs);
 
     let mut prompts = HashMap::new();
@@ -291,13 +290,12 @@ fn test_partial_file_coverage() {
 
     // IMPORTANT: Write INITIAL file AFTER creating initial commit
     let mut initial_attributions = HashMap::new();
-    let mut line_attrs = Vec::new();
-    line_attrs.push(LineAttribution {
+    let line_attrs = vec![LineAttribution {
         start_line: 1,
         end_line: 2,
         author_id: "initial-fileA".to_string(),
         overrode: None,
-    });
+    }];
     initial_attributions.insert("fileA.txt".to_string(), line_attrs);
     // Note: fileB.txt is not in INITIAL
 
@@ -378,13 +376,12 @@ fn test_initial_attributions_in_subsequent_checkpoint() {
 
     // Write INITIAL attributions file for fileB.txt (which doesn't exist yet)
     let mut initial_attributions = HashMap::new();
-    let mut line_attrs = Vec::new();
-    line_attrs.push(LineAttribution {
+    let line_attrs = vec![LineAttribution {
         start_line: 1,
         end_line: 2,
         author_id: "subsequent-initial-789".to_string(),
         overrode: None,
-    });
+    }];
     initial_attributions.insert("fileB.txt".to_string(), line_attrs);
 
     let mut prompts = HashMap::new();

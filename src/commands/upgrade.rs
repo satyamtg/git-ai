@@ -1,9 +1,9 @@
 use crate::api::client::ApiContext;
 use crate::config::{self, UpdateChannel};
 use crate::observability::log_message;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -139,12 +139,11 @@ fn should_check_for_updates(channel: UpdateChannel, cache: Option<&UpdateCache>)
 }
 
 fn semver_from_tag(tag: &str) -> String {
-    let trimmed = tag.trim().trim_start_matches('v');
-    trimmed
-        .split(|c| c == '-' || c == '+')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    let trimmed = tag
+        .trim()
+        .trim_start_matches("enterprise-")
+        .trim_start_matches('v');
+    trimmed.split(['-', '+']).next().unwrap_or("").to_string()
 }
 
 fn determine_action(force: bool, release: &ChannelRelease, current_version: &str) -> UpgradeAction {
@@ -218,8 +217,7 @@ fn fetch_and_verify_checksums(
 ) -> Result<HashMap<String, String>, String> {
     let endpoint = format!("/worker/releases/{}/download/SHA256SUMS", channel);
 
-    let response = minreq::get(format!("{}{}", api_base_url, endpoint))
-        .with_header("User-Agent", format!("git-ai/{}", env!("CARGO_PKG_VERSION")))
+    let response = ApiContext::http_get(&format!("{}{}", api_base_url, endpoint))
         .with_timeout(30)
         .send()
         .map_err(|e| format!("Failed to fetch SHA256SUMS: {}", e))?;
@@ -231,8 +229,7 @@ fn fetch_and_verify_checksums(
         ));
     }
 
-    let content = response
-        .as_bytes();
+    let content = response.as_bytes();
 
     verify_sha256(content, expected_checksum)
         .map_err(|e| format!("SHA256SUMS verification failed: {}", e))?;
@@ -260,8 +257,7 @@ fn fetch_and_verify_install_script(
 
     let endpoint = format!("/worker/releases/{}/download/{}", channel, script_name);
 
-    let response = minreq::get(format!("{}{}", api_base_url, endpoint))
-        .with_header("User-Agent", format!("git-ai/{}", env!("CARGO_PKG_VERSION")))
+    let response = ApiContext::http_get(&format!("{}{}", api_base_url, endpoint))
         .with_timeout(30)
         .send()
         .map_err(|e| format!("Failed to fetch {}: {}", script_name, e))?;
@@ -342,10 +338,7 @@ fn release_from_response(
 }
 
 #[cfg(test)]
-fn try_mock_releases(
-    base: &str,
-    channel: UpdateChannel,
-) -> Option<Result<ChannelRelease, String>> {
+fn try_mock_releases(base: &str, channel: UpdateChannel) -> Option<Result<ChannelRelease, String>> {
     let json = base.strip_prefix("mock://")?;
     Some(
         serde_json::from_str::<ReleasesResponse>(json)
@@ -402,22 +395,28 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
             log_path_str, script_path_str, script_path_str
         );
 
-        let mut cmd = Command::new("powershell");
-        cmd.arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-Command")
-            .arg(&ps_wrapper)
-            .env(GIT_AI_RELEASE_ENV, tag);
+        let spawn_powershell = |exe: &str| -> std::io::Result<std::process::Child> {
+            let mut cmd = Command::new(exe);
+            cmd.arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-Command")
+                .arg(&ps_wrapper)
+                .env(GIT_AI_RELEASE_ENV, tag);
 
-        // Hide the spawned console to prevent any host/UI bleed-through
-        cmd.creation_flags(CREATE_NO_WINDOW);
+            // Hide the spawned console to prevent any host/UI bleed-through
+            cmd.creation_flags(CREATE_NO_WINDOW);
 
-        if silent {
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        }
+            if silent {
+                cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            }
 
-        match cmd.spawn() {
+            cmd.spawn()
+        };
+
+        let spawn_result = spawn_powershell("pwsh").or_else(|_| spawn_powershell("powershell"));
+
+        match spawn_result {
             Ok(_) => {
                 if !silent {
                     println!(
@@ -589,31 +588,33 @@ fn run_impl_with_url(
     println!("Fetching and verifying release artifacts...");
 
     // Fetch and verify SHA256SUMS against the release's master checksum
-    let checksums = match fetch_and_verify_checksums(api_base_url, channel.as_str(), &release.checksum) {
-        Ok(checksums) => {
-            println!("\x1b[1;32m✓\x1b[0m SHA256SUMS verified");
-            checksums
-        }
-        Err(err) => {
-            eprintln!("Failed to fetch/verify checksums: {}", err);
-            std::process::exit(1);
-        }
-    };
+    let checksums =
+        match fetch_and_verify_checksums(api_base_url, channel.as_str(), &release.checksum) {
+            Ok(checksums) => {
+                println!("\x1b[1;32m✓\x1b[0m SHA256SUMS verified");
+                checksums
+            }
+            Err(err) => {
+                eprintln!("Failed to fetch/verify checksums: {}", err);
+                std::process::exit(1);
+            }
+        };
 
     // Fetch and verify the install script
-    let script_content = match fetch_and_verify_install_script(api_base_url, channel.as_str(), &checksums) {
-        Ok(content) => {
-            #[cfg(windows)]
-            println!("\x1b[1;32m✓\x1b[0m install.ps1 verified");
-            #[cfg(not(windows))]
-            println!("\x1b[1;32m✓\x1b[0m install.sh verified");
-            content
-        }
-        Err(err) => {
-            eprintln!("Failed to fetch/verify install script: {}", err);
-            std::process::exit(1);
-        }
-    };
+    let script_content =
+        match fetch_and_verify_install_script(api_base_url, channel.as_str(), &checksums) {
+            Ok(content) => {
+                #[cfg(windows)]
+                println!("\x1b[1;32m✓\x1b[0m install.ps1 verified");
+                #[cfg(not(windows))]
+                println!("\x1b[1;32m✓\x1b[0m install.sh verified");
+                content
+            }
+            Err(err) => {
+                eprintln!("Failed to fetch/verify install script: {}", err);
+                std::process::exit(1);
+            }
+        };
 
     println!();
     println!("Running installation script...");
@@ -687,12 +688,12 @@ pub fn maybe_schedule_background_update_check() {
     let channel = config.update_channel();
     let cache = read_update_cache();
 
-    if config.auto_updates_disabled() {
-        if let Some(cache) = cache.as_ref() {
-            if cache.matches_channel(channel) && cache.update_available() {
-                print_cached_notice(cache);
-            }
-        }
+    if config.auto_updates_disabled()
+        && let Some(cache) = cache.as_ref()
+        && cache.matches_channel(channel)
+        && cache.update_available()
+    {
+        print_cached_notice(cache);
     }
 
     if !should_check_for_updates(channel, cache.as_ref()) {
@@ -791,6 +792,8 @@ mod tests {
         assert_eq!(semver_from_tag("v1.2.3"), "1.2.3");
         assert_eq!(semver_from_tag("1.2.3"), "1.2.3");
         assert_eq!(semver_from_tag("v1.2.3-next-abc"), "1.2.3");
+        assert_eq!(semver_from_tag("enterprise-v1.2.3"), "1.2.3");
+        assert_eq!(semver_from_tag("enterprise-v1.2.3-next-abc"), "1.2.3");
     }
 
     #[test]
@@ -856,6 +859,76 @@ mod tests {
                 test_checksum, test_checksum
             )),
             UpdateChannel::Latest,
+            true,
+        );
+        assert_eq!(action, UpgradeAction::ForceReinstall);
+
+        clear_test_cache_dir();
+    }
+
+    #[test]
+    fn test_run_impl_with_url_enterprise_channels() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        set_test_cache_dir(&temp_dir);
+
+        let mock_url = |body: &str| format!("mock://{}", body);
+        let current = env!("CARGO_PKG_VERSION");
+        let test_checksum = "a".repeat(64); // Valid SHA256 length
+
+        // Newer version available - should upgrade
+        let action = run_impl_with_url(
+            false,
+            &mock_url(&format!(
+                r#"{{"channels":{{"enterprise-latest":{{"version":"v999.0.0","checksum":"{}"}},"enterprise-next":{{"version":"v999.0.0-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
+            )),
+            UpdateChannel::EnterpriseLatest,
+            true,
+        );
+        assert_eq!(action, UpgradeAction::UpgradeAvailable);
+
+        // Same version without --force - already latest
+        let same_version_payload = format!(
+            "{{\"channels\":{{\"enterprise-latest\":{{\"version\":\"v{}\",\"checksum\":\"{}\"}},\"enterprise-next\":{{\"version\":\"v{}-next-deadbeef\",\"checksum\":\"{}\"}}}}}}",
+            current, test_checksum, current, test_checksum
+        );
+        let action = run_impl_with_url(
+            false,
+            &mock_url(&same_version_payload),
+            UpdateChannel::EnterpriseLatest,
+            true,
+        );
+        assert_eq!(action, UpgradeAction::AlreadyLatest);
+
+        // Same version with --force - force reinstall
+        let action = run_impl_with_url(
+            true,
+            &mock_url(&same_version_payload),
+            UpdateChannel::EnterpriseLatest,
+            true,
+        );
+        assert_eq!(action, UpgradeAction::ForceReinstall);
+
+        // Older version without --force - running newer version
+        let action = run_impl_with_url(
+            false,
+            &mock_url(&format!(
+                r#"{{"channels":{{"enterprise-latest":{{"version":"v1.0.9","checksum":"{}"}},"enterprise-next":{{"version":"v1.0.9-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
+            )),
+            UpdateChannel::EnterpriseLatest,
+            true,
+        );
+        assert_eq!(action, UpgradeAction::RunningNewerVersion);
+
+        // Older version with --force - force reinstall
+        let action = run_impl_with_url(
+            true,
+            &mock_url(&format!(
+                r#"{{"channels":{{"enterprise-latest":{{"version":"v1.0.9","checksum":"{}"}},"enterprise-next":{{"version":"v1.0.9-next-deadbeef","checksum":"{}"}}}}}}"#,
+                test_checksum, test_checksum
+            )),
+            UpdateChannel::EnterpriseLatest,
             true,
         );
         assert_eq!(action, UpgradeAction::ForceReinstall);

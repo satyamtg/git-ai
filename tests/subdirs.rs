@@ -650,7 +650,7 @@ subdir_test_variants! {
 
     // Verify AI authorship was preserved in the commit
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved after reset --soft"
     );
 
@@ -695,7 +695,7 @@ subdir_test_variants! {
 
     // Verify AI authorship was preserved
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved after reset --mixed"
     );
 
@@ -740,7 +740,7 @@ subdir_test_variants! {
     let new_commit = repo.commit("Re-commit features").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved for all unwound commits"
     );
 
@@ -787,7 +787,7 @@ subdir_test_variants! {
     let new_commit = repo.stage_all_and_commit("After pathspec reset").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved for file2 after pathspec reset"
     );
 
@@ -832,7 +832,7 @@ subdir_test_variants! {
         let new_commit = repo.commit("Re-commit mixed changes").unwrap();
 
         assert!(
-            new_commit.authorship_log.attestations.len() > 0,
+            !new_commit.authorship_log.attestations.is_empty(),
             "AI authorship should be preserved in mixed AI/human changes"
         );
 
@@ -874,7 +874,7 @@ subdir_test_variants! {
         let new_commit = repo.commit("Re-commit with new file").unwrap();
 
         assert!(
-            new_commit.authorship_log.attestations.len() > 0,
+            !new_commit.authorship_log.attestations.is_empty(),
             "AI authorship should be preserved for new file after reset"
         );
 
@@ -910,7 +910,7 @@ subdir_test_variants! {
         let new_commit = repo.commit("Re-commit after reset").unwrap();
 
         assert!(
-            new_commit.authorship_log.attestations.len() > 0,
+            !new_commit.authorship_log.attestations.is_empty(),
             "AI authorship should be preserved after reset"
         );
 
@@ -949,7 +949,7 @@ subdir_test_variants! {
         let new_commit = repo.stage_all_and_commit("After reset to HEAD").unwrap();
 
         assert!(
-            new_commit.authorship_log.attestations.len() > 0,
+            !new_commit.authorship_log.attestations.is_empty(),
             "AI authorship should be preserved for uncommitted changes after reset"
         );
 
@@ -1042,7 +1042,7 @@ subdir_test_variants! {
         let new_commit = repo.stage_all_and_commit("After pathspec reset").unwrap();
 
         assert!(
-            new_commit.authorship_log.attestations.len() > 0,
+            !new_commit.authorship_log.attestations.is_empty(),
             "AI authorship should be preserved for file2 after pathspec reset"
         );
 

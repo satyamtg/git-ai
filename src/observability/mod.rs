@@ -4,10 +4,15 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::metrics::{METRICS_API_VERSION, MetricEvent};
 
 pub mod flush;
 pub mod wrapper_performance_targets;
+
+/// Maximum events per metrics envelope
+pub const MAX_METRICS_PER_ENVELOPE: usize = 250;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct ErrorEnvelope {
@@ -43,12 +48,22 @@ struct PerformanceEnvelope {
     tags: Option<HashMap<String, String>>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct MetricsEnvelope {
+    #[serde(rename = "type")]
+    event_type: String,
+    timestamp: String,
+    version: u8,
+    events: Vec<MetricEvent>,
+}
+
 #[derive(Clone)]
 enum LogEnvelope {
     Error(ErrorEnvelope),
     Performance(PerformanceEnvelope),
     #[allow(dead_code)]
     Message(MessageEnvelope),
+    Metrics(MetricsEnvelope),
 }
 
 impl LogEnvelope {
@@ -57,6 +72,7 @@ impl LogEnvelope {
             LogEnvelope::Error(e) => serde_json::to_value(e).ok(),
             LogEnvelope::Performance(p) => serde_json::to_value(p).ok(),
             LogEnvelope::Message(m) => serde_json::to_value(m).ok(),
+            LogEnvelope::Metrics(m) => serde_json::to_value(m).ok(),
         }
     }
 }
@@ -74,47 +90,20 @@ static OBSERVABILITY: OnceLock<Mutex<ObservabilityInner>> = OnceLock::new();
 
 fn get_observability() -> &'static Mutex<ObservabilityInner> {
     OBSERVABILITY.get_or_init(|| {
-        Mutex::new(ObservabilityInner {
-            mode: LogMode::Buffered(Vec::new()),
-        })
-    })
-}
-
-/// Set the repository context and flush buffered events to disk
-/// Should be called once Repository is available
-pub fn set_repo_context(repo: &crate::git::repository::Repository) {
-    let log_path = repo
-        .storage
-        .logs
-        .join(format!("{}.log", std::process::id()));
-
-    let mut obs = get_observability().lock().unwrap();
-
-    // Get buffered events
-    let buffered_events = match &obs.mode {
-        LogMode::Buffered(events) => events.clone(),
-        LogMode::Disk(_) => return, // Already set, ignore
-    };
-
-    // Switch to disk mode
-    obs.mode = LogMode::Disk(log_path.clone());
-    drop(obs); // Release lock before writing
-
-    // Flush buffered events to disk
-    if !buffered_events.is_empty() {
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&log_path)
-        {
-            for envelope in buffered_events {
-                if let Some(json) = envelope.to_json() {
-                    let _ = writeln!(file, "{}", json.to_string());
-                }
+        // Initialize directly in Disk mode with global logs path
+        // All logs go to ~/.git-ai/internal/logs/{PID}.log
+        let mode = if let Some(home) = dirs::home_dir() {
+            let logs_dir = home.join(".git-ai").join("internal").join("logs");
+            if std::fs::create_dir_all(&logs_dir).is_ok() {
+                LogMode::Disk(logs_dir.join(format!("{}.log", std::process::id())))
+            } else {
+                LogMode::Buffered(Vec::new())
             }
-        }
-    }
+        } else {
+            LogMode::Buffered(Vec::new())
+        };
+        Mutex::new(ObservabilityInner { mode })
+    })
 }
 
 /// Append an envelope (buffer if no repo context, write to disk if context set)
@@ -129,10 +118,10 @@ fn append_envelope(envelope: LogEnvelope) {
             let log_path = log_path.clone();
             drop(obs); // Release lock before file I/O
 
-            if let Some(json) = envelope.to_json() {
-                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-                    let _ = writeln!(file, "{}", json.to_string());
-                }
+            if let Some(json) = envelope.to_json()
+                && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path)
+            {
+                let _ = writeln!(file, "{}", json);
             }
         }
     }
@@ -185,8 +174,21 @@ pub fn log_message(message: &str, level: &str, context: Option<serde_json::Value
 
 /// Spawn a background process to flush logs to Sentry
 pub fn spawn_background_flush() {
-    // Always spawn flush process - it will handle OSS/Enterprise DSN logic
-    // and cleanup when telemetry_oss is "off"
+    // Skip flush in test builds to prevent race conditions during test cleanup.
+    // Tests spawn git-ai as a subprocess which calls this function. If the background
+    // flush process is still starting when TestRepo::drop() runs, file handles may
+    // remain open causing "Directory not empty" errors. Tests set GIT_AI_TEST_DB_PATH
+    // to isolate their database, so we use that as the test detection mechanism.
+    // This check is compiled out of release builds since tests only run in debug mode.
+    #[cfg(debug_assertions)]
+    if std::env::var("GIT_AI_TEST_DB_PATH").is_ok() {
+        return;
+    }
+
+    if !should_spawn_background_flush() {
+        return;
+    }
+
     use std::process::Command;
 
     if let Ok(exe) = crate::utils::current_git_ai_exe() {
@@ -195,5 +197,56 @@ pub fn spawn_background_flush() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
+    }
+}
+
+/// Debounce background flushes to avoid process/request storms when checkpoints
+/// run in quick succession.
+fn should_spawn_background_flush() -> bool {
+    const MIN_FLUSH_INTERVAL_SECS: u64 = 60;
+
+    let Some(home) = dirs::home_dir() else {
+        return true;
+    };
+    let internal_dir = home.join(".git-ai").join("internal");
+    let _ = std::fs::create_dir_all(&internal_dir);
+
+    let marker = internal_dir.join("last_flush_trigger_ts");
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Ok(previous) = std::fs::read_to_string(&marker)
+        && let Ok(previous_secs) = previous.trim().parse::<u64>()
+        && now_secs.saturating_sub(previous_secs) < MIN_FLUSH_INTERVAL_SECS
+    {
+        return false;
+    }
+
+    let _ = std::fs::write(&marker, now_secs.to_string());
+    true
+}
+
+/// Log a batch of metric events to the observability log file.
+///
+/// Events are batched into envelopes of up to 250 events each.
+/// The flush-logs command will then upload them to the API or
+/// store them in SQLite for later upload.
+pub fn log_metrics(events: Vec<MetricEvent>) {
+    if events.is_empty() {
+        return;
+    }
+
+    // Split into chunks of MAX_METRICS_PER_ENVELOPE
+    for chunk in events.chunks(MAX_METRICS_PER_ENVELOPE) {
+        let envelope = MetricsEnvelope {
+            event_type: "metrics".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            version: METRICS_API_VERSION,
+            events: chunk.to_vec(),
+        };
+
+        append_envelope(LogEnvelope::Metrics(envelope));
     }
 }

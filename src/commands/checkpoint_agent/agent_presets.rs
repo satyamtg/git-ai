@@ -8,6 +8,7 @@ use crate::{
 };
 use chrono::{TimeZone, Utc};
 use dirs;
+use glob::glob;
 use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -46,6 +47,15 @@ impl AgentCheckpointPreset for ClaudePreset {
 
         let hook_data: serde_json::Value = serde_json::from_str(&stdin_json)
             .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
+
+        // VS Code Copilot hooks can be imported into Claude settings. In that case, the
+        // payload uses VS Code hook fields (hookEventName/toolName/sessionId), and should be
+        // handled by the github-copilot preset, not the native Claude preset.
+        if ClaudePreset::is_vscode_copilot_hook_payload(&hook_data) {
+            return GithubCopilotPreset.run(AgentCheckpointFlags {
+                hook_input: Some(stdin_json),
+            });
+        }
 
         // Extract transcript_path and cwd from the JSON
         let transcript_path = hook_data
@@ -142,12 +152,65 @@ impl AgentCheckpointPreset for ClaudePreset {
 }
 
 impl ClaudePreset {
+    fn is_vscode_copilot_hook_payload(hook_data: &serde_json::Value) -> bool {
+        let has_vscode_shape = hook_data.get("hookEventName").is_some()
+            && (hook_data.get("toolName").is_some()
+                || hook_data.get("tool_name").is_some()
+                || hook_data.get("sessionId").is_some()
+                || hook_data.get("session_id").is_some());
+
+        if !has_vscode_shape {
+            return false;
+        }
+
+        let transcript_path = GithubCopilotPreset::transcript_path_from_hook_data(hook_data);
+        if let Some(path) = transcript_path {
+            if GithubCopilotPreset::looks_like_claude_transcript_path(path) {
+                return false;
+            }
+            if GithubCopilotPreset::looks_like_copilot_transcript_path(path) {
+                return true;
+            }
+        }
+
+        // Conservative fallback: only redirect if there's explicit Copilot identity data.
+        if let Some(model_hint) = hook_data
+            .get("model")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("modelId").and_then(|v| v.as_str()))
+            .or_else(|| hook_data.get("selectedModel").and_then(|v| v.as_str()))
+            && model_hint.starts_with("copilot/")
+        {
+            return true;
+        }
+
+        if let Some(agent_hint) = hook_data
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("agentId").and_then(|v| v.as_str()))
+            && agent_hint.to_ascii_lowercase().contains("copilot")
+        {
+            return true;
+        }
+
+        if let Some(tool_hint) = hook_data
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("toolName").and_then(|v| v.as_str()))
+            && tool_hint.to_ascii_lowercase().contains("copilot")
+        {
+            return true;
+        }
+
+        false
+    }
+
     /// Parse a Claude Code JSONL file into a transcript and extract model info
     pub fn transcript_and_model_from_claude_code_jsonl(
         transcript_path: &str,
     ) -> Result<(AiTranscript, Option<String>), GitAiError> {
         let jsonl_content =
-            std::fs::read_to_string(transcript_path).map_err(|e| GitAiError::IoError(e))?;
+            std::fs::read_to_string(transcript_path).map_err(GitAiError::IoError)?;
         let mut transcript = AiTranscript::new();
         let mut model = None;
 
@@ -158,10 +221,11 @@ impl ClaudePreset {
                 let timestamp = raw_entry["timestamp"].as_str().map(|s| s.to_string());
 
                 // Extract model from assistant messages if we haven't found it yet
-                if model.is_none() && raw_entry["type"].as_str() == Some("assistant") {
-                    if let Some(model_str) = raw_entry["message"]["model"].as_str() {
-                        model = Some(model_str.to_string());
-                    }
+                if model.is_none()
+                    && raw_entry["type"].as_str() == Some("assistant")
+                    && let Some(model_str) = raw_entry["message"]["model"].as_str()
+                {
+                    model = Some(model_str.to_string());
                 }
 
                 // Extract messages based on the type
@@ -185,15 +249,14 @@ impl ClaudePreset {
                                     continue;
                                 }
                                 // Handle text content blocks from actual user input
-                                if item["type"].as_str() == Some("text") {
-                                    if let Some(text) = item["text"].as_str() {
-                                        if !text.trim().is_empty() {
-                                            transcript.add_message(Message::User {
-                                                text: text.to_string(),
-                                                timestamp: timestamp.clone(),
-                                            });
-                                        }
-                                    }
+                                if item["type"].as_str() == Some("text")
+                                    && let Some(text) = item["text"].as_str()
+                                    && !text.trim().is_empty()
+                                {
+                                    transcript.add_message(Message::User {
+                                        text: text.to_string(),
+                                        timestamp: timestamp.clone(),
+                                    });
                                 }
                             }
                         }
@@ -204,23 +267,23 @@ impl ClaudePreset {
                             for item in content_array {
                                 match item["type"].as_str() {
                                     Some("text") => {
-                                        if let Some(text) = item["text"].as_str() {
-                                            if !text.trim().is_empty() {
-                                                transcript.add_message(Message::Assistant {
-                                                    text: text.to_string(),
-                                                    timestamp: timestamp.clone(),
-                                                });
-                                            }
+                                        if let Some(text) = item["text"].as_str()
+                                            && !text.trim().is_empty()
+                                        {
+                                            transcript.add_message(Message::Assistant {
+                                                text: text.to_string(),
+                                                timestamp: timestamp.clone(),
+                                            });
                                         }
                                     }
                                     Some("thinking") => {
-                                        if let Some(thinking) = item["thinking"].as_str() {
-                                            if !thinking.trim().is_empty() {
-                                                transcript.add_message(Message::Assistant {
-                                                    text: thinking.to_string(),
-                                                    timestamp: timestamp.clone(),
-                                                });
-                                            }
+                                        if let Some(thinking) = item["thinking"].as_str()
+                                            && !thinking.trim().is_empty()
+                                        {
+                                            transcript.add_message(Message::Assistant {
+                                                text: thinking.to_string(),
+                                                timestamp: timestamp.clone(),
+                                            });
                                         }
                                     }
                                     Some("tool_use") => {
@@ -281,7 +344,7 @@ impl AgentCheckpointPreset for GeminiPreset {
 
         // Parse into transcript and extract model
         let (transcript, model) =
-            match GeminiPreset::transcript_and_model_from_gemini_json(&transcript_path) {
+            match GeminiPreset::transcript_and_model_from_gemini_json(transcript_path) {
                 Ok((transcript, model)) => (transcript, model),
                 Err(e) => {
                     eprintln!("[Warning] Failed to parse Gemini JSON: {e}");
@@ -353,10 +416,9 @@ impl GeminiPreset {
     pub fn transcript_and_model_from_gemini_json(
         transcript_path: &str,
     ) -> Result<(AiTranscript, Option<String>), GitAiError> {
-        let json_content =
-            std::fs::read_to_string(transcript_path).map_err(|e| GitAiError::IoError(e))?;
+        let json_content = std::fs::read_to_string(transcript_path).map_err(GitAiError::IoError)?;
         let conversation: serde_json::Value =
-            serde_json::from_str(&json_content).map_err(|e| GitAiError::JsonError(e))?;
+            serde_json::from_str(&json_content).map_err(GitAiError::JsonError)?;
 
         let messages = conversation
             .get("messages")
@@ -397,10 +459,10 @@ impl GeminiPreset {
                 }
                 "gemini" => {
                     // Extract model from gemini messages if we haven't found it yet
-                    if model.is_none() {
-                        if let Some(model_str) = message.get("model").and_then(|v| v.as_str()) {
-                            model = Some(model_str.to_string());
-                        }
+                    if model.is_none()
+                        && let Some(model_str) = message.get("model").and_then(|v| v.as_str())
+                    {
+                        model = Some(model_str.to_string());
                     }
 
                     // Handle assistant text content - content can be a string
@@ -493,7 +555,7 @@ impl AgentCheckpointPreset for ContinueCliPreset {
         eprintln!("[Debug] Continue CLI using model: {}", model);
 
         // Parse transcript from JSON file
-        let transcript = match ContinueCliPreset::transcript_from_continue_json(&transcript_path) {
+        let transcript = match ContinueCliPreset::transcript_from_continue_json(transcript_path) {
             Ok(transcript) => transcript,
             Err(e) => {
                 eprintln!("[Warning] Failed to parse Continue CLI JSON: {e}");
@@ -562,10 +624,9 @@ impl ContinueCliPreset {
     pub fn transcript_from_continue_json(
         transcript_path: &str,
     ) -> Result<AiTranscript, GitAiError> {
-        let json_content =
-            std::fs::read_to_string(transcript_path).map_err(|e| GitAiError::IoError(e))?;
+        let json_content = std::fs::read_to_string(transcript_path).map_err(GitAiError::IoError)?;
         let conversation: serde_json::Value =
-            serde_json::from_str(&json_content).map_err(|e| GitAiError::JsonError(e))?;
+            serde_json::from_str(&json_content).map_err(GitAiError::JsonError)?;
 
         let history = conversation
             .get("history")
@@ -665,6 +726,341 @@ impl ContinueCliPreset {
     }
 }
 
+pub struct CodexPreset;
+
+impl AgentCheckpointPreset for CodexPreset {
+    fn run(&self, flags: AgentCheckpointFlags) -> Result<AgentRunResult, GitAiError> {
+        let stdin_json = flags.hook_input.ok_or_else(|| {
+            GitAiError::PresetError("hook_input is required for Codex preset".to_string())
+        })?;
+
+        let hook_data: serde_json::Value = serde_json::from_str(&stdin_json)
+            .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
+
+        let session_id = CodexPreset::session_id_from_hook_data(&hook_data).ok_or_else(|| {
+            GitAiError::PresetError("session_id/thread_id not found in hook_input".to_string())
+        })?;
+
+        let cwd = hook_data
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GitAiError::PresetError("cwd not found in hook_input".to_string()))?;
+
+        let transcript_path = hook_data
+            .get("transcript_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(
+                || match CodexPreset::find_latest_rollout_path_for_session(&session_id) {
+                    Ok(Some(path)) => Some(path.to_string_lossy().to_string()),
+                    Ok(None) => None,
+                    Err(e) => {
+                        eprintln!(
+                            "[Warning] Failed to locate Codex rollout for session {session_id}: {e}"
+                        );
+                        log_error(
+                            &e,
+                            Some(serde_json::json!({
+                                "agent_tool": "codex",
+                                "operation": "find_latest_rollout_path_for_session"
+                            })),
+                        );
+                        None
+                    }
+                },
+            );
+
+        let (transcript, model) = if let Some(path) = transcript_path.as_deref() {
+            match CodexPreset::transcript_and_model_from_codex_rollout_jsonl(path) {
+                Ok((transcript, model)) => (transcript, model),
+                Err(e) => {
+                    eprintln!("[Warning] Failed to parse Codex rollout JSONL: {e}");
+                    log_error(
+                        &e,
+                        Some(serde_json::json!({
+                            "agent_tool": "codex",
+                            "operation": "transcript_and_model_from_codex_rollout_jsonl"
+                        })),
+                    );
+                    (AiTranscript::new(), Some("unknown".to_string()))
+                }
+            }
+        } else {
+            eprintln!(
+                "[Warning] No Codex rollout path found for session {session_id}; continuing with empty transcript"
+            );
+            (AiTranscript::new(), Some("unknown".to_string()))
+        };
+
+        let agent_id = AgentId {
+            tool: "codex".to_string(),
+            id: session_id,
+            model: model.unwrap_or_else(|| "unknown".to_string()),
+        };
+
+        let agent_metadata =
+            transcript_path.map(|path| HashMap::from([("transcript_path".to_string(), path)]));
+
+        Ok(AgentRunResult {
+            agent_id,
+            agent_metadata,
+            checkpoint_kind: CheckpointKind::AiAgent,
+            transcript: Some(transcript),
+            repo_working_dir: Some(cwd.to_string()),
+            edited_filepaths: None,
+            will_edit_filepaths: None,
+            dirty_files: None,
+        })
+    }
+}
+
+impl CodexPreset {
+    fn session_id_from_hook_data(hook_data: &serde_json::Value) -> Option<String> {
+        hook_data
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("thread_id").and_then(|v| v.as_str()))
+            .or_else(|| hook_data.get("thread-id").and_then(|v| v.as_str()))
+            .or_else(|| {
+                hook_data
+                    .get("hook_event")
+                    .and_then(|ev| ev.get("thread_id"))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|s| s.to_string())
+    }
+
+    pub fn codex_home_dir() -> PathBuf {
+        if let Ok(codex_home) = env::var("CODEX_HOME")
+            && !codex_home.trim().is_empty()
+        {
+            return PathBuf::from(codex_home);
+        }
+
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(".codex")
+    }
+
+    pub fn find_latest_rollout_path_for_session(
+        session_id: &str,
+    ) -> Result<Option<PathBuf>, GitAiError> {
+        Self::find_latest_rollout_path_for_session_in_home(session_id, &Self::codex_home_dir())
+    }
+
+    pub fn find_latest_rollout_path_for_session_in_home(
+        session_id: &str,
+        codex_home: &Path,
+    ) -> Result<Option<PathBuf>, GitAiError> {
+        let mut candidates = Vec::new();
+        for subdir in ["sessions", "archived_sessions"] {
+            let base = codex_home.join(subdir);
+            if !base.exists() {
+                continue;
+            }
+
+            let pattern = format!(
+                "{}/**/rollout-*{}*.jsonl",
+                base.to_string_lossy(),
+                session_id
+            );
+            let entries = glob(&pattern).map_err(|e| {
+                GitAiError::Generic(format!("Failed to glob Codex rollout files: {e}"))
+            })?;
+
+            for entry in entries.flatten() {
+                if entry.is_file() {
+                    candidates.push(entry);
+                }
+            }
+        }
+
+        let newest = candidates.into_iter().max_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH)
+        });
+
+        Ok(newest)
+    }
+
+    pub fn transcript_and_model_from_codex_rollout_jsonl(
+        transcript_path: &str,
+    ) -> Result<(AiTranscript, Option<String>), GitAiError> {
+        let jsonl_content =
+            std::fs::read_to_string(transcript_path).map_err(GitAiError::IoError)?;
+
+        let mut parsed_lines: Vec<serde_json::Value> = Vec::new();
+        for line in jsonl_content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(trimmed)?;
+            parsed_lines.push(value);
+        }
+
+        let mut transcript = AiTranscript::new();
+        let mut model = None;
+
+        for entry in &parsed_lines {
+            let timestamp = entry
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let item_type = entry
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let payload = entry.get("payload").unwrap_or(entry);
+
+            match item_type {
+                "turn_context" => {
+                    if let Some(model_name) = payload.get("model").and_then(|v| v.as_str())
+                        && !model_name.trim().is_empty()
+                    {
+                        // Keep the latest model for sessions that switched models mid-thread.
+                        model = Some(model_name.to_string());
+                    }
+                }
+                "response_item" => {
+                    let response_type = payload
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    match response_type {
+                        "message" => {
+                            let role = payload
+                                .get("role")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+
+                            let mut text_parts: Vec<String> = Vec::new();
+                            if let Some(content_arr) =
+                                payload.get("content").and_then(|v| v.as_array())
+                            {
+                                for item in content_arr {
+                                    let content_type = item
+                                        .get("type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default();
+                                    if (role == "assistant" || role == "user")
+                                        && (content_type == "output_text"
+                                            || content_type == "input_text")
+                                        && let Some(text) =
+                                            item.get("text").and_then(|v| v.as_str())
+                                    {
+                                        let trimmed = text.trim();
+                                        if !trimmed.is_empty() {
+                                            text_parts.push(trimmed.to_string());
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !text_parts.is_empty() {
+                                let joined = text_parts.join("\n");
+                                if role == "user" {
+                                    transcript.add_message(Message::User {
+                                        text: joined,
+                                        timestamp: timestamp.clone(),
+                                    });
+                                } else if role == "assistant" {
+                                    transcript.add_message(Message::Assistant {
+                                        text: joined,
+                                        timestamp: timestamp.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        "function_call" | "custom_tool_call" | "local_shell_call"
+                        | "web_search_call" => {
+                            let name = payload
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(response_type)
+                                .to_string();
+
+                            let input = if response_type == "function_call" {
+                                if let Some(arguments) =
+                                    payload.get("arguments").and_then(|v| v.as_str())
+                                {
+                                    serde_json::from_str::<serde_json::Value>(arguments)
+                                        .unwrap_or_else(|_| {
+                                            serde_json::Value::String(arguments.to_string())
+                                        })
+                                } else {
+                                    payload.get("arguments").cloned().unwrap_or_else(|| {
+                                        serde_json::Value::Object(serde_json::Map::new())
+                                    })
+                                }
+                            } else if let Some(input) =
+                                payload.get("input").and_then(|v| v.as_str())
+                            {
+                                serde_json::Value::String(input.to_string())
+                            } else {
+                                payload.clone()
+                            };
+
+                            transcript.add_message(Message::ToolUse {
+                                name,
+                                input,
+                                timestamp: timestamp.clone(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if transcript.messages().is_empty() {
+            // Backward-compatible fallback for sessions that only recorded legacy event messages.
+            for entry in &parsed_lines {
+                let timestamp = entry
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if entry.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+                    continue;
+                }
+
+                let payload = entry.get("payload").unwrap_or(entry);
+                let event_type = payload
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+
+                if event_type == "user_message" {
+                    if let Some(text) = payload.get("message").and_then(|v| v.as_str()) {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            transcript.add_message(Message::User {
+                                text: trimmed.to_string(),
+                                timestamp: timestamp.clone(),
+                            });
+                        }
+                    }
+                } else if event_type == "agent_message"
+                    && let Some(text) = payload.get("message").and_then(|v| v.as_str())
+                {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        transcript.add_message(Message::Assistant {
+                            text: trimmed.to_string(),
+                            timestamp: timestamp.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok((transcript, model))
+    }
+}
+
 // Cursor to checkpoint preset
 pub struct CursorPreset;
 
@@ -694,7 +1090,7 @@ impl AgentCheckpointPreset for CursorPreset {
                 GitAiError::PresetError("workspace_roots not found in hook_input".to_string())
             })?
             .iter()
-            .filter_map(|v| v.as_str().map(|s| Self::normalize_cursor_path(s)))
+            .filter_map(|v| v.as_str().map(Self::normalize_cursor_path))
             .collect::<Vec<String>>();
 
         let hook_event_name = hook_data
@@ -819,9 +1215,21 @@ impl AgentCheckpointPreset for CursorPreset {
             model,
         };
 
+        // Store cursor database path in metadata for refetching during post-commit.
+        // This is only needed when GIT_AI_CURSOR_GLOBAL_DB_PATH env var is set (i.e., in tests),
+        // because the env var isn't passed to git hook subprocesses.
+        let agent_metadata = if std::env::var("GIT_AI_CURSOR_GLOBAL_DB_PATH").is_ok() {
+            Some(HashMap::from([(
+                "__test_cursor_db_path".to_string(),
+                global_db.to_string_lossy().to_string(),
+            )]))
+        } else {
+            None
+        };
+
         Ok(AgentRunResult {
             agent_id,
-            agent_metadata: None,
+            agent_metadata,
             checkpoint_kind: CheckpointKind::AiAgent,
             transcript: Some(transcript),
             repo_working_dir: Some(repo_working_dir),
@@ -842,15 +1250,14 @@ impl CursorPreset {
         // Check for pattern like /c:/ or /C:/ at the start
         // e.g. "/c:/Users/foo" -> "C:\Users\foo"
         let mut chars = path.chars();
-        if chars.next() == Some('/') {
-            if let (Some(drive), Some(':')) = (chars.next(), chars.next()) {
-                if drive.is_ascii_alphabetic() {
-                    let rest: String = chars.collect();
-                    // Convert forward slashes to backslashes for Windows
-                    let normalized_rest = rest.replace('/', "\\");
-                    return format!("{}:{}", drive.to_ascii_uppercase(), normalized_rest);
-                }
-            }
+        if chars.next() == Some('/')
+            && let (Some(drive), Some(':')) = (chars.next(), chars.next())
+            && drive.is_ascii_alphabetic()
+        {
+            let rest: String = chars.collect();
+            // Convert forward slashes to backslashes for Windows
+            let normalized_rest = rest.replace('/', "\\");
+            return format!("{}:{}", drive.to_ascii_uppercase(), normalized_rest);
         }
         // No conversion needed
         path.to_string()
@@ -867,17 +1274,25 @@ impl CursorPreset {
         conversation_id: &str,
     ) -> Result<Option<(AiTranscript, String)>, GitAiError> {
         let global_db = Self::cursor_global_database_path()?;
-        if !global_db.exists() {
+        Self::fetch_cursor_conversation_from_db(&global_db, conversation_id)
+    }
+
+    /// Fetch a Cursor conversation from a specific database path
+    pub fn fetch_cursor_conversation_from_db(
+        db_path: &std::path::Path,
+        conversation_id: &str,
+    ) -> Result<Option<(AiTranscript, String)>, GitAiError> {
+        if !db_path.exists() {
             return Ok(None);
         }
 
         // Fetch composer payload
-        let composer_payload = Self::fetch_composer_payload(&global_db, conversation_id)?;
+        let composer_payload = Self::fetch_composer_payload(db_path, conversation_id)?;
 
         // Extract transcript and model
         let transcript_data = Self::transcript_data_from_composer_payload(
             &composer_payload,
-            &global_db,
+            db_path,
             conversation_id,
         )?;
 
@@ -916,7 +1331,16 @@ impl CursorPreset {
                 .join("User"))
         }
 
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        #[cfg(target_os = "linux")]
+        {
+            // Linux: ~/.config/Cursor/User
+            let config_dir = dirs::config_dir().ok_or_else(|| {
+                GitAiError::Generic("Could not determine user config directory".to_string())
+            })?;
+            Ok(config_dir.join("Cursor").join("User"))
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
             Err(GitAiError::PresetError(
                 "Cursor is only supported on Windows and macOS platforms".to_string(),
@@ -981,92 +1405,87 @@ impl CursorPreset {
         let mut model = None;
 
         for header in conv.iter() {
-            if let Some(bubble_id) = header.get("bubbleId").and_then(|v| v.as_str()) {
-                if let Ok(Some(bubble_content)) =
+            if let Some(bubble_id) = header.get("bubbleId").and_then(|v| v.as_str())
+                && let Ok(Some(bubble_content)) =
                     Self::fetch_bubble_content_from_db(global_db_path, composer_id, bubble_id)
+            {
+                // Get bubble created at (ISO 8601 UTC string)
+                let bubble_created_at = bubble_content
+                    .get("createdAt")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                // Extract model from bubble (first value wins)
+                if model.is_none()
+                    && let Some(model_info) = bubble_content.get("modelInfo")
+                    && let Some(model_name) = model_info.get("modelName").and_then(|v| v.as_str())
                 {
-                    // Get bubble created at (ISO 8601 UTC string)
-                    let bubble_created_at = bubble_content
-                        .get("createdAt")
+                    model = Some(model_name.to_string());
+                }
+
+                // Extract text from bubble
+                if let Some(text) = bubble_content.get("text").and_then(|v| v.as_str()) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        let role = header.get("type").and_then(|v| v.as_i64()).unwrap_or(0);
+                        if role == 1 {
+                            transcript.add_message(Message::user(
+                                trimmed.to_string(),
+                                bubble_created_at.clone(),
+                            ));
+                        } else {
+                            transcript.add_message(Message::assistant(
+                                trimmed.to_string(),
+                                bubble_created_at.clone(),
+                            ));
+                        }
+                    }
+                }
+
+                // Handle tool calls and edits
+                if let Some(tool_former_data) = bubble_content.get("toolFormerData") {
+                    let tool_name = tool_former_data
+                        .get("name")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    // Extract model from bubble (first value wins)
-                    if model.is_none() {
-                        if let Some(model_info) = bubble_content.get("modelInfo") {
-                            if let Some(model_name) =
-                                model_info.get("modelName").and_then(|v| v.as_str())
-                            {
-                                model = Some(model_name.to_string());
-                            }
+                        .unwrap_or("unknown");
+                    let raw_args_str = tool_former_data
+                        .get("rawArgs")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{}");
+                    let raw_args_json = serde_json::from_str::<serde_json::Value>(raw_args_str)
+                        .unwrap_or(serde_json::Value::Null);
+                    match tool_name {
+                        "edit_file" => {
+                            let target_file =
+                                raw_args_json.get("target_file").and_then(|v| v.as_str());
+                            transcript.add_message(Message::tool_use(
+                                tool_name.to_string(),
+                                // Explicitly clear out everything other than target_file (renamed to file_path for consistency in git-ai) (too much data in rawArgs)
+                                serde_json::json!({ "file_path": target_file.unwrap_or("") }),
+                            ));
                         }
-                    }
-
-                    // Extract text from bubble
-                    if let Some(text) = bubble_content.get("text").and_then(|v| v.as_str()) {
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            let role = header.get("type").and_then(|v| v.as_i64()).unwrap_or(0);
-                            if role == 1 {
-                                transcript.add_message(Message::user(
-                                    trimmed.to_string(),
-                                    bubble_created_at.clone(),
-                                ));
-                            } else {
-                                transcript.add_message(Message::assistant(
-                                    trimmed.to_string(),
-                                    bubble_created_at.clone(),
-                                ));
-                            }
+                        "apply_patch"
+                        | "edit_file_v2_apply_patch"
+                        | "search_replace"
+                        | "edit_file_v2_search_replace"
+                        | "write"
+                        | "MultiEdit" => {
+                            let file_path = raw_args_json.get("file_path").and_then(|v| v.as_str());
+                            transcript.add_message(Message::tool_use(
+                                tool_name.to_string(),
+                                // Explicitly clear out everything other than file_path (too much data in rawArgs)
+                                serde_json::json!({ "file_path": file_path.unwrap_or("") }),
+                            ));
                         }
-                    }
-
-                    // Handle tool calls and edits
-                    if let Some(tool_former_data) = bubble_content.get("toolFormerData") {
-                        let tool_name = tool_former_data
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let raw_args_str = tool_former_data
-                            .get("rawArgs")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}");
-                        let raw_args_json = serde_json::from_str::<serde_json::Value>(raw_args_str)
-                            .unwrap_or(serde_json::Value::Null);
-                        match tool_name {
-                            "edit_file" => {
-                                let target_file =
-                                    raw_args_json.get("target_file").and_then(|v| v.as_str());
-                                transcript.add_message(Message::tool_use(
-                                    tool_name.to_string(),
-                                    // Explicitly clear out everything other than target_file (renamed to file_path for consistency in git-ai) (too much data in rawArgs)
-                                    serde_json::json!({ "file_path": target_file.unwrap_or("") }),
-                                ));
-                            }
-                            "apply_patch"
-                            | "edit_file_v2_apply_patch"
-                            | "search_replace"
-                            | "edit_file_v2_search_replace"
-                            | "write"
-                            | "MultiEdit" => {
-                                let file_path =
-                                    raw_args_json.get("file_path").and_then(|v| v.as_str());
-                                transcript.add_message(Message::tool_use(
-                                    tool_name.to_string(),
-                                    // Explicitly clear out everything other than file_path (too much data in rawArgs)
-                                    serde_json::json!({ "file_path": file_path.unwrap_or("") }),
-                                ));
-                            }
-                            "codebase_search" | "grep" | "read_file" | "web_search"
-                            | "run_terminal_cmd" | "glob_file_search" | "todo_write"
-                            | "file_search" | "grep_search" | "list_dir" | "ripgrep" => {
-                                transcript.add_message(Message::tool_use(
-                                    tool_name.to_string(),
-                                    raw_args_json,
-                                ));
-                            }
-                            _ => {}
+                        "codebase_search" | "grep" | "read_file" | "web_search"
+                        | "run_terminal_cmd" | "glob_file_search" | "todo_write"
+                        | "file_search" | "grep_search" | "list_dir" | "ripgrep" => {
+                            transcript.add_message(Message::tool_use(
+                                tool_name.to_string(),
+                                raw_args_json,
+                            ));
                         }
+                        _ => {}
                     }
                 }
             }
@@ -1113,9 +1532,25 @@ impl CursorPreset {
 
 pub struct GithubCopilotPreset;
 
+#[derive(Default)]
+struct CopilotModelCandidates {
+    request_non_auto_model_id: Option<String>,
+    request_model_id: Option<String>,
+    session_non_auto_model_id: Option<String>,
+    session_model_id: Option<String>,
+}
+
+impl CopilotModelCandidates {
+    fn best(self) -> Option<String> {
+        self.request_non_auto_model_id
+            .or(self.request_model_id)
+            .or(self.session_non_auto_model_id)
+            .or(self.session_model_id)
+    }
+}
+
 impl AgentCheckpointPreset for GithubCopilotPreset {
     fn run(&self, flags: AgentCheckpointFlags) -> Result<AgentRunResult, GitAiError> {
-        // Parse hook_input JSON to extract chat session information
         let hook_input_json = flags.hook_input.ok_or_else(|| {
             GitAiError::PresetError("hook_input is required for GitHub Copilot preset".to_string())
         })?;
@@ -1123,23 +1558,32 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
         let hook_data: serde_json::Value = serde_json::from_str(&hook_input_json)
             .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 
-        // Extract hook_event_name to determine checkpoint type
-        // Fallback to "after_edit" if not set (for older versions of the VS Code extension)
         let hook_event_name = hook_data
             .get("hook_event_name")
+            .or_else(|| hook_data.get("hookEventName"))
             .and_then(|v| v.as_str())
             .unwrap_or("after_edit");
 
-        // Validate hook_event_name
-        if hook_event_name != "before_edit" && hook_event_name != "after_edit" {
-            return Err(GitAiError::PresetError(format!(
-                "Invalid hook_event_name: {}. Expected 'before_edit' or 'after_edit'",
-                hook_event_name
-            )));
+        if hook_event_name == "before_edit" || hook_event_name == "after_edit" {
+            return Self::run_legacy_extension_hooks(&hook_data, hook_event_name);
         }
 
-        // Required working directory provided by the extension
-        // Accept snake_case (new) with fallback to camelCase (old) for backward compatibility
+        if hook_event_name == "PreToolUse" || hook_event_name == "PostToolUse" {
+            return Self::run_vscode_native_hooks(&hook_data, hook_event_name);
+        }
+
+        Err(GitAiError::PresetError(format!(
+            "Invalid hook_event_name: {}. Expected one of 'before_edit', 'after_edit', 'PreToolUse', or 'PostToolUse'",
+            hook_event_name
+        )))
+    }
+}
+
+impl GithubCopilotPreset {
+    fn run_legacy_extension_hooks(
+        hook_data: &serde_json::Value,
+        hook_event_name: &str,
+    ) -> Result<AgentRunResult, GitAiError> {
         let repo_working_dir: String = hook_data
             .get("workspace_folder")
             .and_then(|v| v.as_str())
@@ -1151,24 +1595,9 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
             })?
             .to_string();
 
-        // Extract dirty_files if available (snake_case with fallback to camelCase)
-        let dirty_files = hook_data
-            .get("dirty_files")
-            .and_then(|v| v.as_object())
-            .or_else(|| hook_data.get("dirtyFiles").and_then(|v| v.as_object()))
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(key, value)| {
-                        value
-                            .as_str()
-                            .map(|content| (key.clone(), content.to_string()))
-                    })
-                    .collect::<HashMap<String, String>>()
-            });
+        let dirty_files = Self::dirty_files_from_hook_data(hook_data);
 
-        // Handle before_edit (human checkpoint)
         if hook_event_name == "before_edit" {
-            // Extract will_edit_filepaths (required for human checkpoints)
             let will_edit_filepaths = hook_data
                 .get("will_edit_filepaths")
                 .and_then(|v| v.as_array())
@@ -1207,8 +1636,6 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
             });
         }
 
-        // Handle after_edit (AI checkpoint)
-        // Accept snake_case (new) with fallback to camelCase (old) for backward compatibility
         let chat_session_path = hook_data
             .get("chat_session_path")
             .and_then(|v| v.as_str())
@@ -1225,8 +1652,6 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
             chat_session_path.to_string(),
         )]);
 
-        // Accept snake_case (new) with fallback to camelCase (old) for backward compatibility
-        // Accept either chat_session_id/session_id (new) or chatSessionId/sessionId (old)
         let chat_session_id = hook_data
             .get("chat_session_id")
             .and_then(|v| v.as_str())
@@ -1237,7 +1662,6 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
             .to_string();
 
         // TODO Make edited_filepaths required in future versions (after old extensions are updated)
-        // Optionally take edited_filepaths from hook_data if present (from extension)
         let edited_filepaths = hook_data
             .get("edited_filepaths")
             .and_then(|val| val.as_array())
@@ -1247,15 +1671,13 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
                     .collect::<Vec<String>>()
             });
 
-        // Read the Copilot chat session JSON (ignore errors)
         let (transcript, detected_model, detected_edited_filepaths) =
             GithubCopilotPreset::transcript_and_model_from_copilot_session_json(chat_session_path)
                 .map(|(t, m, f)| (Some(t), m, f))
                 .unwrap_or_else(|e| {
                     eprintln!(
                         "[Warning] Failed to parse GitHub Copilot chat session JSON from {} (will update transcript at commit): {}",
-                        chat_session_path,
-                        e
+                        chat_session_path, e
                     );
                     log_error(
                         &e,
@@ -1281,16 +1703,968 @@ impl AgentCheckpointPreset for GithubCopilotPreset {
             transcript,
             repo_working_dir: Some(repo_working_dir),
             // TODO Remove detected_edited_filepaths once edited_filepaths is required in future versions (after old extensions are updated)
-            edited_filepaths: edited_filepaths.or_else(|| detected_edited_filepaths),
+            edited_filepaths: edited_filepaths.or(detected_edited_filepaths),
             will_edit_filepaths: None,
             dirty_files,
         })
+    }
+
+    fn run_vscode_native_hooks(
+        hook_data: &serde_json::Value,
+        hook_event_name: &str,
+    ) -> Result<AgentRunResult, GitAiError> {
+        let cwd = hook_data
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("workspace_folder").and_then(|v| v.as_str()))
+            .or_else(|| hook_data.get("workspaceFolder").and_then(|v| v.as_str()))
+            .ok_or_else(|| GitAiError::PresetError("cwd not found in hook_input".to_string()))?
+            .to_string();
+
+        let dirty_files = Self::dirty_files_from_hook_data(hook_data);
+        let chat_session_id = hook_data
+            .get("chat_session_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("session_id").and_then(|v| v.as_str()))
+            .or_else(|| hook_data.get("chatSessionId").and_then(|v| v.as_str()))
+            .or_else(|| hook_data.get("sessionId").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string();
+
+        let tool_name = hook_data
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("toolName").and_then(|v| v.as_str()))
+            .unwrap_or("unknown");
+
+        // VS Code currently executes imported hooks even when matcher/tool filters are ignored.
+        // Enforce tool filtering in git-ai to avoid creating checkpoints for read/search tools.
+        if !Self::is_supported_vscode_edit_tool_name(tool_name) {
+            return Err(GitAiError::PresetError(format!(
+                "Skipping VS Code hook for unsupported tool_name '{}' (non-edit tool).",
+                tool_name
+            )));
+        }
+
+        let tool_input = hook_data
+            .get("tool_input")
+            .or_else(|| hook_data.get("toolInput"));
+        let tool_response = hook_data
+            .get("tool_response")
+            .or_else(|| hook_data.get("toolResponse"));
+
+        let mut extracted_paths =
+            Self::extract_filepaths_from_vscode_hook_payload(tool_input, tool_response, &cwd);
+
+        let top_level_paths = hook_data
+            .get("edited_filepaths")
+            .and_then(|v| v.as_array())
+            .or_else(|| {
+                hook_data
+                    .get("will_edit_filepaths")
+                    .and_then(|v| v.as_array())
+            })
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|path| Self::normalize_hook_path(path, &cwd))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+
+        for path in top_level_paths {
+            if !extracted_paths.contains(&path) {
+                extracted_paths.push(path);
+            }
+        }
+
+        let transcript_path = Self::transcript_path_from_hook_data(hook_data).map(str::to_string);
+
+        if let Some(path) = transcript_path.as_deref()
+            && Self::looks_like_claude_transcript_path(path)
+        {
+            return Err(GitAiError::PresetError(
+                "Skipping VS Code hook because transcript_path looks like a Claude transcript path."
+                    .to_string(),
+            ));
+        }
+
+        let (transcript, mut detected_model, detected_edited_filepaths) = if let Some(path) =
+            transcript_path.as_deref()
+        {
+            GithubCopilotPreset::transcript_and_model_from_copilot_session_json(path)
+                .map(|(t, m, f)| (Some(t), m, f))
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "[Warning] Failed to parse GitHub Copilot chat session JSON from {} (will update transcript at commit): {}",
+                        path, e
+                    );
+                    log_error(
+                        &e,
+                        Some(serde_json::json!({
+                            "agent_tool": "github-copilot",
+                            "operation": "transcript_and_model_from_copilot_session_json",
+                            "note": "JSON exists but invalid"
+                        })),
+                    );
+                    (None, None, None)
+                })
+        } else {
+            (None, None, None)
+        };
+
+        if let Some(path) = transcript_path.as_deref()
+            && chat_session_id != "unknown"
+            && Self::should_resolve_model_from_chat_sessions(detected_model.as_deref())
+            && let Some(chat_sessions_model) =
+                Self::model_from_copilot_chat_sessions(path, &chat_session_id)
+        {
+            detected_model = Some(chat_sessions_model);
+        }
+
+        if !Self::is_likely_copilot_native_hook(
+            tool_name,
+            detected_model.as_deref(),
+            hook_data,
+            transcript_path.as_deref(),
+        ) {
+            return Err(GitAiError::PresetError(format!(
+                "Skipping VS Code hook for non-Copilot session (tool_name: {}, model: {}).",
+                tool_name,
+                detected_model.as_deref().unwrap_or("unknown")
+            )));
+        }
+
+        let detected_edited_filepaths = detected_edited_filepaths.map(|paths| {
+            paths
+                .into_iter()
+                .filter_map(|path| Self::normalize_hook_path(&path, &cwd))
+                .collect::<Vec<String>>()
+        });
+
+        for path in detected_edited_filepaths.unwrap_or_default() {
+            if !extracted_paths.contains(&path) {
+                extracted_paths.push(path);
+            }
+        }
+
+        if hook_event_name == "PreToolUse" {
+            if extracted_paths.is_empty() {
+                return Err(GitAiError::PresetError(format!(
+                    "No editable file paths found in VS Code hook input (tool_name: {}). Skipping checkpoint.",
+                    tool_name
+                )));
+            }
+
+            return Ok(AgentRunResult {
+                agent_id: AgentId {
+                    tool: "human".to_string(),
+                    id: "human".to_string(),
+                    model: "human".to_string(),
+                },
+                agent_metadata: None,
+                checkpoint_kind: CheckpointKind::Human,
+                transcript: None,
+                repo_working_dir: Some(cwd),
+                edited_filepaths: None,
+                will_edit_filepaths: Some(extracted_paths),
+                dirty_files,
+            });
+        }
+
+        let transcript_path = transcript_path.ok_or_else(|| {
+            GitAiError::PresetError(
+                "transcript_path not found in hook_input for PostToolUse".to_string(),
+            )
+        })?;
+
+        let agent_id = AgentId {
+            tool: "github-copilot".to_string(),
+            id: chat_session_id,
+            model: detected_model.unwrap_or_else(|| "unknown".to_string()),
+        };
+
+        let agent_metadata = HashMap::from([
+            ("transcript_path".to_string(), transcript_path.clone()),
+            ("chat_session_path".to_string(), transcript_path),
+        ]);
+
+        if extracted_paths.is_empty() {
+            return Err(GitAiError::PresetError(format!(
+                "No editable file paths found in VS Code PostToolUse hook input (tool_name: {}). Skipping checkpoint.",
+                tool_name
+            )));
+        }
+
+        Ok(AgentRunResult {
+            agent_id,
+            agent_metadata: Some(agent_metadata),
+            checkpoint_kind: CheckpointKind::AiAgent,
+            transcript,
+            repo_working_dir: Some(cwd),
+            edited_filepaths: Some(extracted_paths),
+            will_edit_filepaths: None,
+            dirty_files,
+        })
+    }
+
+    fn dirty_files_from_hook_data(
+        hook_data: &serde_json::Value,
+    ) -> Option<HashMap<String, String>> {
+        hook_data
+            .get("dirty_files")
+            .and_then(|v| v.as_object())
+            .or_else(|| hook_data.get("dirtyFiles").and_then(|v| v.as_object()))
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|content| (key.clone(), content.to_string()))
+                    })
+                    .collect::<HashMap<String, String>>()
+            })
+    }
+
+    fn is_likely_copilot_native_hook(
+        tool_name: &str,
+        detected_model: Option<&str>,
+        hook_data: &serde_json::Value,
+        transcript_path: Option<&str>,
+    ) -> bool {
+        if let Some(path) = transcript_path {
+            if Self::looks_like_claude_transcript_path(path) {
+                return false;
+            }
+            if Self::looks_like_copilot_transcript_path(path) {
+                return true;
+            }
+        }
+
+        if let Some(model) = detected_model {
+            return model.starts_with("copilot/");
+        }
+
+        if let Some(model_hint) = hook_data
+            .get("model")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("modelId").and_then(|v| v.as_str()))
+            .or_else(|| hook_data.get("selectedModel").and_then(|v| v.as_str()))
+        {
+            return model_hint.starts_with("copilot/");
+        }
+
+        tool_name.to_ascii_lowercase().contains("copilot")
+    }
+
+    fn should_resolve_model_from_chat_sessions(detected_model: Option<&str>) -> bool {
+        match detected_model {
+            None => true,
+            Some(model) => {
+                let normalized = model.trim().to_ascii_lowercase();
+                normalized.is_empty() || normalized == "unknown" || normalized == "copilot/auto"
+            }
+        }
+    }
+
+    fn model_from_copilot_chat_sessions(
+        transcript_path: &str,
+        transcript_session_id: &str,
+    ) -> Option<String> {
+        let chat_sessions_dir = Self::chat_sessions_dir_from_transcript_path(transcript_path)?;
+        let entries = std::fs::read_dir(chat_sessions_dir).ok()?;
+        let mut candidates = CopilotModelCandidates::default();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let ext = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext != "json" && ext != "jsonl" {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+
+            if !content.contains(transcript_session_id) {
+                continue;
+            }
+
+            Self::collect_model_candidates_from_chat_session_content(
+                &content,
+                transcript_session_id,
+                &mut candidates,
+            );
+
+            if candidates.request_non_auto_model_id.is_some() {
+                break;
+            }
+        }
+
+        candidates.best()
+    }
+
+    fn chat_sessions_dir_from_transcript_path(transcript_path: &str) -> Option<PathBuf> {
+        let transcript = Path::new(transcript_path);
+        let transcripts_dir = transcript.parent()?;
+        let is_transcripts_dir = transcripts_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .map(|name| name.eq_ignore_ascii_case("transcripts"))
+            .unwrap_or(false);
+        if !is_transcripts_dir {
+            return None;
+        }
+
+        let copilot_dir = transcripts_dir.parent()?;
+        let is_copilot_dir = copilot_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .map(|name| name.eq_ignore_ascii_case("github.copilot-chat"))
+            .unwrap_or(false);
+        if !is_copilot_dir {
+            return None;
+        }
+
+        let workspace_storage_dir = copilot_dir.parent()?;
+        let chat_sessions_dir = workspace_storage_dir.join("chatSessions");
+        if chat_sessions_dir.is_dir() {
+            Some(chat_sessions_dir)
+        } else {
+            None
+        }
+    }
+
+    fn collect_model_candidates_from_chat_session_content(
+        content: &str,
+        transcript_session_id: &str,
+        candidates: &mut CopilotModelCandidates,
+    ) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+            Self::collect_model_candidates_from_session_object(
+                &parsed,
+                transcript_session_id,
+                candidates,
+            );
+            return;
+        }
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let parsed_line: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            match parsed_line.get("kind").and_then(|v| v.as_u64()) {
+                Some(0) => {
+                    if let Some(session_obj) = parsed_line.get("v") {
+                        Self::collect_model_candidates_from_session_object(
+                            session_obj,
+                            transcript_session_id,
+                            candidates,
+                        );
+                    }
+                }
+                Some(2) => {
+                    if let Some(requests) = parsed_line.get("v").and_then(|v| v.as_array()) {
+                        for request in requests {
+                            Self::collect_model_candidates_from_request(
+                                request,
+                                transcript_session_id,
+                                candidates,
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    Self::collect_model_candidates_from_session_object(
+                        &parsed_line,
+                        transcript_session_id,
+                        candidates,
+                    );
+                }
+            }
+        }
+    }
+
+    fn collect_model_candidates_from_session_object(
+        session_obj: &serde_json::Value,
+        transcript_session_id: &str,
+        candidates: &mut CopilotModelCandidates,
+    ) {
+        if let Some(selected_model) = session_obj
+            .get("inputState")
+            .and_then(|v| v.get("selectedModel"))
+            .and_then(|v| v.get("identifier"))
+            .and_then(|v| v.as_str())
+        {
+            Self::record_selected_model_candidate(candidates, selected_model);
+        }
+
+        if let Some(requests) = session_obj.get("requests").and_then(|v| v.as_array()) {
+            for request in requests {
+                Self::collect_model_candidates_from_request(
+                    request,
+                    transcript_session_id,
+                    candidates,
+                );
+            }
+        }
+    }
+
+    fn collect_model_candidates_from_request(
+        request: &serde_json::Value,
+        transcript_session_id: &str,
+        candidates: &mut CopilotModelCandidates,
+    ) {
+        if !Self::request_matches_transcript_session(request, transcript_session_id) {
+            return;
+        }
+
+        if let Some(model_id) = request.get("modelId").and_then(|v| v.as_str()) {
+            Self::record_model_id_candidate(candidates, model_id);
+        }
+    }
+
+    fn request_matches_transcript_session(
+        request: &serde_json::Value,
+        transcript_session_id: &str,
+    ) -> bool {
+        request
+            .get("result")
+            .and_then(|v| v.get("metadata"))
+            .and_then(|v| v.get("sessionId"))
+            .and_then(|v| v.as_str())
+            .map(|session_id| session_id == transcript_session_id)
+            .unwrap_or(false)
+            || request
+                .get("result")
+                .and_then(|v| v.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .map(|session_id| session_id == transcript_session_id)
+                .unwrap_or(false)
+            || request
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(|session_id| session_id == transcript_session_id)
+                .unwrap_or(false)
+    }
+
+    fn record_model_id_candidate(candidates: &mut CopilotModelCandidates, model_id: &str) {
+        let model = model_id.trim();
+        if model.is_empty() {
+            return;
+        }
+
+        if candidates.request_model_id.is_none() {
+            candidates.request_model_id = Some(model.to_string());
+        }
+
+        if !model.eq_ignore_ascii_case("copilot/auto")
+            && candidates.request_non_auto_model_id.is_none()
+        {
+            candidates.request_non_auto_model_id = Some(model.to_string());
+        }
+    }
+
+    fn record_selected_model_candidate(candidates: &mut CopilotModelCandidates, model_id: &str) {
+        let model = model_id.trim();
+        if model.is_empty() {
+            return;
+        }
+
+        if candidates.session_model_id.is_none() {
+            candidates.session_model_id = Some(model.to_string());
+        }
+
+        if !model.eq_ignore_ascii_case("copilot/auto")
+            && candidates.session_non_auto_model_id.is_none()
+        {
+            candidates.session_non_auto_model_id = Some(model.to_string());
+        }
+    }
+
+    fn transcript_path_from_hook_data(hook_data: &serde_json::Value) -> Option<&str> {
+        hook_data
+            .get("transcript_path")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("chat_session_path").and_then(|v| v.as_str()))
+            .or_else(|| hook_data.get("chatSessionPath").and_then(|v| v.as_str()))
+    }
+
+    fn looks_like_claude_transcript_path(path: &str) -> bool {
+        let normalized = path.replace('\\', "/").to_ascii_lowercase();
+        normalized.contains("/.claude/") || normalized.contains("/claude/projects/")
+    }
+
+    fn looks_like_copilot_transcript_path(path: &str) -> bool {
+        let normalized = path.replace('\\', "/").to_ascii_lowercase();
+        normalized.contains("/chatsessions/")
+            || normalized.contains("vscode-chat-session")
+            || normalized.contains("/workspacestorage/")
+            || normalized.contains("copilot_session")
+    }
+
+    fn is_supported_vscode_edit_tool_name(tool_name: &str) -> bool {
+        let lower = tool_name.to_ascii_lowercase();
+
+        let non_edit_keywords = [
+            "find", "search", "read", "grep", "glob", "list", "ls", "fetch", "web", "open", "todo",
+            "terminal", "run", "execute",
+        ];
+        if non_edit_keywords.iter().any(|kw| lower.contains(kw)) {
+            return false;
+        }
+
+        let exact_edit_tools = [
+            "write",
+            "edit",
+            "multiedit",
+            "applypatch",
+            "copilot_insertedit",
+            "copilot_replacestring",
+            "vscode_editfile_internal",
+        ];
+        if exact_edit_tools.iter().any(|name| lower == *name) {
+            return true;
+        }
+
+        lower.contains("edit") || lower.contains("write") || lower.contains("replace")
+    }
+
+    fn extract_filepaths_from_vscode_hook_payload(
+        tool_input: Option<&serde_json::Value>,
+        tool_response: Option<&serde_json::Value>,
+        cwd: &str,
+    ) -> Vec<String> {
+        let mut raw_paths = Vec::new();
+        if let Some(value) = tool_input {
+            Self::collect_tool_paths(value, &mut raw_paths);
+        }
+        if let Some(value) = tool_response {
+            Self::collect_tool_paths(value, &mut raw_paths);
+        }
+
+        let mut normalized_paths = Vec::new();
+        for raw in raw_paths {
+            if let Some(path) = Self::normalize_hook_path(&raw, cwd)
+                && !normalized_paths.contains(&path)
+            {
+                normalized_paths.push(path);
+            }
+        }
+        normalized_paths
+    }
+
+    fn collect_tool_paths(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, val) in map {
+                    let key_lower = key.to_ascii_lowercase();
+                    if (key_lower == "file_path"
+                        || key_lower == "filepath"
+                        || key_lower == "path"
+                        || key_lower == "fspath")
+                        && let Some(path) = val.as_str()
+                    {
+                        out.push(path.to_string());
+                    }
+                    Self::collect_tool_paths(val, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    Self::collect_tool_paths(item, out);
+                }
+            }
+            serde_json::Value::String(s) => {
+                if s.starts_with("file://") {
+                    out.push(s.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn normalize_hook_path(raw_path: &str, cwd: &str) -> Option<String> {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let path_without_scheme = trimmed
+            .strip_prefix("file://localhost")
+            .or_else(|| trimmed.strip_prefix("file://"))
+            .unwrap_or(trimmed);
+
+        let path = Path::new(path_without_scheme);
+        let joined = if path.is_absolute()
+            || path_without_scheme.starts_with("\\\\")
+            || path_without_scheme
+                .as_bytes()
+                .get(1)
+                .map(|b| *b == b':')
+                .unwrap_or(false)
+        {
+            PathBuf::from(path_without_scheme)
+        } else {
+            Path::new(cwd).join(path_without_scheme)
+        };
+
+        Some(joined.to_string_lossy().replace('\\', "/"))
+    }
+}
+
+impl AgentCheckpointPreset for DroidPreset {
+    fn run(&self, flags: AgentCheckpointFlags) -> Result<AgentRunResult, GitAiError> {
+        // Parse hook_input JSON from Droid
+        let hook_input_json = flags.hook_input.ok_or_else(|| {
+            GitAiError::PresetError("hook_input is required for Droid preset".to_string())
+        })?;
+
+        let hook_data: serde_json::Value = serde_json::from_str(&hook_input_json)
+            .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
+
+        // Extract common fields from Droid hook input
+        // Note: Droid may use either snake_case or camelCase field names
+        // session_id is optional - generate a fallback if not present
+        let session_id = hook_data
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("sessionId").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                format!(
+                    "droid-{}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                )
+            });
+
+        // transcript_path is optional - Droid may not always provide it
+        let transcript_path = hook_data
+            .get("transcript_path")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("transcriptPath").and_then(|v| v.as_str()));
+
+        let cwd = hook_data
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| GitAiError::PresetError("cwd not found in hook_input".to_string()))?;
+
+        let hook_event_name = hook_data
+            .get("hookEventName")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("hook_event_name").and_then(|v| v.as_str()))
+            .ok_or_else(|| {
+                GitAiError::PresetError("hookEventName not found in hook_input".to_string())
+            })?;
+
+        // Extract tool_name and tool_input for tool-related events
+        let tool_name = hook_data
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("toolName").and_then(|v| v.as_str()));
+
+        // Extract file_path from tool_input if present
+        let tool_input = hook_data
+            .get("tool_input")
+            .or_else(|| hook_data.get("toolInput"));
+
+        let mut file_path_as_vec = tool_input.and_then(|ti| {
+            ti.get("file_path")
+                .or_else(|| ti.get("filePath"))
+                .and_then(|v| v.as_str())
+                .map(|path| vec![path.to_string()])
+        });
+
+        // For ApplyPatch, extract file paths from the patch text
+        // Patch format contains lines like: *** Update File: <path>
+        if file_path_as_vec.is_none() && tool_name == Some("ApplyPatch") {
+            let mut paths = Vec::new();
+
+            // Try extracting from tool_input patch text
+            if let Some(ti) = tool_input
+                && let Some(patch_text) = ti
+                    .as_str()
+                    .or_else(|| ti.get("patch").and_then(|v| v.as_str()))
+            {
+                for line in patch_text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(path) = trimmed
+                        .strip_prefix("*** Update File: ")
+                        .or_else(|| trimmed.strip_prefix("*** Add File: "))
+                    {
+                        paths.push(path.trim().to_string());
+                    }
+                }
+            }
+
+            // For PostToolUse, also try parsing tool_response for file_path
+            if paths.is_empty()
+                && hook_event_name == "PostToolUse"
+                && let Some(tool_response) = hook_data
+                    .get("tool_response")
+                    .or_else(|| hook_data.get("toolResponse"))
+            {
+                // tool_response might be a JSON string or an object
+                let response_obj = if let Some(s) = tool_response.as_str() {
+                    serde_json::from_str::<serde_json::Value>(s).ok()
+                } else {
+                    Some(tool_response.clone())
+                };
+                if let Some(obj) = response_obj
+                    && let Some(path) = obj
+                        .get("file_path")
+                        .or_else(|| obj.get("filePath"))
+                        .and_then(|v| v.as_str())
+                {
+                    paths.push(path.to_string());
+                }
+            }
+
+            if !paths.is_empty() {
+                file_path_as_vec = Some(paths);
+            }
+        }
+
+        // Resolve transcript and settings paths:
+        // 1. Use transcript_path from hook input if provided
+        // 2. Otherwise derive from session_id + cwd
+        let (resolved_transcript_path, resolved_settings_path) = if let Some(tp) = transcript_path {
+            // Derive settings path as sibling of transcript_path
+            let settings = tp.replace(".jsonl", ".settings.json");
+            (tp.to_string(), settings)
+        } else {
+            let (jsonl_p, settings_p) = DroidPreset::droid_session_paths(&session_id, cwd);
+            (
+                jsonl_p.to_string_lossy().to_string(),
+                settings_p.to_string_lossy().to_string(),
+            )
+        };
+
+        // Parse the Droid transcript JSONL file
+        let transcript =
+            match DroidPreset::transcript_and_model_from_droid_jsonl(&resolved_transcript_path) {
+                Ok((transcript, _model)) => transcript,
+                Err(e) => {
+                    eprintln!("[Warning] Failed to parse Droid JSONL: {e}");
+                    log_error(
+                        &e,
+                        Some(serde_json::json!({
+                            "agent_tool": "droid",
+                            "operation": "transcript_and_model_from_droid_jsonl"
+                        })),
+                    );
+                    crate::authorship::transcript::AiTranscript::new()
+                }
+            };
+
+        // Extract model from settings.json
+        let model = match DroidPreset::model_from_droid_settings_json(&resolved_settings_path) {
+            Ok(m) => m.unwrap_or_else(|| "unknown".to_string()),
+            Err(_) => "unknown".to_string(),
+        };
+
+        let agent_id = AgentId {
+            tool: "droid".to_string(),
+            id: session_id,
+            model,
+        };
+
+        // Store both paths in metadata
+        let mut agent_metadata = HashMap::new();
+        agent_metadata.insert(
+            "transcript_path".to_string(),
+            resolved_transcript_path.clone(),
+        );
+        agent_metadata.insert("settings_path".to_string(), resolved_settings_path.clone());
+        if let Some(name) = tool_name {
+            agent_metadata.insert("tool_name".to_string(), name.to_string());
+        }
+
+        // Check if this is a PreToolUse event (human checkpoint)
+        if hook_event_name == "PreToolUse" {
+            return Ok(AgentRunResult {
+                agent_id,
+                agent_metadata: None,
+                checkpoint_kind: CheckpointKind::Human,
+                transcript: None,
+                repo_working_dir: Some(cwd.to_string()),
+                edited_filepaths: None,
+                will_edit_filepaths: file_path_as_vec,
+                dirty_files: None,
+            });
+        }
+
+        // PostToolUse event - AI checkpoint
+        Ok(AgentRunResult {
+            agent_id,
+            agent_metadata: Some(agent_metadata),
+            checkpoint_kind: CheckpointKind::AiAgent,
+            transcript: Some(transcript),
+            repo_working_dir: Some(cwd.to_string()),
+            edited_filepaths: file_path_as_vec,
+            will_edit_filepaths: None,
+            dirty_files: None,
+        })
+    }
+}
+
+impl DroidPreset {
+    /// Parse a Droid JSONL transcript file into a transcript.
+    /// Droid JSONL uses the same nested format as Claude Code:
+    /// `{"type":"message","timestamp":"...","message":{"role":"user|assistant","content":[...]}}`
+    /// Model is NOT stored in the JSONL — it comes from the companion .settings.json file.
+    pub fn transcript_and_model_from_droid_jsonl(
+        transcript_path: &str,
+    ) -> Result<(AiTranscript, Option<String>), GitAiError> {
+        let jsonl_content =
+            std::fs::read_to_string(transcript_path).map_err(GitAiError::IoError)?;
+        let mut transcript = AiTranscript::new();
+
+        for line in jsonl_content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let raw_entry: serde_json::Value = serde_json::from_str(line)?;
+
+            // Only process "message" entries; skip session_start, todo_state, etc.
+            if raw_entry["type"].as_str() != Some("message") {
+                continue;
+            }
+
+            let timestamp = raw_entry["timestamp"].as_str().map(|s| s.to_string());
+
+            let message = &raw_entry["message"];
+            let role = match message["role"].as_str() {
+                Some(r) => r,
+                None => continue,
+            };
+
+            match role {
+                "user" => {
+                    if let Some(content_array) = message["content"].as_array() {
+                        for item in content_array {
+                            // Skip tool_result items — those are system-generated responses
+                            if item["type"].as_str() == Some("tool_result") {
+                                continue;
+                            }
+                            if item["type"].as_str() == Some("text")
+                                && let Some(text) = item["text"].as_str()
+                                && !text.trim().is_empty()
+                            {
+                                transcript.add_message(Message::User {
+                                    text: text.to_string(),
+                                    timestamp: timestamp.clone(),
+                                });
+                            }
+                        }
+                    } else if let Some(content) = message["content"].as_str()
+                        && !content.trim().is_empty()
+                    {
+                        transcript.add_message(Message::User {
+                            text: content.to_string(),
+                            timestamp: timestamp.clone(),
+                        });
+                    }
+                }
+                "assistant" => {
+                    if let Some(content_array) = message["content"].as_array() {
+                        for item in content_array {
+                            match item["type"].as_str() {
+                                Some("text") => {
+                                    if let Some(text) = item["text"].as_str()
+                                        && !text.trim().is_empty()
+                                    {
+                                        transcript.add_message(Message::Assistant {
+                                            text: text.to_string(),
+                                            timestamp: timestamp.clone(),
+                                        });
+                                    }
+                                }
+                                Some("thinking") => {
+                                    if let Some(thinking) = item["thinking"].as_str()
+                                        && !thinking.trim().is_empty()
+                                    {
+                                        transcript.add_message(Message::Assistant {
+                                            text: thinking.to_string(),
+                                            timestamp: timestamp.clone(),
+                                        });
+                                    }
+                                }
+                                Some("tool_use") => {
+                                    if let (Some(name), Some(_input)) =
+                                        (item["name"].as_str(), item["input"].as_object())
+                                    {
+                                        transcript.add_message(Message::ToolUse {
+                                            name: name.to_string(),
+                                            input: item["input"].clone(),
+                                            timestamp: timestamp.clone(),
+                                        });
+                                    }
+                                }
+                                _ => continue,
+                            }
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        // Model is not in the JSONL — return None
+        Ok((transcript, None))
+    }
+
+    /// Read the model from a Droid .settings.json file
+    pub fn model_from_droid_settings_json(
+        settings_path: &str,
+    ) -> Result<Option<String>, GitAiError> {
+        let content = std::fs::read_to_string(settings_path).map_err(GitAiError::IoError)?;
+        let settings: serde_json::Value =
+            serde_json::from_str(&content).map_err(GitAiError::JsonError)?;
+        Ok(settings["model"].as_str().map(|s| s.to_string()))
+    }
+
+    /// Derive JSONL and settings.json paths from a session_id and cwd.
+    /// Droid stores sessions at ~/.factory/sessions/{encoded_cwd}/{session_id}.jsonl
+    /// where encoded_cwd replaces '/' with '-'.
+    pub fn droid_session_paths(session_id: &str, cwd: &str) -> (PathBuf, PathBuf) {
+        let encoded_cwd = cwd.replace('/', "-");
+        let base = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join(".factory")
+            .join("sessions")
+            .join(&encoded_cwd);
+        let jsonl_path = base.join(format!("{}.jsonl", session_id));
+        let settings_path = base.join(format!("{}.settings.json", session_id));
+        (jsonl_path, settings_path)
     }
 }
 
 impl GithubCopilotPreset {
     /// Translate a GitHub Copilot chat session JSON file into an AiTranscript, optional model, and edited filepaths.
     /// Returns an empty transcript if running in Codespaces or Remote Containers.
+    #[allow(clippy::type_complexity)]
     pub fn transcript_and_model_from_copilot_session_json(
         session_json_path: &str,
     ) -> Result<(AiTranscript, Option<String>, Option<Vec<String>>), GitAiError> {
@@ -1302,12 +2676,84 @@ impl GithubCopilotPreset {
             return Ok((AiTranscript::new(), None, Some(Vec::new())));
         }
 
-        // Read the session JSON file
+        // Read the session JSON file.
+        // Supports both plain .json (pretty-printed or single-line) and .jsonl files
+        // where the session is wrapped in a JSONL envelope on the first line:
+        //   {"kind":0,"v":{...session data...}}
         let session_json_str =
-            std::fs::read_to_string(session_json_path).map_err(|e| GitAiError::IoError(e))?;
+            std::fs::read_to_string(session_json_path).map_err(GitAiError::IoError)?;
 
-        let session_json: serde_json::Value =
-            serde_json::from_str(&session_json_str).map_err(|e| GitAiError::JsonError(e))?;
+        // Try parsing the first line as JSON first (handles JSONL and single-line JSON).
+        // Fall back to parsing the entire content (handles pretty-printed JSON).
+        let first_line = session_json_str.lines().next().unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(first_line)
+            .or_else(|_| serde_json::from_str(&session_json_str))
+            .map_err(GitAiError::JsonError)?;
+
+        // New VS Code Copilot transcript format (1.109.3+):
+        // JSONL event stream with lines like {"type":"session.start","data":{...}}
+        if Self::looks_like_copilot_event_stream_root(&parsed) {
+            return Self::transcript_and_model_from_copilot_event_stream_jsonl(&session_json_str);
+        }
+
+        // Auto-detect JSONL wrapper: if the parsed value has "kind" and "v" fields,
+        // unwrap to use the inner "v" object as the session data
+        let is_jsonl = parsed.get("kind").is_some() && parsed.get("v").is_some();
+        let mut session_json = if is_jsonl {
+            parsed.get("v").unwrap().clone()
+        } else {
+            parsed
+        };
+
+        // Apply incremental patches from subsequent JSONL lines (kind:1 = scalar, kind:2 = array/object)
+        if is_jsonl {
+            for line in session_json_str.lines().skip(1) {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let patch: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let kind = match patch.get("kind").and_then(|v| v.as_u64()) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                if (kind == 1 || kind == 2)
+                    && let (Some(key_path), Some(value)) =
+                        (patch.get("k").and_then(|v| v.as_array()), patch.get("v"))
+                {
+                    // Walk the key path on session_json, setting the value at the leaf
+                    let keys: Vec<String> = key_path
+                        .iter()
+                        .filter_map(|k| {
+                            k.as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| k.as_u64().map(|n| n.to_string()))
+                                .or_else(|| k.as_i64().map(|n| n.to_string()))
+                        })
+                        .collect();
+                    if !keys.is_empty() {
+                        // Use pointer-based indexing to find the parent, then insert at leaf
+                        let json_pointer = if keys.len() == 1 {
+                            String::new()
+                        } else {
+                            format!("/{}", keys[..keys.len() - 1].join("/"))
+                        };
+                        let leaf_key = &keys[keys.len() - 1];
+                        let parent = if json_pointer.is_empty() {
+                            Some(&mut session_json)
+                        } else {
+                            session_json.pointer_mut(&json_pointer)
+                        };
+                        if let Some(obj) = parent.and_then(|p| p.as_object_mut()) {
+                            obj.insert(leaf_key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         // Extract the requests array which represents the conversation from start to finish
         let requests = session_json
@@ -1318,6 +2764,14 @@ impl GithubCopilotPreset {
                     "requests array not found in Copilot chat session".to_string(),
                 )
             })?;
+
+        // Extract session-level model from inputState as fallback
+        let session_level_model: Option<String> = session_json
+            .get("inputState")
+            .and_then(|is| is.get("selectedModel"))
+            .and_then(|sm| sm.get("identifier"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let mut transcript = AiTranscript::new();
         let mut detected_model: Option<String> = None;
@@ -1396,10 +2850,10 @@ impl GithubCopilotPreset {
                                                 .and_then(|v| v.as_str())
                                                 .map(|s| s.to_string())
                                         });
-                                    if let Some(p) = path_opt {
-                                        if !edited_filepaths.contains(&p) {
-                                            edited_filepaths.push(p);
-                                        }
+                                    if let Some(p) = path_opt
+                                        && !edited_filepaths.contains(&p)
+                                    {
+                                        edited_filepaths.push(p);
                                     }
                                 }
                                 transcript
@@ -1513,18 +2967,230 @@ impl GithubCopilotPreset {
             }
 
             // Detect model from request metadata if not yet set (uses first modelId seen)
-            if detected_model.is_none() {
-                if let Some(model_id) = request.get("modelId").and_then(|v| v.as_str()) {
-                    detected_model = Some(model_id.to_string());
+            if detected_model.is_none()
+                && let Some(model_id) = request.get("modelId").and_then(|v| v.as_str())
+            {
+                detected_model = Some(model_id.to_string());
+            }
+        }
+
+        // Fall back to session-level model if no per-request modelId was found
+        if detected_model.is_none() {
+            detected_model = session_level_model;
+        }
+
+        Ok((transcript, detected_model, Some(edited_filepaths)))
+    }
+
+    fn looks_like_copilot_event_stream_root(parsed: &serde_json::Value) -> bool {
+        parsed
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|event_type| {
+                parsed.get("data").map(|v| v.is_object()).unwrap_or(false)
+                    && parsed.get("kind").is_none()
+                    && (event_type.starts_with("session.")
+                        || event_type.starts_with("assistant.")
+                        || event_type.starts_with("user.")
+                        || event_type.starts_with("tool."))
+            })
+            .unwrap_or(false)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn transcript_and_model_from_copilot_event_stream_jsonl(
+        session_jsonl: &str,
+    ) -> Result<(AiTranscript, Option<String>, Option<Vec<String>>), GitAiError> {
+        let mut transcript = AiTranscript::new();
+        let mut edited_filepaths: Vec<String> = Vec::new();
+        let mut detected_model: Option<String> = None;
+
+        for line in session_jsonl.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let event: serde_json::Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let data = event.get("data");
+            let timestamp = event
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if detected_model.is_none()
+                && let Some(d) = data
+            {
+                detected_model = Self::extract_copilot_model_hint(d);
+            }
+
+            match event_type {
+                "user.message" => {
+                    if let Some(text) = data
+                        .and_then(|d| d.get("content"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        transcript.add_message(Message::User {
+                            text: text.to_string(),
+                            timestamp: timestamp.clone(),
+                        });
+                    }
                 }
+                "assistant.message" => {
+                    // Prefer visible assistant content; if empty, use reasoningText as a fallback.
+                    let assistant_text = data
+                        .and_then(|d| d.get("content"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            data.and_then(|d| d.get("reasoningText"))
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                        });
+
+                    if let Some(text) = assistant_text {
+                        transcript.add_message(Message::Assistant {
+                            text,
+                            timestamp: timestamp.clone(),
+                        });
+                    }
+
+                    if let Some(tool_requests) = data
+                        .and_then(|d| d.get("toolRequests"))
+                        .and_then(|v| v.as_array())
+                    {
+                        for request in tool_requests {
+                            let name = request
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("tool")
+                                .to_string();
+
+                            let input = request
+                                .get("arguments")
+                                .map(Self::normalize_copilot_tool_arguments)
+                                .unwrap_or(serde_json::Value::Null);
+
+                            Self::collect_copilot_filepaths(&input, &mut edited_filepaths);
+                            transcript.add_message(Message::tool_use(name, input));
+                        }
+                    }
+                }
+                "tool.execution_start" => {
+                    let name = data
+                        .and_then(|d| d.get("toolName"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool")
+                        .to_string();
+
+                    let input = data
+                        .and_then(|d| d.get("arguments"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    Self::collect_copilot_filepaths(&input, &mut edited_filepaths);
+                    transcript.add_message(Message::tool_use(name, input));
+                }
+                _ => {}
             }
         }
 
         Ok((transcript, detected_model, Some(edited_filepaths)))
     }
+
+    fn normalize_copilot_tool_arguments(value: &serde_json::Value) -> serde_json::Value {
+        if let Some(as_str) = value.as_str() {
+            serde_json::from_str::<serde_json::Value>(as_str)
+                .unwrap_or_else(|_| serde_json::Value::String(as_str.to_string()))
+        } else {
+            value.clone()
+        }
+    }
+
+    fn collect_copilot_filepaths(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, val) in map {
+                    let key_lower = key.to_ascii_lowercase();
+                    if (key_lower == "filepath"
+                        || key_lower == "file_path"
+                        || key_lower == "fspath"
+                        || key_lower == "path")
+                        && let Some(path) = val.as_str()
+                    {
+                        let normalized = path.replace('\\', "/");
+                        if !out.contains(&normalized) {
+                            out.push(normalized);
+                        }
+                    }
+                    Self::collect_copilot_filepaths(val, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    Self::collect_copilot_filepaths(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_copilot_model_hint(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(model_id) = map.get("modelId").and_then(|v| v.as_str())
+                    && model_id.starts_with("copilot/")
+                {
+                    return Some(model_id.to_string());
+                }
+                if let Some(model) = map.get("model").and_then(|v| v.as_str())
+                    && model.starts_with("copilot/")
+                {
+                    return Some(model.to_string());
+                }
+                if let Some(identifier) = map
+                    .get("selectedModel")
+                    .and_then(|v| v.get("identifier"))
+                    .and_then(|v| v.as_str())
+                    && identifier.starts_with("copilot/")
+                {
+                    return Some(identifier.to_string());
+                }
+                for val in map.values() {
+                    if let Some(found) = Self::extract_copilot_model_hint(val) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(arr) => arr.iter().find_map(Self::extract_copilot_model_hint),
+            serde_json::Value::String(s) => {
+                if s.starts_with("copilot/") {
+                    Some(s.to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 pub struct AiTabPreset;
+
+// Droid (Factory) to checkpoint preset
+pub struct DroidPreset;
 
 #[derive(Debug, Deserialize)]
 struct AiTabHookInput {

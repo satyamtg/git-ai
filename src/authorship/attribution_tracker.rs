@@ -14,6 +14,12 @@ use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 pub const INITIAL_ATTRIBUTION_TS: u128 = 42;
+const MOVE_DETECTION_MIN_FILE_BYTES: usize = 64 * 1024;
+const MOVE_DETECTION_MAX_OPS: usize = 256;
+const TOKEN_DIFF_FAST_PATH_MIN_BYTES: usize = 32 * 1024;
+const TOKEN_DIFF_FAST_PATH_MIN_LINES: usize = 256;
+const TOKEN_DIFF_FAST_PATH_HUGE_BYTES: usize = 256 * 1024;
+const TOKEN_DIFF_FAST_PATH_MAX_OPS: usize = 8;
 
 /// Represents a single attribution range in the file.
 /// Ranges can overlap (multiple authors can be attributed to the same text).
@@ -225,6 +231,7 @@ struct Token {
     lexeme: String,
     start: usize,
     end: usize,
+    #[allow(dead_code)]
     line: usize,
 }
 
@@ -388,7 +395,7 @@ impl AttributionTracker {
             if start < end {
                 diffs.push(ByteDiff::new(
                     ByteDiffOp::Equal,
-                    old_content[start..end].as_bytes(),
+                    &old_content.as_bytes()[start..end],
                 ));
             }
 
@@ -421,6 +428,31 @@ impl AttributionTracker {
         let (new_start, new_end) =
             line_range_to_byte_range(new_lines, new_start_line, new_end_line, new_content.len());
 
+        if should_use_line_aligned_hunk_diff(
+            ops,
+            old_end_line.saturating_sub(old_start_line),
+            new_end_line.saturating_sub(new_start_line),
+            old_end.saturating_sub(old_start),
+            new_end.saturating_sub(new_start),
+        ) {
+            append_range_diffs(
+                &mut computation.diffs,
+                old_content,
+                new_content,
+                (old_start, old_end),
+                (new_start, new_end),
+                true,
+            );
+            if new_start < new_end
+                && !data_is_whitespace(&new_content.as_bytes()[new_start..new_end])
+            {
+                computation
+                    .substantive_new_ranges
+                    .push((new_start, new_end));
+            }
+            return Ok(());
+        }
+
         let (mut hunk_diffs, substantive_ranges) = build_token_aligned_diffs(
             old_content,
             new_content,
@@ -433,7 +465,7 @@ impl AttributionTracker {
         computation.diffs.append(&mut hunk_diffs);
         computation
             .substantive_new_ranges
-            .extend(substantive_ranges.into_iter());
+            .extend(substantive_ranges);
 
         Ok(())
     }
@@ -447,43 +479,33 @@ impl AttributionTracker {
         ts: u128,
     ) -> Vec<Attribution> {
         let mut attributions = prev_attributions.to_vec();
-        let mut unattributed_char_idxs = Vec::new();
+        let mut range_start: Option<usize> = None;
 
-        // Find all unattributed character positions
-        for i in 0..content.len() {
-            if !attributions.iter().any(|a| a.overlaps(i, i + 1)) {
-                unattributed_char_idxs.push(i);
-            }
-        }
+        // Find all unattributed character ranges on UTF-8 boundaries.
+        for (idx, ch) in content.char_indices() {
+            let end = idx + ch.len_utf8();
+            let covered = attributions.iter().any(|a| a.overlaps(idx, end));
 
-        // Sort the unattributed character indices by position
-        unattributed_char_idxs.sort();
-
-        // Group contiguous unattributed ranges
-        let mut contiguous_ranges = Vec::new();
-        if !unattributed_char_idxs.is_empty() {
-            let mut start = unattributed_char_idxs[0];
-            let mut end = start + 1;
-
-            for i in 1..unattributed_char_idxs.len() {
-                let current = unattributed_char_idxs[i];
-                if current == end {
-                    // Contiguous with previous range
-                    end = current + 1;
-                } else {
-                    // Gap found, save current range and start new one
-                    contiguous_ranges.push((start, end));
-                    start = current;
-                    end = current + 1;
+            if covered {
+                if let Some(start) = range_start.take()
+                    && start < idx
+                {
+                    attributions.push(Attribution::new(start, idx, author.to_string(), ts));
                 }
+            } else if range_start.is_none() {
+                range_start = Some(idx);
             }
-            // Don't forget the last range
-            contiguous_ranges.push((start, end));
         }
 
-        // Create attributions for each contiguous unattributed range
-        for (start, end) in contiguous_ranges {
-            attributions.push(Attribution::new(start, end, author.to_string(), ts));
+        if let Some(start) = range_start.take()
+            && start < content.len()
+        {
+            attributions.push(Attribution::new(
+                start,
+                content.len(),
+                author.to_string(),
+                ts,
+            ));
         }
 
         attributions
@@ -507,6 +529,12 @@ impl AttributionTracker {
         current_author: &str,
         ts: u128,
     ) -> Result<Vec<Attribution>, GitAiError> {
+        // Cursor-based scans in transform_attributions assume sorted ranges.
+        // Normalize once at the boundary so callers can pass ranges in any order.
+        let sorted_old_storage = (!is_attribution_list_sorted(old_attributions))
+            .then(|| sort_attributions_for_transform(old_attributions));
+        let old_attributions = sorted_old_storage.as_deref().unwrap_or(old_attributions);
+
         // Phase 1: Compute diff
         let diff_result = self.compute_diffs(old_content, new_content)?;
 
@@ -514,7 +542,12 @@ impl AttributionTracker {
         let (deletions, insertions) = self.build_diff_catalog(&diff_result.diffs);
 
         // Phase 3: Detect move operations
-        let move_mappings = self.detect_moves(old_content, new_content, &deletions, &insertions);
+        let move_mappings =
+            if self.should_skip_move_detection(old_content, new_content, &deletions, &insertions) {
+                Vec::new()
+            } else {
+                self.detect_moves(old_content, new_content, &deletions, &insertions)
+            };
 
         // Phase 4: Transform attributions through the diff
         let new_attributions = self.transform_attributions(
@@ -529,6 +562,43 @@ impl AttributionTracker {
 
         // Phase 5: Merge and clean up
         Ok(self.merge_attributions(new_attributions))
+    }
+
+    fn should_skip_move_detection(
+        &self,
+        old_content: &str,
+        new_content: &str,
+        deletions: &[Deletion],
+        insertions: &[Insertion],
+    ) -> bool {
+        if self.config.move_lines_threshold == 0 {
+            return true;
+        }
+        if deletions.is_empty() || insertions.is_empty() {
+            return true;
+        }
+
+        let max_file_bytes = old_content.len().max(new_content.len());
+        let operation_count = deletions.len().saturating_add(insertions.len());
+        if max_file_bytes < MOVE_DETECTION_MIN_FILE_BYTES
+            && operation_count <= MOVE_DETECTION_MAX_OPS
+        {
+            return false;
+        }
+
+        let deleted_bytes: usize = deletions
+            .iter()
+            .map(|deletion| deletion.end.saturating_sub(deletion.start))
+            .sum();
+        let inserted_bytes: usize = insertions
+            .iter()
+            .map(|insertion| insertion.end.saturating_sub(insertion.start))
+            .sum();
+        let changed_bytes = deleted_bytes.saturating_add(inserted_bytes);
+
+        operation_count > MOVE_DETECTION_MAX_OPS
+            || (max_file_bytes >= MOVE_DETECTION_MIN_FILE_BYTES
+                && changed_bytes >= max_file_bytes.saturating_mul(3) / 2)
     }
 
     /// Build catalogs of deletions and insertions from the diff
@@ -736,6 +806,7 @@ impl AttributionTracker {
     }
 
     /// Transform attributions through the diff
+    #[allow(clippy::too_many_arguments)]
     fn transform_attributions(
         &self,
         diffs: &[ByteDiff],
@@ -775,6 +846,8 @@ impl AttributionTracker {
         let mut deletion_idx = 0;
         let mut insertion_idx = 0;
         let mut prev_whitespace_delete = false;
+        let mut old_attr_cursor = 0usize;
+        let mut insertion_attr_cursor = 0usize;
 
         for diff in diffs {
             let op = diff.op();
@@ -786,7 +859,17 @@ impl AttributionTracker {
                     let old_range = (old_pos, old_pos + len);
                     let new_range = (new_pos, new_pos + len);
 
-                    for attr in old_attributions {
+                    while old_attr_cursor < old_attributions.len()
+                        && old_attributions[old_attr_cursor].end <= old_range.0
+                    {
+                        old_attr_cursor += 1;
+                    }
+                    let mut attr_idx = old_attr_cursor;
+                    while attr_idx < old_attributions.len() {
+                        let attr = &old_attributions[attr_idx];
+                        if attr.start >= old_range.1 {
+                            break;
+                        }
                         if let Some((overlap_start, overlap_end)) =
                             attr.intersection(old_range.0, old_range.1)
                         {
@@ -798,9 +881,10 @@ impl AttributionTracker {
                                 new_range.0 + offset_in_range,
                                 new_range.0 + offset_in_range + overlap_len,
                                 attr.author_id.clone(),
-                                attr.ts.clone(),
+                                attr.ts,
                             ));
                         }
+                        attr_idx += 1;
                     }
 
                     old_pos += len;
@@ -820,7 +904,17 @@ impl AttributionTracker {
                             if source_start < source_end {
                                 let target_start = insertion.start + mapping.target_range.0;
 
-                                for attr in old_attributions {
+                                while old_attr_cursor < old_attributions.len()
+                                    && old_attributions[old_attr_cursor].end <= source_start
+                                {
+                                    old_attr_cursor += 1;
+                                }
+                                let mut attr_idx = old_attr_cursor;
+                                while attr_idx < old_attributions.len() {
+                                    let attr = &old_attributions[attr_idx];
+                                    if attr.start >= source_end {
+                                        break;
+                                    }
                                     if let Some((overlap_start, overlap_end)) =
                                         attr.intersection(source_start, source_end)
                                     {
@@ -837,6 +931,7 @@ impl AttributionTracker {
                                             ));
                                         }
                                     }
+                                    attr_idx += 1;
                                 }
                             }
                         }
@@ -916,16 +1011,19 @@ impl AttributionTracker {
                     let is_substantive_insert =
                         ranges_intersect(substantive_new_ranges, insertion_range);
                     let is_whitespace_only = data_is_whitespace(diff.data());
-                    let contains_newline = diff.data().iter().any(|b| *b == b'\n');
+                    let contains_newline = diff.data().contains(&b'\n');
                     let is_formatting_pair = prev_whitespace_delete && is_whitespace_only;
+                    #[allow(clippy::if_same_then_else)]
                     let (author_id, attribution_ts) = if contains_newline {
                         (current_author.to_string(), ts)
                     } else if is_substantive_insert {
                         (current_author.to_string(), ts)
                     } else if is_formatting_pair {
-                        if let Some(attr) =
-                            find_attribution_for_insertion(old_attributions, old_pos)
-                        {
+                        if let Some(attr) = find_attribution_for_insertion(
+                            old_attributions,
+                            old_pos,
+                            &mut insertion_attr_cursor,
+                        ) {
                             (attr.author_id.clone(), attr.ts)
                         } else if let Some(attr) = new_attributions.last() {
                             (attr.author_id.clone(), attr.ts)
@@ -934,9 +1032,11 @@ impl AttributionTracker {
                         }
                     } else if let Some(attr) = new_attributions.last() {
                         (attr.author_id.clone(), attr.ts)
-                    } else if let Some(attr) =
-                        find_attribution_for_insertion(old_attributions, old_pos)
-                    {
+                    } else if let Some(attr) = find_attribution_for_insertion(
+                        old_attributions,
+                        old_pos,
+                        &mut insertion_attr_cursor,
+                    ) {
                         (attr.author_id.clone(), attr.ts)
                     } else {
                         (current_author.to_string(), ts)
@@ -965,13 +1065,36 @@ impl AttributionTracker {
             return attributions;
         }
 
-        // Sort by start position
-        attributions.sort_by_key(|a| (a.start, a.end, a.author_id.clone()));
+        // Sort by position first, then stable author/timestamp metadata.
+        attributions.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then_with(|| a.end.cmp(&b.end))
+                .then_with(|| a.author_id.cmp(&b.author_id))
+                .then_with(|| a.ts.cmp(&b.ts))
+        });
 
         // Remove exact duplicates
         attributions.dedup();
 
-        attributions
+        // Coalesce adjacent/overlapping ranges with identical attribution metadata.
+        // This keeps attribution vectors compact during long rewrite chains.
+        let mut merged: Vec<Attribution> = Vec::with_capacity(attributions.len());
+        for attr in attributions {
+            if let Some(last) = merged.last_mut()
+                && last.author_id == attr.author_id
+                && last.ts == attr.ts
+                && last.start < last.end
+                && attr.start < attr.end
+                && attr.start <= last.end
+            {
+                last.end = last.end.max(attr.end);
+                continue;
+            }
+            merged.push(attr);
+        }
+
+        merged
     }
 }
 
@@ -1025,6 +1148,25 @@ fn hunk_line_bounds(ops: &[DiffOp], for_old: bool) -> (usize, usize) {
     }
 }
 
+fn should_use_line_aligned_hunk_diff(
+    ops: &[DiffOp],
+    changed_old_lines: usize,
+    changed_new_lines: usize,
+    changed_old_bytes: usize,
+    changed_new_bytes: usize,
+) -> bool {
+    if ops.is_empty() || ops.len() > TOKEN_DIFF_FAST_PATH_MAX_OPS {
+        return false;
+    }
+
+    let changed_lines = changed_old_lines.max(changed_new_lines);
+    let changed_bytes = changed_old_bytes.max(changed_new_bytes);
+
+    changed_bytes >= TOKEN_DIFF_FAST_PATH_HUGE_BYTES
+        || (changed_bytes >= TOKEN_DIFF_FAST_PATH_MIN_BYTES
+            && changed_lines >= TOKEN_DIFF_FAST_PATH_MIN_LINES)
+}
+
 fn line_range_to_byte_range(
     lines: &[LineMetadata],
     start_idx: usize,
@@ -1056,8 +1198,30 @@ fn line_range_to_byte_range(
 fn is_operator_or_delimiter(ch: char) -> bool {
     matches!(
         ch,
-        '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!' | '&' | '|' | '^' | '~' | '?' | '@'
-            | ';' | ',' | '.' | ':' | '(' | ')' | '{' | '}' | '[' | ']'
+        '+' | '-'
+            | '*'
+            | '/'
+            | '%'
+            | '='
+            | '<'
+            | '>'
+            | '!'
+            | '&'
+            | '|'
+            | '^'
+            | '~'
+            | '?'
+            | '@'
+            | ';'
+            | ','
+            | '.'
+            | ':'
+            | '('
+            | ')'
+            | '{'
+            | '}'
+            | '['
+            | ']'
     )
 }
 
@@ -1178,14 +1342,27 @@ fn tokenize_non_whitespace(
         }
 
         // Numbers (including hex, octal, binary, floats, scientific notation)
-        if ch.is_ascii_digit() || (ch == '.' && i + ch_len < end && content[i + ch_len..].chars().next().map_or(false, |c| c.is_ascii_digit())) {
+        if ch.is_ascii_digit()
+            || (ch == '.'
+                && i + ch_len < end
+                && content[i + ch_len..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit()))
+        {
             let mut lexeme = String::new();
             let token_start = i;
 
             // Handle hex (0x), octal (0o), binary (0b) prefixes
             if ch == '0' && i + 1 < end {
                 let next_ch = content[i + 1..].chars().next().unwrap();
-                if next_ch == 'x' || next_ch == 'X' || next_ch == 'o' || next_ch == 'O' || next_ch == 'b' || next_ch == 'B' {
+                if next_ch == 'x'
+                    || next_ch == 'X'
+                    || next_ch == 'o'
+                    || next_ch == 'O'
+                    || next_ch == 'b'
+                    || next_ch == 'B'
+                {
                     lexeme.push(ch);
                     lexeme.push(next_ch);
                     i += 1 + next_ch.len_utf8();
@@ -1392,7 +1569,7 @@ fn build_token_aligned_diffs(
 
                     diffs.push(ByteDiff::new(
                         ByteDiffOp::Equal,
-                        new_content[new_token.start..new_token.end].as_bytes(),
+                        &new_content.as_bytes()[new_token.start..new_token.end],
                     ));
 
                     old_cursor = old_token.end;
@@ -1421,7 +1598,7 @@ fn build_token_aligned_diffs(
 
                 diffs.push(ByteDiff::new(
                     ByteDiffOp::Delete,
-                    old_content[start..end].as_bytes(),
+                    &old_content.as_bytes()[start..end],
                 ));
 
                 old_cursor = end;
@@ -1448,7 +1625,7 @@ fn build_token_aligned_diffs(
 
                 diffs.push(ByteDiff::new(
                     ByteDiffOp::Insert,
-                    new_content[start..end].as_bytes(),
+                    &new_content.as_bytes()[start..end],
                 ));
 
                 substantive_ranges.push((start, end));
@@ -1483,7 +1660,7 @@ fn build_token_aligned_diffs(
                     let old_end_pos = old_tokens[old_index + old_len - 1].end;
                     diffs.push(ByteDiff::new(
                         ByteDiffOp::Delete,
-                        old_content[old_start_pos..old_end_pos].as_bytes(),
+                        &old_content.as_bytes()[old_start_pos..old_end_pos],
                     ));
                     old_cursor = old_end_pos;
                 } else {
@@ -1494,7 +1671,7 @@ fn build_token_aligned_diffs(
                     let new_end_pos = new_tokens[new_index + new_len - 1].end;
                     diffs.push(ByteDiff::new(
                         ByteDiffOp::Insert,
-                        new_content[new_start_pos..new_end_pos].as_bytes(),
+                        &new_content.as_bytes()[new_start_pos..new_end_pos],
                     ));
                     substantive_ranges.push((new_start_pos, new_end_pos));
                     new_cursor = new_end_pos;
@@ -1564,29 +1741,72 @@ fn ranges_intersect(ranges: &[(usize, usize)], target: (usize, usize)) -> bool {
     false
 }
 
+fn compare_attribution_order(a: &Attribution, b: &Attribution) -> Ordering {
+    a.start
+        .cmp(&b.start)
+        .then_with(|| a.end.cmp(&b.end))
+        .then_with(|| a.author_id.cmp(&b.author_id))
+        .then_with(|| a.ts.cmp(&b.ts))
+}
+
+fn is_attribution_list_sorted(attributions: &[Attribution]) -> bool {
+    attributions
+        .windows(2)
+        .all(|pair| compare_attribution_order(&pair[0], &pair[1]) != Ordering::Greater)
+}
+
+fn sort_attributions_for_transform(attributions: &[Attribution]) -> Vec<Attribution> {
+    let mut sorted = attributions.to_vec();
+    sorted.sort_by(compare_attribution_order);
+    sorted
+}
+
 fn find_attribution_for_insertion<'a>(
     old_attributions: &'a [Attribution],
     position: usize,
+    cursor_hint: &mut usize,
 ) -> Option<&'a Attribution> {
-    if let Some(overlapping) = old_attributions
-        .iter()
-        .filter(|a| a.overlaps(position, position.saturating_add(1)))
-        .max_by(|a, b| {
-            a.ts.cmp(&b.ts)
-                .then_with(|| (a.end - a.start).cmp(&(b.end - b.start)))
-        })
-    {
-        return Some(overlapping);
+    if old_attributions.is_empty() {
+        return None;
     }
 
-    let before = old_attributions
-        .iter()
-        .filter(|a| a.end <= position)
-        .max_by_key(|a| a.end);
+    while *cursor_hint < old_attributions.len() && old_attributions[*cursor_hint].end <= position {
+        *cursor_hint += 1;
+    }
+
+    let mut best_overlap: Option<&Attribution> = None;
+    let mut idx = *cursor_hint;
+    while idx < old_attributions.len() {
+        let attr = &old_attributions[idx];
+        if attr.start > position {
+            break;
+        }
+        let better_than_current = match best_overlap {
+            None => true,
+            Some(best) => {
+                attr.ts > best.ts
+                    || (attr.ts == best.ts && (attr.end - attr.start) > (best.end - best.start))
+            }
+        };
+        if attr.overlaps(position, position.saturating_add(1)) && better_than_current {
+            best_overlap = Some(attr);
+        }
+        idx += 1;
+    }
+
+    if best_overlap.is_some() {
+        return best_overlap;
+    }
+
+    let before = if *cursor_hint > 0 {
+        Some(&old_attributions[*cursor_hint - 1])
+    } else {
+        None
+    };
     let after = old_attributions
         .iter()
-        .filter(|a| a.start >= position)
-        .min_by_key(|a| a.start);
+        .skip(*cursor_hint)
+        .find(|a| a.start >= position);
 
     before.or(after)
 }
@@ -1609,7 +1829,7 @@ impl Default for AttributionTracker {
 
 /// Helper struct to track line boundaries in content
 struct LineBoundaries {
-    /// Maps line number (1-indexed) to (start_char, end_char) exclusive end
+    /// Maps line number (1-indexed) to (start_byte, end_byte) exclusive end
     line_ranges: Vec<(usize, usize)>,
 }
 
@@ -1647,6 +1867,22 @@ impl LineBoundaries {
             Some(self.line_ranges[line_num as usize - 1])
         }
     }
+}
+
+fn floor_char_boundary(content: &str, idx: usize) -> usize {
+    let mut i = idx.min(content.len());
+    while i > 0 && !content.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(content: &str, idx: usize) -> usize {
+    let mut i = idx.min(content.len());
+    while i < content.len() && !content.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 /// Convert line-based attributions to character-based attributions.
@@ -1699,7 +1935,7 @@ pub fn line_attributions_to_attributions(
 /// # Returns
 /// A vector of line attributions with consecutive lines by the same author merged
 pub fn attributions_to_line_attributions(
-    attributions: &Vec<Attribution>,
+    attributions: &[Attribution],
     content: &str,
 ) -> Vec<LineAttribution> {
     if content.is_empty() || attributions.is_empty() {
@@ -1713,13 +1949,45 @@ pub fn attributions_to_line_attributions(
         return Vec::new();
     }
 
-    // For each line, determine the dominant author
+    let mut sorted_indices: Vec<usize> = (0..attributions.len()).collect();
+    sorted_indices.sort_by_key(|&idx| (attributions[idx].start, attributions[idx].end, idx));
+
+    let mut next_idx = 0usize;
+    let mut active_indices: Vec<usize> = Vec::new();
+
+    // For each line, determine the dominant author using a sweep over overlapping ranges.
     let mut line_authors: Vec<Option<(String, Option<String>)>> =
         Vec::with_capacity(line_count as usize);
 
     for line_num in 1..=line_count {
-        let (author, overrode) =
-            find_dominant_author_for_line(line_num, &boundaries, attributions, content);
+        let Some((line_start, line_end)) = boundaries.get_line_range(line_num) else {
+            line_authors.push(Some((CheckpointKind::Human.to_str(), None)));
+            continue;
+        };
+
+        while next_idx < sorted_indices.len()
+            && attributions[sorted_indices[next_idx]].start < line_end
+        {
+            active_indices.push(sorted_indices[next_idx]);
+            next_idx += 1;
+        }
+
+        active_indices.retain(|&attr_idx| {
+            let attr = &attributions[attr_idx];
+            attr.start < line_end && attr.end > line_start
+        });
+
+        let line_content = &content[line_start..line_end];
+        let is_line_empty =
+            line_content.is_empty() || line_content.chars().all(|c| c.is_whitespace());
+        let (author, overrode) = find_dominant_author_for_line_candidates(
+            line_start,
+            line_end,
+            is_line_empty,
+            &active_indices,
+            attributions,
+            content,
+        );
         line_authors.push(Some((author, overrode)));
     }
 
@@ -1733,33 +2001,48 @@ pub fn attributions_to_line_attributions(
     merged_line_authors
 }
 
-/// Find the dominant author for a specific line based on non-whitespace character count
-fn find_dominant_author_for_line(
-    line_num: u32,
-    boundaries: &LineBoundaries,
-    attributions: &Vec<Attribution>,
+/// Find the dominant author for a specific line from overlapping attribution candidates.
+fn find_dominant_author_for_line_candidates(
+    line_start: usize,
+    line_end: usize,
+    is_line_empty: bool,
+    candidate_indices: &[usize],
+    attributions: &[Attribution],
     full_content: &str,
 ) -> (String, Option<String>) {
-    let (line_start, line_end) = boundaries.get_line_range(line_num).unwrap();
-    let line_content = &full_content[line_start..line_end];
-    let is_line_empty = line_content.is_empty() || line_content.chars().all(|c| c.is_whitespace());
-
-    let mut candidate_attrs = Vec::new();
-    for attribution in attributions {
+    let mut candidate_attrs: Vec<&Attribution> = Vec::new();
+    for &attr_idx in candidate_indices {
+        let attribution = &attributions[attr_idx];
         if !attribution.overlaps(line_start, line_end) {
             continue;
         }
 
         // Get the substring of the content on this line that is covered by the attribution
-        let content_slice = &full_content[std::cmp::max(line_start, attribution.start)
-            ..std::cmp::min(line_end, attribution.end)];
-        let attr_non_whitespace_count =
-            content_slice.chars().filter(|c| !c.is_whitespace()).count();
+        let slice_start = std::cmp::max(line_start, attribution.start);
+        let slice_end = std::cmp::min(line_end, attribution.end);
+        let mut has_non_whitespace = false;
+        if slice_start < slice_end {
+            let safe_start = if full_content.is_char_boundary(slice_start) {
+                slice_start
+            } else {
+                floor_char_boundary(full_content, slice_start).max(line_start)
+            };
+            let safe_end = if full_content.is_char_boundary(slice_end) {
+                slice_end
+            } else {
+                ceil_char_boundary(full_content, slice_end).min(line_end)
+            };
+
+            if safe_start < safe_end {
+                let content_slice = &full_content[safe_start..safe_end];
+                has_non_whitespace = content_slice.chars().any(|c| !c.is_whitespace());
+            }
+        }
         // Zero-length attributions are deletion markers - they indicate the author
         // deleted content at this position, so they should influence line attribution
         let is_deletion_marker = attribution.start == attribution.end;
-        if attr_non_whitespace_count > 0 || is_line_empty || is_deletion_marker {
-            candidate_attrs.push(attribution.clone());
+        if has_non_whitespace || is_line_empty || is_deletion_marker {
+            candidate_attrs.push(attribution);
         } else {
             // If the attribution is only whitespace, discard it
             continue;
@@ -1770,21 +2053,23 @@ fn find_dominant_author_for_line(
         return (CheckpointKind::Human.to_str(), None);
     }
 
-    // Choose the author with the latest timestamp
-    let latest_timestamp = candidate_attrs.iter().max_by_key(|a| a.ts).unwrap().ts;
-    let latest_author = candidate_attrs
-        .iter()
-        .filter(|a| a.ts == latest_timestamp)
-        .map(|a| a.author_id.clone())
-        .collect::<Vec<String>>();
-    let last_ai_edit = candidate_attrs
-        .iter()
-        .filter(|a| a.author_id != CheckpointKind::Human.to_str())
-        .last();
-    let last_human_edit = candidate_attrs
-        .iter()
-        .filter(|a| a.author_id == CheckpointKind::Human.to_str())
-        .last();
+    // Choose the author with the latest timestamp (keep first match on ties).
+    let mut latest_author = candidate_attrs[0];
+    for attr in candidate_attrs.iter().skip(1) {
+        if attr.ts > latest_author.ts {
+            latest_author = attr;
+        }
+    }
+
+    let mut last_ai_edit: Option<&Attribution> = None;
+    let mut last_human_edit: Option<&Attribution> = None;
+    for attr in &candidate_attrs {
+        if attr.author_id == CheckpointKind::Human.to_str() {
+            last_human_edit = Some(attr);
+        } else {
+            last_ai_edit = Some(attr);
+        }
+    }
     let overrode = match (last_ai_edit, last_human_edit) {
         (Some(ai), Some(h)) => {
             if h.ts > ai.ts {
@@ -1795,7 +2080,7 @@ fn find_dominant_author_for_line(
         }
         _ => None,
     };
-    return (latest_author[0].clone(), overrode);
+    (latest_author.author_id.clone(), overrode)
 }
 
 /// Merge consecutive lines with the same author into LineAttribution ranges
@@ -1941,6 +2226,92 @@ mod tests {
             "Alice",
             "indentation change should not steal tokens",
         );
+    }
+
+    #[test]
+    fn large_file_small_edit_preserves_unchanged_tokens() {
+        let tracker = AttributionTracker::new();
+
+        let mut old = String::new();
+        for i in 0..1400 {
+            old.push_str(&format!("const V{:04} = {};\n", i, i));
+        }
+        let mut new = old.clone();
+        new = new.replace("const V0700 = 700;", "const V0700 = 9999;");
+
+        let old_attrs = vec![Attribution::new(0, old.len(), "Alice".into(), TEST_TS)];
+        let updated = tracker
+            .update_attributions(&old, &new, &old_attrs, "Bob", TEST_TS + 1)
+            .unwrap();
+
+        let changed_pos = new.find("9999").expect("changed token");
+        assert_range_owned_by(&updated, changed_pos, changed_pos + "9999".len(), "Bob");
+
+        let unchanged_pos = new.find("V0001").expect("unchanged token");
+        assert_range_owned_by(
+            &updated,
+            unchanged_pos,
+            unchanged_pos + "V0001".len(),
+            "Alice",
+        );
+    }
+
+    #[test]
+    fn unsorted_ranges_preserve_existing_lines_across_insertions() {
+        let tracker = AttributionTracker::new();
+        let old = "function example() {\n  return 42;\n}\n";
+        let new = "// Header comment\nfunction example() {\n  // Added documentation\n  return 42;\n}\n// Footer\n";
+
+        // Intentionally unsorted line ranges to mimic out-of-order caller input.
+        let unsorted_line_attrs = vec![
+            LineAttribution::new(2, 2, "Alice".to_string(), None),
+            LineAttribution::new(1, 1, "Alice".to_string(), None),
+            LineAttribution::new(3, 3, "Alice".to_string(), None),
+        ];
+        let old_attrs = line_attributions_to_attributions(&unsorted_line_attrs, old, TEST_TS);
+        assert!(!is_attribution_list_sorted(&old_attrs));
+
+        let updated = tracker
+            .update_attributions(old, new, &old_attrs, "Bob", TEST_TS + 1)
+            .unwrap();
+
+        let function_pos = new.find("function example() {").unwrap();
+        assert_range_owned_by(
+            &updated,
+            function_pos,
+            function_pos + "function example() {".len(),
+            "Alice",
+        );
+
+        let return_pos = new.find("return 42;").unwrap();
+        assert_range_owned_by(
+            &updated,
+            return_pos,
+            return_pos + "return 42;".len(),
+            "Alice",
+        );
+
+        let brace_pos = new.rfind("\n}\n").unwrap() + 1;
+        assert_range_owned_by(&updated, brace_pos, brace_pos + 1, "Alice");
+
+        let header_pos = new.find("// Header comment").unwrap();
+        assert_range_owned_by(
+            &updated,
+            header_pos,
+            header_pos + "// Header comment".len(),
+            "Bob",
+        );
+
+        let docs_pos = new.find("// Added documentation").unwrap();
+        assert_range_owned_by(
+            &updated,
+            docs_pos,
+            docs_pos + "// Added documentation".len(),
+            "Bob",
+        );
+
+        let footer_pos = new.find("// Footer").unwrap();
+        assert_range_owned_by(&updated, footer_pos, footer_pos + "// Footer".len(), "Bob");
     }
 
     #[test]
@@ -2124,6 +2495,15 @@ mod tests {
                 .any(|a| a.author_id == "Bob" && a.start >= old.len()),
             "New multibyte tokens should belong to Bob"
         );
+    }
+
+    #[test]
+    fn line_attribution_handles_split_multibyte_ranges() {
+        let content = "选\n";
+        let attrs = vec![Attribution::new(0, 1, "Alice".into(), TEST_TS)];
+        let line_attrs = attributions_to_line_attributions(&attrs, content);
+        assert_eq!(line_attrs.len(), 1);
+        assert_eq!(line_attrs[0].author_id, "Alice");
     }
 
     #[test]

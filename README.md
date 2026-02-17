@@ -1,12 +1,15 @@
 <div>
-<img src="https://github.com/acunniffe/git-ai/raw/main/assets/docs/git-ai.png" align="right"
-     alt="Git AI by acunniffe/git-ai" width="100" height="100" />
+<img src="https://github.com/git-ai-project/git-ai/raw/main/assets/docs/git-ai.png" align="right"
+     alt="Git AI by git-ai-project/git-ai" width="100" height="100" />
 
 </div>
 <div>
 <h1 align="left"><b>git-ai</b></h1>
 </div>
 <p align="left">Track the AI Code in your repositories</p>
+<p align="left">
+  <a href="https://discord.gg/XJStYvkb5U"><img alt="Discord" src="https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white" /></a>
+</p>
 
 <video src="https://github.com/user-attachments/assets/68304ca6-b262-4638-9fb6-0a26f55c7986" muted loop controls autoplay></video>
 
@@ -21,52 +24,34 @@ curl -sSL https://usegitai.com/install.sh | bash
 #### Windows (non-WSL)
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm http://usegitai.com/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://usegitai.com/install.ps1 | iex"
 ```
 
 🎊 That's it! **No per-repo setup.** Once installed Git AI will work OOTB with any of these **Supported Agents**:
 
-<img src="https://github.com/acunniffe/git-ai/raw/main/assets/docs/supported-agents.png" width="320" />
+<img width="933" height="364" alt="code-tracking" src="https://github.com/user-attachments/assets/99ab05b1-97a9-4100-8ade-8ea8a227627b" />
 
-### Next step: **Just code and commit!**
+### Documentation https://usegitai.com/docs
+- [AI Blame](https://usegitai.com/docs/cli/ai-blame)
+- [Cross-Agent Prompt Saving](https://usegitai.com/docs/cli/prompt-storage)
+- [CLI Reference](https://usegitai.com/docs/cli/reference)
+- [Configuring Git AI for the enterprise](https://usegitai.com/docs/cli/configuration)
 
-Once installed, all your Coding Agents will call Git AI in the background and mark the code they generate AI-authored.
+### Just Install and Commit
 
-After you commit, `git-ai` adds a git note to track which lines were AI-authored and scores each commit:
+Build as usual. Just prompt, edit and commit. Git AI will track every line of AI-Code and record the Coding Agent, Model, and prompt that generated it. 
 
-<img src="https://github.com/acunniffe/git-ai/raw/main/assets/docs/graph.jpg" width="400" />
+<img src="https://github.com/git-ai-project/git-ai/raw/main/assets/docs/graph.jpg" width="400" />
 
-## Installing the Stats Bot (early access)
+#### How Does it work? 
 
-Aggregate `git-ai` data at the PR, developer, Repository and Organization levels:
+Supported Coding Agents call Git AI and mark the lines they insert as AI-generated. 
 
-- AI authorship breakdown for every Pull Request
-- Measure % of code that is AI generated through the entire SDLC
-- Compare accepted-rate for code written by each Agent + Model. 
-- AI-Code Halflife (how durable is the AI code)
-> [Get early access by chatting with the maintainers](https://calendly.com/acunniffe/meeting-with-git-ai-authors)
+On commit, Git AI saves the final AI-attributions into a Git Note. These notes power AI-Blame, AI contribution stats, and more. The CLI makes sure these notes are preserved through rebases, merges, squashes, cherry-picks, etc.
 
-![alt](https://github.com/acunniffe/git-ai/raw/main/assets/docs/dashboard.png)
+![Git Tree](https://github.com/user-attachments/assets/edd20990-ec0b-4a53-afa4-89fa33de9541)
 
-## Prompt Storage
-By default Git AI stores prompt data locally only. To include prompts in git notes (authorship logs), set `prompt_storage` to `notes`:
-
-```bash
-git-ai config set prompt_storage notes
-```
-
-When using notes mode, you can exclude specific repositories from having prompt data included:
-
-```bash
-git-ai config set --add exclude_prompts_in_repositories https://github.com/private-org/*
-git-ai config set --add exclude_prompts_in_repositories /path/to/private/repo
-```
-
-*or to exclude all repositories:*
-
-```bash
-git-ai config set --add exclude_prompts_in_repositories "*"
-```
+The format of the notes is outlined here in the [Git AI Standard v3.0.0](https://github.com/git-ai-project/git-ai/blob/main/specs/git_ai_standard_v3.0.0.md)
 
 ## Goals of `git-ai` project
 
@@ -80,35 +65,43 @@ git-ai config set --add exclude_prompts_in_repositories "*"
 
 🚀 **Git-native + Fast** - `git-ai` is built on git plumbing commands. Negligible impact even in large repos (&lt;100ms). Tested in [Chromium](https://github.com/chromium/chromium).
 
-## [Documentation](https://usegitai.com/docs)
-
-- How Git AI Works and its Limitations [▶️ Video](https://www.youtube.com/watch?v=b_DZTC1PKHI) [🗺️ Diagram](https://usegitai.com/docs/how-git-ai-works)
-- [Git AI Commands](https://usegitai.com/docs/reference)
-- [Configuring Git AI for the enterprise](https://usegitai.com/docs/administration/enterprise-configuration)
-
 ## Agent Support
 
 `git-ai` automatically sets up all supported agent hooks using the `git-ai install-hooks` command
 
 | Agent/IDE                                                                                  | Authorship | Prompts |
 | ------------------------------------------------------------------------------------------ | ---------- | ------- |
-| Cursor &gt;1.7                                                                             | ✅         | ✅      |
 | Claude Code                                                                                | ✅         | ✅      |
+| OpenAI Codex                                                                               | ✅         | ✅      |
+| Cursor                                                                                     | ✅         | ✅      |
 | GitHub Copilot in VSCode via Extension                                                     | ✅         | ✅      |
-| Google Gemini CLI                                                                          | ✅         | ✅      |
-| Continue CLI                                                                               | ✅         | ✅      |
 | OpenCode                                                                                   | ✅         | ✅      |
+| Google Gemini CLI                                                                          | ✅         | ✅      |
+| Droid CLI (Factory AI)                                                                     | ✅         | ✅      |
+| Continue CLI                                                                               | ✅         | ✅      |
 | Atlassian RovoDev CLI                                                                      | ✅         | ✅      |
+| GitHub Copilot in Jetbrains IDEs (IntelliJ, etc.)                                          | ✅         | 🔄      |
+| Jetbrains Junie                                                                            | ✅         | 🔄      |
+| Amp (in-progress)                                                                          | 🔄         | 🔄      |
 | AWS Kiro (in-progress)                                                                     | 🔄         | 🔄      |
 | Continue VS Code/IntelliJ (in-progress)                                                    | 🔄         | 🔄      |
-| Windsurf                                                                                   | 🔄         | 🔄      |
+| Windsurf (in-review)                                                                       | 🔄         | 🔄      |
 | Augment Code                                                                               | 🔄         | 🔄      |
-| OpenAI Codex (waiting on [openai/codex #2109](https://github.com/openai/codex/issues/2109)) |            |         |
-| Junie &amp; Jetbrains IDEs                                                                 |            |         |
 | Ona                                                                                        |            |         |
-| Sourcegraph Cody + Amp                                                                     |            |         |
+| Sourcegraph Cody                                                                           |            |         |
 | Google Antigravity                                                                         |            |         |
 
-| _your agent here_                                                                          |            |         |
 
-> **Building a Coding Agent?** [Add support for Git AI by following this guide](https://usegitai.com/docs/add-your-agent)
+> **Building a Coding Agent?** [Add support for Git AI by following this guide](https://usegitai.com/docs/cli/add-your-agent)
+
+## Installing the Stats Bot (early access)
+
+Aggregate `git-ai` data at the PR, developer, Repository and Organization levels:
+
+- AI authorship breakdown for every Pull Request
+- Measure % of code that is AI generated through the entire SDLC
+- Compare accepted-rate for code written by each Agent + Model. 
+- AI-Code Halflife (how durable is the AI code)
+> [Get early access by chatting with the maintainers](https://calendly.com/acunniffe/meeting-with-git-ai-authors)
+
+![alt](https://github.com/git-ai-project/git-ai/raw/main/assets/docs/dashboard.png)

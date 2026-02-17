@@ -1,9 +1,10 @@
 import { IDEHostKind } from "./utils/host-kind";
 
 export const MIN_GIT_AI_VERSION = "1.0.23";
+export const MIN_VSCODE_NATIVE_HOOKS_VERSION = "1.109.3";
 
 // Use GitHub URL to avoid VS Code open URL safety prompt
-export const GIT_AI_INSTALL_DOCS_URL = "https://github.com/acunniffe/git-ai?tab=readme-ov-file#quick-start";
+export const GIT_AI_INSTALL_DOCS_URL = "https://github.com/git-ai-project/git-ai?tab=readme-ov-file#quick-start";
 
 // IDE-specific AI tab completion commands
 export const TAB_AI_COMPLETION_COMMANDS: Partial<Record<IDEHostKind, string>> = {

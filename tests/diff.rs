@@ -60,7 +60,7 @@ impl DiffLine {
         };
 
         // Extract content (everything before attribution markers)
-        let content = if let Some(_) = attribution {
+        let content = if attribution.is_some() {
             // Remove attribution from content
             rest.split("🤖")
                 .next()

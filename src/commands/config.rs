@@ -1,5 +1,5 @@
-use serde_json::Value;
 use dirs;
+use serde_json::Value;
 
 use crate::git::repository::find_repository_in_path;
 
@@ -85,7 +85,7 @@ fn resolve_path_to_remotes(path: &str) -> Result<Vec<String>, String> {
 
 fn print_config_help() {
     eprintln!("git-ai config - View and manage git-ai configuration");
-    eprintln!("");
+    eprintln!();
     eprintln!("Usage:");
     eprintln!("  git-ai config                Show all config as formatted JSON");
     eprintln!("  git-ai config <key>          Show specific config value");
@@ -93,7 +93,7 @@ fn print_config_help() {
     eprintln!("  git-ai config set <key> <value> --add    Add to array (extends existing)");
     eprintln!("  git-ai config --add <key> <value>        Add to array or upsert into object");
     eprintln!("  git-ai config unset <key>    Remove config value (reverts to default)");
-    eprintln!("");
+    eprintln!();
     eprintln!("Configuration Keys:");
     eprintln!("  git_path                     Path to git binary");
     eprintln!("  exclude_prompts_in_repositories  Repos to exclude prompts from (array)");
@@ -107,13 +107,16 @@ fn print_config_help() {
     eprintln!("  feature_flags                Feature flags (object)");
     eprintln!("  api_key                      API key for X-API-Key header");
     eprintln!("  prompt_storage               Prompt storage mode (default/notes/local)");
-    eprintln!("");
+    eprintln!("  include_prompts_in_repositories  Repos to include for prompt storage (array)");
+    eprintln!("  default_prompt_storage       Fallback storage mode for non-included repos");
+    eprintln!("  quiet                        Suppress chart output after commits (bool)");
+    eprintln!();
     eprintln!("Repository Patterns:");
     eprintln!("  For exclude/allow/exclude_prompts_in_repositories, you can provide:");
     eprintln!("    - A glob pattern: \"*\", \"https://github.com/org/*\"");
     eprintln!("    - A URL/git protocol: \"git@github.com:org/repo.git\"");
     eprintln!("    - A file path: \".\" or \"/path/to/repo\" (resolves to repo's remotes)");
-    eprintln!("");
+    eprintln!();
     eprintln!("Examples:");
     eprintln!("  git-ai config exclude_repositories");
     eprintln!("  git-ai config set disable_auto_updates true");
@@ -123,7 +126,7 @@ fn print_config_help() {
     eprintln!("  git-ai config --add allow_repositories ~/projects/my-repo");
     eprintln!("  git-ai config --add feature_flags.my_flag true");
     eprintln!("  git-ai config unset exclude_repositories");
-    eprintln!("");
+    eprintln!();
     std::process::exit(0);
 }
 
@@ -283,6 +286,24 @@ fn show_all_config() -> Result<(), String> {
         Value::String(runtime_config.prompt_storage().to_string()),
     );
 
+    // include_prompts_in_repositories
+    if let Some(ref repos) = file_config.include_prompts_in_repositories {
+        effective_config.insert(
+            "include_prompts_in_repositories".to_string(),
+            serde_json::to_value(repos).unwrap_or(Value::Array(vec![])),
+        );
+    }
+
+    // default_prompt_storage
+    if let Some(ref storage) = file_config.default_prompt_storage {
+        effective_config.insert(
+            "default_prompt_storage".to_string(),
+            Value::String(storage.clone()),
+        );
+    }
+
+    effective_config.insert("quiet".to_string(), Value::Bool(runtime_config.is_quiet()));
+
     // Feature flags - show effective flags with defaults applied
     let flags_value = serde_json::to_value(runtime_config.get_feature_flags())
         .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
@@ -356,6 +377,21 @@ fn get_config_value(key: &str) -> Result<(), String> {
                 }
             }
             "prompt_storage" => Value::String(runtime_config.prompt_storage().to_string()),
+            "include_prompts_in_repositories" => {
+                if let Some(ref repos) = file_config.include_prompts_in_repositories {
+                    serde_json::to_value(repos).unwrap()
+                } else {
+                    Value::Array(vec![])
+                }
+            }
+            "default_prompt_storage" => {
+                if let Some(ref storage) = file_config.default_prompt_storage {
+                    Value::String(storage.clone())
+                } else {
+                    Value::Null
+                }
+            }
+            "quiet" => Value::Bool(runtime_config.is_quiet()),
             _ => return Err(format!("Unknown config key: {}", key)),
         };
 
@@ -384,7 +420,7 @@ fn get_config_value(key: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err(format!("Nested keys are only supported for feature_flags"))
+    Err("Nested keys are only supported for feature_flags".to_string())
 }
 
 fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String> {
@@ -451,9 +487,9 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
             "update_channel" => {
                 // Validate update channel
                 if value != "latest" && value != "next" {
-                    return Err(format!(
-                        "Invalid update_channel value. Expected 'latest' or 'next'"
-                    ));
+                    return Err(
+                        "Invalid update_channel value. Expected 'latest' or 'next'".to_string()
+                    );
                 }
                 file_config.update_channel = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
@@ -484,6 +520,38 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 file_config.prompt_storage = Some(value.to_string());
                 crate::config::save_file_config(&file_config)?;
                 eprintln!("[prompt_storage]: {}", value);
+            }
+            "include_prompts_in_repositories" => {
+                let resolved = resolve_repository_value(value)?;
+                if add_mode {
+                    let mut list = file_config
+                        .include_prompts_in_repositories
+                        .unwrap_or_default();
+                    for pattern in &resolved {
+                        if !list.contains(pattern) {
+                            list.push(pattern.clone());
+                        }
+                    }
+                    file_config.include_prompts_in_repositories = Some(list);
+                } else {
+                    file_config.include_prompts_in_repositories = Some(resolved.clone());
+                }
+                crate::config::save_file_config(&file_config)?;
+                for pattern in resolved {
+                    eprintln!("[include_prompts_in_repositories]: {}", pattern);
+                }
+            }
+            "default_prompt_storage" => {
+                validate_prompt_storage_value(value)?;
+                file_config.default_prompt_storage = Some(value.to_string());
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("[default_prompt_storage]: {}", value);
+            }
+            "quiet" => {
+                let bool_value = parse_bool(value)?;
+                file_config.quiet = Some(bool_value);
+                crate::config::save_file_config(&file_config)?;
+                eprintln!("[quiet]: {}", bool_value);
             }
             _ => return Err(format!("Unknown config key: {}", key)),
         }
@@ -541,7 +609,7 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
         return Ok(());
     }
 
-    Err(format!("Nested keys are only supported for feature_flags"))
+    Err("Nested keys are only supported for feature_flags".to_string())
 }
 
 fn unset_config_value(key: &str) -> Result<(), String> {
@@ -635,6 +703,27 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                     eprintln!("- [prompt_storage]: {}", v);
                 }
             }
+            "include_prompts_in_repositories" => {
+                let old_value = file_config.include_prompts_in_repositories.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    eprintln!("- [include_prompts_in_repositories]: {:?}", v);
+                }
+            }
+            "default_prompt_storage" => {
+                let old_value = file_config.default_prompt_storage.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    eprintln!("- [default_prompt_storage]: {}", v);
+                }
+            }
+            "quiet" => {
+                let old_value = file_config.quiet.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(v) = old_value {
+                    eprintln!("- [quiet]: {}", v);
+                }
+            }
             _ => return Err(format!("Unknown config key: {}", key)),
         }
 
@@ -695,7 +784,7 @@ fn unset_config_value(key: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err(format!("Nested keys are only supported for feature_flags"))
+    Err("Nested keys are only supported for feature_flags".to_string())
 }
 
 fn parse_key_path(key: &str) -> Vec<String> {
@@ -704,9 +793,10 @@ fn parse_key_path(key: &str) -> Vec<String> {
 
 /// Set array field for repository patterns (exclude_repositories, allow_repositories, exclude_prompts_in_repositories)
 /// This function handles the special logic of detecting if a value is:
-/// - A global wildcard pattern like "*"
-/// - A URL or git protocol pattern
-/// - A file path that should be resolved to repository remotes
+///  - A global wildcard pattern like "*"
+///  - A URL or git protocol pattern
+///  - A file path that should be resolved to repository remotes
+///
 /// Returns the values that were added/set for logging purposes
 fn set_repository_array_field(
     field: &mut Option<Vec<String>>,
@@ -772,6 +862,7 @@ fn resolve_repository_value(value: &str) -> Result<Vec<String>, String> {
 
 /// Log array changes with + prefix for add mode, or just list items for set mode
 fn log_array_changes(items: &[String], add_mode: bool) {
+    #[allow(clippy::if_same_then_else)]
     if add_mode {
         for item in items {
             eprintln!("+ {}", item);
@@ -860,5 +951,32 @@ mod tests {
         assert!(err.contains("default"));
         assert!(err.contains("notes"));
         assert!(err.contains("local"));
+    }
+
+    #[test]
+    fn test_parse_bool_valid_true_values() {
+        for value in ["true", "1", "yes", "on", "TRUE", "True", "YES", "ON"] {
+            let result = parse_bool(value);
+            assert!(result.is_ok(), "Expected '{}' to parse as bool", value);
+            assert!(result.unwrap(), "Expected '{}' to be true", value);
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_valid_false_values() {
+        for value in ["false", "0", "no", "off", "FALSE", "False", "NO", "OFF"] {
+            let result = parse_bool(value);
+            assert!(result.is_ok(), "Expected '{}' to parse as bool", value);
+            assert!(!result.unwrap(), "Expected '{}' to be false", value);
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_invalid_value() {
+        let result = parse_bool("invalid");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Invalid boolean value"));
+        assert!(err.contains("invalid"));
     }
 }

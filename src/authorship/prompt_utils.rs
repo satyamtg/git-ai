@@ -2,8 +2,10 @@ use crate::authorship::authorship_log::PromptRecord;
 use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::transcript::AiTranscript;
 use crate::commands::checkpoint_agent::agent_presets::{
-    ClaudePreset, ContinueCliPreset, CursorPreset, GeminiPreset, GithubCopilotPreset,
+    ClaudePreset, CodexPreset, ContinueCliPreset, CursorPreset, DroidPreset, GeminiPreset,
+    GithubCopilotPreset,
 };
+use crate::commands::checkpoint_agent::opencode_preset::OpenCodePreset;
 use crate::error::GitAiError;
 use crate::git::refs::{get_authorship, grep_ai_notes};
 use crate::git::repository::Repository;
@@ -83,13 +85,13 @@ pub fn find_prompt_in_history(
     // Iterate through commits, looking for the prompt and counting occurrences
     let mut found_count = 0;
     for sha in &shas {
-        if let Some(authorship_log) = get_authorship(repo, sha) {
-            if let Some(prompt) = authorship_log.metadata.prompts.get(prompt_id) {
-                if found_count == offset {
-                    return Ok((sha.clone(), prompt.clone()));
-                }
-                found_count += 1;
+        if let Some(authorship_log) = get_authorship(repo, sha)
+            && let Some(prompt) = authorship_log.metadata.prompts.get(prompt_id)
+        {
+            if found_count == offset {
+                return Ok((sha.clone(), prompt.clone()));
             }
+            found_count += 1;
         }
     }
 
@@ -151,8 +153,8 @@ pub fn find_prompt_with_db_fallback(
 /// Result of attempting to update a prompt from a tool
 pub enum PromptUpdateResult {
     Updated(AiTranscript, String), // (new_transcript, new_model)
-    Unchanged,                      // No update available or needed
-    Failed(GitAiError),             // Error occurred but not fatal
+    Unchanged,                     // No update available or needed
+    Failed(GitAiError),            // Error occurred but not fatal
 }
 
 /// Update a prompt by fetching latest transcript from the tool
@@ -166,11 +168,14 @@ pub fn update_prompt_from_tool(
     current_model: &str,
 ) -> PromptUpdateResult {
     match tool {
-        "cursor" => update_cursor_prompt(external_thread_id),
+        "cursor" => update_cursor_prompt(external_thread_id, agent_metadata, current_model),
         "claude" => update_claude_prompt(agent_metadata, current_model),
+        "codex" => update_codex_prompt(agent_metadata, current_model),
         "gemini" => update_gemini_prompt(agent_metadata, current_model),
         "github-copilot" => update_github_copilot_prompt(agent_metadata, current_model),
         "continue-cli" => update_continue_cli_prompt(agent_metadata, current_model),
+        "droid" => update_droid_prompt(agent_metadata, current_model),
+        "opencode" => update_opencode_prompt(external_thread_id, agent_metadata, current_model),
         _ => {
             debug_log(&format!("Unknown tool: {}", tool));
             PromptUpdateResult::Unchanged
@@ -178,12 +183,71 @@ pub fn update_prompt_from_tool(
     }
 }
 
+/// Update Codex prompt from rollout transcript file
+fn update_codex_prompt(
+    metadata: Option<&HashMap<String, String>>,
+    current_model: &str,
+) -> PromptUpdateResult {
+    if let Some(metadata) = metadata {
+        if let Some(transcript_path) = metadata.get("transcript_path") {
+            match CodexPreset::transcript_and_model_from_codex_rollout_jsonl(transcript_path) {
+                Ok((transcript, model)) => PromptUpdateResult::Updated(
+                    transcript,
+                    model.unwrap_or_else(|| current_model.to_string()),
+                ),
+                Err(e) => {
+                    debug_log(&format!(
+                        "Failed to parse Codex rollout JSONL transcript from {}: {}",
+                        transcript_path, e
+                    ));
+                    log_error(
+                        &e,
+                        Some(serde_json::json!({
+                            "agent_tool": "codex",
+                            "operation": "transcript_and_model_from_codex_rollout_jsonl"
+                        })),
+                    );
+                    PromptUpdateResult::Failed(e)
+                }
+            }
+        } else {
+            PromptUpdateResult::Unchanged
+        }
+    } else {
+        PromptUpdateResult::Unchanged
+    }
+}
+
 /// Update Cursor prompt by fetching from Cursor's database
-fn update_cursor_prompt(conversation_id: &str) -> PromptUpdateResult {
-    let res = CursorPreset::fetch_latest_cursor_conversation(conversation_id);
+fn update_cursor_prompt(
+    conversation_id: &str,
+    metadata: Option<&HashMap<String, String>>,
+    current_model: &str,
+) -> PromptUpdateResult {
+    // For Cursor, we check the env var first (it represents the current database state),
+    // then fall back to metadata (stored during checkpoint for git hook subprocesses
+    // which don't inherit env vars).
+    let res = if let Ok(env_db_path) = std::env::var("GIT_AI_CURSOR_GLOBAL_DB_PATH") {
+        // Environment variable takes precedence (allows resync to use updated database)
+        CursorPreset::fetch_cursor_conversation_from_db(
+            std::path::Path::new(&env_db_path),
+            conversation_id,
+        )
+    } else if let Some(db_path) = metadata.and_then(|m| m.get("__test_cursor_db_path")) {
+        // Fall back to metadata path (for git hook subprocesses in tests)
+        CursorPreset::fetch_cursor_conversation_from_db(
+            std::path::Path::new(db_path),
+            conversation_id,
+        )
+    } else {
+        // Use default Cursor database location
+        CursorPreset::fetch_latest_cursor_conversation(conversation_id)
+    };
     match res {
-        Ok(Some((latest_transcript, latest_model))) => {
-            PromptUpdateResult::Updated(latest_transcript, latest_model)
+        Ok(Some((latest_transcript, _db_model))) => {
+            // For Cursor, preserve the model from the checkpoint (which came from hook input)
+            // rather than using the database model
+            PromptUpdateResult::Updated(latest_transcript, current_model.to_string())
         }
         Ok(None) => PromptUpdateResult::Unchanged,
         Err(e) => {
@@ -373,4 +437,140 @@ fn update_continue_cli_prompt(
         // No agent_metadata available
         PromptUpdateResult::Unchanged
     }
+}
+
+/// Update Droid prompt from transcript and settings files
+fn update_droid_prompt(
+    metadata: Option<&HashMap<String, String>>,
+    current_model: &str,
+) -> PromptUpdateResult {
+    if let Some(metadata) = metadata {
+        if let Some(transcript_path) = metadata.get("transcript_path") {
+            // Re-parse transcript
+            let transcript =
+                match DroidPreset::transcript_and_model_from_droid_jsonl(transcript_path) {
+                    Ok((transcript, _model)) => transcript,
+                    Err(e) => {
+                        debug_log(&format!(
+                            "Failed to parse Droid JSONL transcript from {}: {}",
+                            transcript_path, e
+                        ));
+                        log_error(
+                            &e,
+                            Some(serde_json::json!({
+                                "agent_tool": "droid",
+                                "operation": "transcript_and_model_from_droid_jsonl"
+                            })),
+                        );
+                        return PromptUpdateResult::Failed(e);
+                    }
+                };
+
+            // Re-parse model from settings.json
+            let model = if let Some(settings_path) = metadata.get("settings_path") {
+                match DroidPreset::model_from_droid_settings_json(settings_path) {
+                    Ok(Some(m)) => m,
+                    Ok(None) => current_model.to_string(),
+                    Err(e) => {
+                        debug_log(&format!(
+                            "Failed to parse Droid settings.json from {}: {}",
+                            settings_path, e
+                        ));
+                        current_model.to_string()
+                    }
+                }
+            } else {
+                current_model.to_string()
+            };
+
+            PromptUpdateResult::Updated(transcript, model)
+        } else {
+            // No transcript_path in metadata
+            PromptUpdateResult::Unchanged
+        }
+    } else {
+        // No agent_metadata available
+        PromptUpdateResult::Unchanged
+    }
+}
+
+/// Update OpenCode prompt by fetching latest transcript from storage
+fn update_opencode_prompt(
+    session_id: &str,
+    metadata: Option<&HashMap<String, String>>,
+    current_model: &str,
+) -> PromptUpdateResult {
+    // Check for test storage path override in metadata or env var
+    let storage_path = if let Ok(env_path) = std::env::var("GIT_AI_OPENCODE_STORAGE_PATH") {
+        Some(std::path::PathBuf::from(env_path))
+    } else {
+        metadata
+            .and_then(|m| m.get("__test_storage_path"))
+            .map(std::path::PathBuf::from)
+    };
+
+    let result = if let Some(path) = storage_path {
+        OpenCodePreset::transcript_and_model_from_storage(&path, session_id)
+    } else {
+        OpenCodePreset::transcript_and_model_from_session(session_id)
+    };
+
+    match result {
+        Ok((transcript, model)) => PromptUpdateResult::Updated(
+            transcript,
+            model.unwrap_or_else(|| current_model.to_string()),
+        ),
+        Err(e) => {
+            debug_log(&format!(
+                "Failed to fetch OpenCode transcript for session {}: {}",
+                session_id, e
+            ));
+            log_error(
+                &e,
+                Some(serde_json::json!({
+                    "agent_tool": "opencode",
+                    "operation": "transcript_and_model_from_storage"
+                })),
+            );
+            PromptUpdateResult::Failed(e)
+        }
+    }
+}
+
+/// Format a PromptRecord's messages into a human-readable transcript.
+///
+/// Filters out ToolUse messages; keeps User, Assistant, Thinking, and Plan.
+/// Each message is prefixed with its role label.
+pub fn format_transcript(prompt: &PromptRecord) -> String {
+    use crate::authorship::transcript::Message;
+
+    let mut output = String::new();
+    for message in &prompt.messages {
+        match message {
+            Message::User { text, .. } => {
+                output.push_str("User: ");
+                output.push_str(text);
+                output.push('\n');
+            }
+            Message::Assistant { text, .. } => {
+                output.push_str("Assistant: ");
+                output.push_str(text);
+                output.push('\n');
+            }
+            Message::Thinking { text, .. } => {
+                output.push_str("Thinking: ");
+                output.push_str(text);
+                output.push('\n');
+            }
+            Message::Plan { text, .. } => {
+                output.push_str("Plan: ");
+                output.push_str(text);
+                output.push('\n');
+            }
+            Message::ToolUse { .. } => {
+                // Skip tool use messages in formatted transcript
+            }
+        }
+    }
+    output
 }

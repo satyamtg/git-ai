@@ -10,11 +10,11 @@ YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
 # GitHub repository details
-# Replaced during release builds with the actual repository (e.g., "acunniffe/git-ai")
-# When set to __REPO_PLACEHOLDER__, defaults to "acunniffe/git-ai"
+# Replaced during release builds with the actual repository (e.g., "git-ai-project/git-ai")
+# When set to __REPO_PLACEHOLDER__, defaults to "git-ai-project/git-ai"
 REPO="__REPO_PLACEHOLDER__"
 if [ "$REPO" = "__REPO_PLACEHOLDER__" ]; then
-    REPO="acunniffe/git-ai"
+    REPO="git-ai-project/git-ai"
 fi
 
 # Version placeholder - replaced during release builds with actual version (e.g., "v1.0.24")
@@ -86,34 +86,49 @@ verify_checksum() {
     success "Checksum verified for $binary_name"
 }
 
-# Function to detect shell and generate alias command
-detect_shell() {
-    local shell_name=""
-    local config_file=""
+# Function to detect all shells with existing config files
+# Returns shell configurations in format: "shell_name|config_file" (one per line)
+detect_all_shells() {
+    local shells=""
     
-    # Check for zsh first (macOS default)
-    if [ -f "$HOME/.zshrc" ]; then
-        shell_name="zsh"
-        config_file="$HOME/.zshrc"
-    # Check for bash
-    elif [ -f "$HOME/.bashrc" ] || [ -f "$HOME/.bash_profile" ]; then
-        shell_name="bash"
-        config_file="$HOME/.bashrc"
-    else
-        # Fallback - try to detect from environment
-        if [ -n "$ZSH_VERSION" ]; then
-            shell_name="zsh"
-            config_file="$HOME/.zshrc"
-        elif [ -n "$BASH_VERSION" ]; then
-            shell_name="bash"
-            config_file="$HOME/.bashrc"
-        else
-            shell_name="unknown"
-            config_file=""
-        fi
+    # Check for bash configs (prefer .bashrc over .bash_profile)
+    if [ -f "$HOME/.bashrc" ]; then
+        shells="${shells}bash|$HOME/.bashrc\n"
+    elif [ -f "$HOME/.bash_profile" ]; then
+        shells="${shells}bash|$HOME/.bash_profile\n"
     fi
     
-    echo "$shell_name|$config_file"
+    # Check for zsh config
+    if [ -f "$HOME/.zshrc" ]; then
+        shells="${shells}zsh|$HOME/.zshrc\n"
+    fi
+    
+    # Check for fish config
+    if [ -f "$HOME/.config/fish/config.fish" ]; then
+        shells="${shells}fish|$HOME/.config/fish/config.fish\n"
+    fi
+    
+    # If no configs found, fall back to $SHELL detection and create config for that shell only
+    if [ -z "$shells" ]; then
+        local login_shell=""
+        if [ -n "$SHELL" ]; then
+            login_shell=$(basename "$SHELL")
+        fi
+        case "$login_shell" in
+            fish)
+                shells="fish|$HOME/.config/fish/config.fish"
+                ;;
+            zsh)
+                shells="zsh|$HOME/.zshrc"
+                ;;
+            bash|*)
+                shells="bash|$HOME/.bashrc"
+                ;;
+        esac
+    fi
+    
+    # Remove trailing newline and output
+    printf '%b' "$shells" | sed '/^$/d'
 }
 
 detect_std_git() {
@@ -153,21 +168,18 @@ detect_std_git() {
 
     # Fail if we couldn't find a standard git
     if [ -z "$git_path" ]; then
-        error "Could not detect a standard git binary on PATH. Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/acunniffe/git-ai/issues."
+        error "Could not detect a standard git binary on PATH. Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/git-ai-project/git-ai/issues."
     fi
 
     # Verify detected git is usable
     if ! "$git_path" --version >/dev/null 2>&1; then
-        error "Detected git at $git_path is not usable (--version failed). Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/acunniffe/git-ai/issues."
+        error "Detected git at $git_path is not usable (--version failed). Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/git-ai-project/git-ai/issues."
     fi
 
     echo "$git_path"
 }
 
-# Detect shell and get alias information
-SHELL_INFO=$(detect_shell)
-SHELL_NAME=$(echo "$SHELL_INFO" | cut -d'|' -f1)
-CONFIG_FILE=$(echo "$SHELL_INFO" | cut -d'|' -f2)
+# Detect standard git path (needed early for install)
 STD_GIT_PATH=$(detect_std_git)
 
 # Detect OS and architecture
@@ -204,8 +216,11 @@ esac
 BINARY_NAME="git-ai-${OS}-${ARCH}"
 
 # Determine release tag
-# Priority: 1. Pinned version (for release builds), 2. Environment variable, 3. "latest"
-if [ "$PINNED_VERSION" != "__VERSION_PLACEHOLDER__" ]; then
+# Priority: 1. Local binary override, 2. Pinned version (for release builds), 3. Environment variable, 4. "latest"
+if [ -n "${GIT_AI_LOCAL_BINARY:-}" ]; then
+    RELEASE_TAG="local"
+    DOWNLOAD_URL=""
+elif [ "$PINNED_VERSION" != "__VERSION_PLACEHOLDER__" ]; then
     # Version-pinned install script from a release
     RELEASE_TAG="$PINNED_VERSION"
     DOWNLOAD_URL="https://usegitai.com/worker/releases/download/${RELEASE_TAG}/${BINARY_NAME}"
@@ -226,11 +241,19 @@ INSTALL_DIR="$HOME/.git-ai/bin"
 mkdir -p "$INSTALL_DIR"
 
 # Download and install
-echo "Downloading git-ai (release: ${RELEASE_TAG})..."
 TMP_FILE="${INSTALL_DIR}/git-ai.tmp.$$"
-if ! curl --fail --location --silent --show-error -o "$TMP_FILE" "$DOWNLOAD_URL"; then
-    rm -f "$TMP_FILE" 2>/dev/null || true
-    error "Failed to download binary (HTTP error)"
+if [ -n "${GIT_AI_LOCAL_BINARY:-}" ]; then
+    echo "Using local git-ai binary (release: ${RELEASE_TAG})..."
+    if [ ! -f "$GIT_AI_LOCAL_BINARY" ]; then
+        error "Local binary not found at $GIT_AI_LOCAL_BINARY"
+    fi
+    cp "$GIT_AI_LOCAL_BINARY" "$TMP_FILE"
+else
+    echo "Downloading git-ai (release: ${RELEASE_TAG})..."
+    if ! curl --fail --location --silent --show-error -o "$TMP_FILE" "$DOWNLOAD_URL"; then
+        rm -f "$TMP_FILE" 2>/dev/null || true
+        error "Failed to download binary (HTTP error)"
+    fi
 fi
 
 # Basic validation: ensure file is not empty
@@ -257,8 +280,6 @@ if [ "$OS" = "macos" ]; then
     xattr -d com.apple.quarantine "${INSTALL_DIR}/git-ai" 2>/dev/null || true
 fi
 
-PATH_CMD="export PATH=\"$INSTALL_DIR:\$PATH\""
-
 success "Successfully installed git-ai into ${INSTALL_DIR}"
 success "You can now run 'git-ai' from your terminal"
 
@@ -266,7 +287,14 @@ success "You can now run 'git-ai' from your terminal"
 INSTALLED_VERSION=$(${INSTALL_DIR}/git-ai --version 2>&1 || echo "unknown")
 echo "Installed git-ai ${INSTALLED_VERSION}"
 
-# Install hooks
+# Login user with install token if provided
+NEED_LOGIN=false
+if [ -n "${INSTALL_NONCE:-}" ] && [ -n "${API_BASE:-}" ]; then
+    if ! ${INSTALL_DIR}/git-ai exchange-nonce; then
+        NEED_LOGIN=true
+    fi
+fi
+
 echo "Setting up IDE/agent hooks..."
 if ! ${INSTALL_DIR}/git-ai install-hooks; then
     warn "Warning: Failed to set up IDE/agent hooks. Please try running 'git-ai install-hooks' manually."
@@ -289,24 +317,79 @@ EOF
     mv -f "$TMP_CFG" "$CONFIG_JSON_PATH"
 fi
 
-# Add to PATH automatically if not already there
-if [[ ":$PATH:" != *"$INSTALL_DIR"* ]]; then
-    if [ -n "$CONFIG_FILE" ]; then
-        # Ensure config file exists
-        touch "$CONFIG_FILE"
-        # Append PATH update if not already present
-        if ! grep -qsF "$INSTALL_DIR" "$CONFIG_FILE"; then
-            echo "" >> "$CONFIG_FILE"
-            echo "# Added by git-ai installer on $(date)" >> "$CONFIG_FILE"
-            echo "$PATH_CMD" >> "$CONFIG_FILE"
-        fi
-        success "Updated ${CONFIG_FILE} to include ${INSTALL_DIR} in PATH"
-        echo "Restart your shell or run: source \"$CONFIG_FILE\""
+# Add to PATH in all detected shell configurations
+SHELLS_CONFIGURED=""
+SHELLS_ALREADY_CONFIGURED=""
+
+while IFS='|' read -r shell_name config_file; do
+    [ -z "$shell_name" ] && continue
+    
+    # Generate shell-appropriate PATH command
+    if [ "$shell_name" = "fish" ]; then
+        path_cmd="fish_add_path -g \"$INSTALL_DIR\""
+        # Create fish config directory if it doesn't exist (for fallback case)
+        mkdir -p "$(dirname "$config_file")"
     else
-        echo "Could not detect your shell config file."
-        echo "Please add the following line(s) to your shell config and restart:"
-        echo "$PATH_CMD"
+        path_cmd="export PATH=\"$INSTALL_DIR:\$PATH\""
     fi
+    
+    # Create config file if it doesn't exist (for fallback case when no configs found)
+    touch "$config_file"
+    
+    # Append if not already present
+    if ! grep -qsF "$INSTALL_DIR" "$config_file"; then
+        echo "" >> "$config_file"
+        echo "# Added by git-ai installer on $(date)" >> "$config_file"
+        echo "$path_cmd" >> "$config_file"
+        SHELLS_CONFIGURED="${SHELLS_CONFIGURED}${shell_name}|${config_file}\n"
+    else
+        SHELLS_ALREADY_CONFIGURED="${SHELLS_ALREADY_CONFIGURED}${shell_name}|${config_file}\n"
+    fi
+done <<< "$(detect_all_shells)"
+
+# Display results to user
+if [ -n "$SHELLS_CONFIGURED" ]; then
+    echo ""
+    echo "Updated shell configurations:"
+    printf '%b' "$SHELLS_CONFIGURED" | while IFS='|' read -r shell_name config_file; do
+        [ -z "$shell_name" ] && continue
+        success "  ✓ $config_file"
+    done
+    
+    echo ""
+    echo "To apply changes immediately:"
+    printf '%b' "$SHELLS_CONFIGURED" | while IFS='|' read -r shell_name config_file; do
+        [ -z "$shell_name" ] && continue
+        if [ "$shell_name" = "fish" ]; then
+            echo "  - For fish: source $config_file"
+        else
+            echo "  - For $shell_name: source $config_file"
+        fi
+    done
 fi
 
+if [ -n "$SHELLS_ALREADY_CONFIGURED" ]; then
+    echo ""
+    echo "Already configured (no changes needed):"
+    printf '%b' "$SHELLS_ALREADY_CONFIGURED" | while IFS='|' read -r shell_name config_file; do
+        [ -z "$shell_name" ] && continue
+        echo "  ✓ $config_file"
+    done
+fi
+
+if [ -z "$SHELLS_CONFIGURED" ] && [ -z "$SHELLS_ALREADY_CONFIGURED" ]; then
+    echo ""
+    echo "Could not detect any shell config files."
+    echo "Please add the following line to your shell config and restart:"
+    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+fi
+
+echo ""
 echo -e "${YELLOW}Close and reopen your terminal and IDE sessions to use git-ai.${NC}"
+
+# If nonce exchange failed, run interactive login
+if [ "$NEED_LOGIN" = true ]; then
+    echo ""
+    echo "Launching login..."
+    ${INSTALL_DIR}/git-ai login
+fi

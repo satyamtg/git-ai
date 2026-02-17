@@ -5,7 +5,6 @@ mod test_utils;
 use repos::test_file::ExpectedLineExt;
 use repos::test_repo::TestRepo;
 use rusqlite::{Connection, OpenFlags};
-use serde_json;
 use test_utils::fixture_path;
 
 const TEST_CONVERSATION_ID: &str = "00812842-49fe-4699-afae-bb22cda3f6e1";
@@ -215,7 +214,7 @@ fn test_cursor_preset_multi_root_workspace_detection() {
             let preset = CursorPreset;
             let result = preset
                 .run(flags)
-                .expect(&format!("Should succeed for: {}", description));
+                .unwrap_or_else(|_| panic!("Should succeed for: {}", description));
 
             assert_eq!(
                 result.repo_working_dir,
@@ -384,13 +383,13 @@ fn test_cursor_e2e_with_attribution() {
 
     // Verify the authorship log contains attestations and prompts
     assert!(
-        commit.authorship_log.attestations.len() > 0,
+        !commit.authorship_log.attestations.is_empty(),
         "Should have at least one attestation"
     );
 
     // Verify the metadata has prompts with transcript data
     assert!(
-        commit.authorship_log.metadata.prompts.len() > 0,
+        !commit.authorship_log.metadata.prompts.is_empty(),
         "Should have at least one prompt record in metadata"
     );
 
@@ -405,7 +404,7 @@ fn test_cursor_e2e_with_attribution() {
 
     // Verify that the prompt record has messages (transcript)
     assert!(
-        prompt_record.messages.len() > 0,
+        !prompt_record.messages.is_empty(),
         "Prompt record should contain messages from the cursor database"
     );
 
@@ -543,13 +542,13 @@ fn test_cursor_e2e_with_resync() {
 
     // Verify the authorship log contains attestations and prompts
     assert!(
-        commit.authorship_log.attestations.len() > 0,
+        !commit.authorship_log.attestations.is_empty(),
         "Should have at least one attestation"
     );
 
     // Verify the metadata has prompts with transcript data
     assert!(
-        commit.authorship_log.metadata.prompts.len() > 0,
+        !commit.authorship_log.metadata.prompts.is_empty(),
         "Should have at least one prompt record in metadata"
     );
 

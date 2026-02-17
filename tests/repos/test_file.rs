@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{fs, path::PathBuf};
 
 use insta::assert_debug_snapshot;
@@ -10,6 +12,7 @@ const AI_AUTHOR_NAMES: &[&str] = &[
     "gpt",
     "copilot",
     "cursor",
+    "codex",
     "gemini",
 ];
 
@@ -105,7 +108,7 @@ impl<'a> TestFile<'a> {
     ) -> Self {
         Self {
             lines,
-            file_path: file_path,
+            file_path,
             repo,
         }
     }
@@ -181,25 +184,25 @@ impl<'a> TestFile<'a> {
 
     /// Static version of parse_blame_line for use in from_existing_file
     fn parse_blame_line_static(line: &str) -> (String, String) {
-        if let Some(start_paren) = line.find('(') {
-            if let Some(end_paren) = line.find(')') {
-                let author_section = &line[start_paren + 1..end_paren];
-                let content = line[end_paren + 1..].trim();
+        if let Some(start_paren) = line.find('(')
+            && let Some(end_paren) = line.find(')')
+        {
+            let author_section = &line[start_paren + 1..end_paren];
+            let content = line[end_paren + 1..].trim();
 
-                // Extract author name (everything before the date)
-                let parts: Vec<&str> = author_section.trim().split_whitespace().collect();
-                let mut author_parts = Vec::new();
-                for part in parts {
-                    // Stop when we hit what looks like a date (starts with digit)
-                    if part.chars().next().unwrap_or('a').is_ascii_digit() {
-                        break;
-                    }
-                    author_parts.push(part);
+            // Extract author name (everything before the date)
+            let parts: Vec<&str> = author_section.split_whitespace().collect();
+            let mut author_parts = Vec::new();
+            for part in parts {
+                // Stop when we hit what looks like a date (starts with digit)
+                if part.chars().next().unwrap_or('a').is_ascii_digit() {
+                    break;
                 }
-                let author = author_parts.join(" ");
-
-                return (author, content.to_string());
+                author_parts.push(part);
             }
+            let author = author_parts.join(" ");
+
+            return (author, content.to_string());
         }
         ("unknown".to_string(), line.to_string())
     }
@@ -418,25 +421,25 @@ impl<'a> TestFile<'a> {
     /// Parse a single blame line to extract author and content
     /// Format: sha (author date line_num) content
     pub fn parse_blame_line(&self, line: &str) -> (String, String) {
-        if let Some(start_paren) = line.find('(') {
-            if let Some(end_paren) = line.find(')') {
-                let author_section = &line[start_paren + 1..end_paren];
-                let content = line[end_paren + 1..].trim();
+        if let Some(start_paren) = line.find('(')
+            && let Some(end_paren) = line.find(')')
+        {
+            let author_section = &line[start_paren + 1..end_paren];
+            let content = line[end_paren + 1..].trim();
 
-                // Extract author name (everything before the date)
-                let parts: Vec<&str> = author_section.trim().split_whitespace().collect();
-                let mut author_parts = Vec::new();
-                for part in parts {
-                    // Stop when we hit what looks like a date (starts with digit)
-                    if part.chars().next().unwrap_or('a').is_ascii_digit() {
-                        break;
-                    }
-                    author_parts.push(part);
+            // Extract author name (everything before the date)
+            let parts: Vec<&str> = author_section.split_whitespace().collect();
+            let mut author_parts = Vec::new();
+            for part in parts {
+                // Stop when we hit what looks like a date (starts with digit)
+                if part.chars().next().unwrap_or('a').is_ascii_digit() {
+                    break;
                 }
-                let author = author_parts.join(" ");
-
-                return (author, content.to_string());
+                author_parts.push(part);
             }
+            let author = author_parts.join(" ");
+
+            return (author, content.to_string());
         }
         ("unknown".to_string(), line.to_string())
     }
@@ -509,7 +512,7 @@ impl<'a> TestFile<'a> {
                     // Author is everything before the date/timestamp
                     // Date format is typically "YYYY-MM-DD" or similar
                     // Split by multiple spaces or look for year pattern
-                    let parts: Vec<&str> = after_paren.trim().split_whitespace().collect();
+                    let parts: Vec<&str> = after_paren.split_whitespace().collect();
                     if !parts.is_empty() {
                         // The author is typically the first part before the date
                         // Date usually starts with a year (4 digits) or a number
@@ -551,7 +554,7 @@ impl<'a> TestFile<'a> {
     ) -> &mut Self {
         let lines: Vec<ExpectedLine> = lines.into_iter().map(|l| l.into()).collect();
 
-        if lines.len() == 0 {
+        if lines.is_empty() {
             panic!("[test internals] must insert > 0 lines")
         }
 
@@ -668,9 +671,9 @@ impl<'a> TestFile<'a> {
             .iter()
             .map(|s| {
                 if s.author_type == AuthorType::Ai {
-                    return "||__AI LINE__ PENDING__||".to_string();
+                    "||__AI LINE__ PENDING__||".to_string()
                 } else {
-                    return s.contents.clone();
+                    s.contents.clone()
                 }
             })
             .collect::<Vec<String>>()
@@ -700,9 +703,9 @@ impl<'a> TestFile<'a> {
             .iter()
             .map(|s| {
                 if s.author_type == AuthorType::Ai {
-                    return "||__AI LINE__ PENDING__||".to_string();
+                    "||__AI LINE__ PENDING__||".to_string()
                 } else {
-                    return s.contents.clone();
+                    s.contents.clone()
                 }
             })
             .collect::<Vec<String>>()
@@ -723,15 +726,20 @@ impl<'a> TestFile<'a> {
     }
 
     pub fn contents(&self) -> String {
-        return self
-            .lines
+        self.lines
             .iter()
             .map(|s| s.contents.clone())
             .collect::<Vec<String>>()
-            .join("\n");
+            .join("\n")
     }
 
     fn write_and_checkpoint(&self, author_type: &AuthorType) {
+        // Create parent directories if they don't exist (important for nested paths)
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).expect("failed to create parent directories");
+            }
+        }
         let contents = self.contents();
         fs::write(&self.file_path, contents).unwrap();
         if author_type == &AuthorType::Ai {
@@ -742,6 +750,12 @@ impl<'a> TestFile<'a> {
     }
 
     fn write_and_checkpoint_with_contents(&self, contents: &str, author_type: &AuthorType) {
+        // Create parent directories if they don't exist (important for nested paths like src/模块/组件.ts)
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).expect("failed to create parent directories");
+            }
+        }
         fs::write(&self.file_path, contents).unwrap();
 
         // Stage the file first
@@ -762,6 +776,12 @@ impl<'a> TestFile<'a> {
     }
 
     fn write_and_checkpoint_no_stage(&self, contents: &str, author_type: &AuthorType) {
+        // Create parent directories if they don't exist (important for nested paths)
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).expect("failed to create parent directories");
+            }
+        }
         fs::write(&self.file_path, contents).unwrap();
 
         // Create checkpoint without staging - checkpoints work with unstaged files

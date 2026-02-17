@@ -276,9 +276,11 @@ fn handle_reset_pathspec_preserve_working_dir(
     let mut non_pathspec_checkpoints = Vec::new();
     for mut checkpoint in existing_checkpoints {
         checkpoint.entries.retain(|entry| {
-            !pathspecs
-                .iter()
-                .any(|pathspec| entry.file == *pathspec || entry.file.starts_with(pathspec))
+            !pathspecs.iter().any(|pathspec| {
+                entry.file == *pathspec
+                    || (pathspec.ends_with('/') && entry.file.starts_with(pathspec))
+                    || entry.file.starts_with(&format!("{}/", pathspec))
+            })
         });
         if !checkpoint.entries.is_empty() {
             non_pathspec_checkpoints.push(checkpoint);
@@ -484,10 +486,10 @@ fn get_pathspec_from_file_path(parsed_args: &ParsedGitInvocation) -> Option<Stri
         }
         if arg == "--pathspec-from-file" {
             // Next arg should be the file path
-            if let Some(idx) = parsed_args.command_args.iter().position(|a| a == arg) {
-                if idx + 1 < parsed_args.command_args.len() {
-                    return Some(parsed_args.command_args[idx + 1].clone());
-                }
+            if let Some(idx) = parsed_args.command_args.iter().position(|a| a == arg)
+                && idx + 1 < parsed_args.command_args.len()
+            {
+                return Some(parsed_args.command_args[idx + 1].clone());
             }
         }
     }

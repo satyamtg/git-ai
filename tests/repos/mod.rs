@@ -19,6 +19,7 @@ macro_rules! subdir_test_variants {
                     inner: $crate::repos::test_repo::TestRepo,
                 }
 
+                #[allow(dead_code)]
                 impl TestRepoWithCFlag {
                     fn new() -> Self {
                         Self { inner: $crate::repos::test_repo::TestRepo::new() }

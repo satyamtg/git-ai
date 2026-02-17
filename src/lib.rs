@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod authorship;
 pub mod ci;
 pub mod commands;
@@ -6,5 +7,8 @@ pub mod config;
 pub mod error;
 pub mod feature_flags;
 pub mod git;
+pub mod mdm;
+pub mod metrics;
 pub mod observability;
+pub mod repo_url;
 pub mod utils;

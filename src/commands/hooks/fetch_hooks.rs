@@ -1,11 +1,11 @@
-use crate::authorship::virtual_attribution::{
-    VirtualAttributions, merge_attributions_favoring_first,
-};
+use crate::authorship::virtual_attribution::{VirtualAttributions, restore_stashed_va};
 use crate::commands::git_handlers::CommandHooksContext;
 use crate::commands::hooks::commit_hooks::get_commit_default_author;
+use crate::commands::hooks::rebase_hooks::build_rebase_commit_mappings;
 use crate::commands::upgrade;
 use crate::git::cli_parser::{ParsedGitInvocation, is_dry_run};
 use crate::git::repository::{Repository, exec_git, find_repository};
+use crate::git::rewrite_log::RewriteLogEvent;
 use crate::git::sync_authorship::{fetch_authorship_notes, fetch_remote_from_args};
 use crate::utils::debug_log;
 
@@ -135,7 +135,7 @@ pub fn fetch_pull_post_command_hook(
 /// 2. Renames working log for fast-forward pulls to preserve attributions.
 pub fn pull_post_command_hook(
     repository: &mut Repository,
-    _parsed_args: &ParsedGitInvocation,
+    parsed_args: &ParsedGitInvocation,
     exit_status: std::process::ExitStatus,
     command_hooks_context: &mut CommandHooksContext,
 ) {
@@ -169,112 +169,22 @@ pub fn pull_post_command_hook(
     // Check if we have a stashed VA to restore (from pull --rebase --autostash)
     if let Some(stashed_va) = command_hooks_context.stashed_va.take() {
         restore_stashed_va(repository, &old_head, &new_head, stashed_va);
-        return;
     }
 
-    // No stashed VA - check for fast-forward pull and rename working log if applicable
+    // Check for fast-forward pull and rename working log if applicable
     if was_fast_forward_pull(repository, &new_head) {
         debug_log(&format!(
             "Fast-forward detected: {} -> {}",
             old_head, new_head
         ));
         let _ = repository.storage.rename_working_log(&old_head, &new_head);
-    }
-}
-
-/// Restore stashed VirtualAttributions after a pull --rebase --autostash operation.
-fn restore_stashed_va(
-    repository: &mut Repository,
-    old_head: &str,
-    new_head: &str,
-    stashed_va: VirtualAttributions,
-) {
-    debug_log(&format!(
-        "Restoring stashed VA after pull --rebase --autostash: {} -> {}",
-        old_head, new_head
-    ));
-
-    // Get the files that were in the stashed VA
-    let stashed_files: Vec<String> = stashed_va.files();
-
-    if stashed_files.is_empty() {
-        debug_log("Stashed VA has no files, nothing to restore");
         return;
     }
 
-    // Get current working directory file contents (final state after autostash apply)
-    let mut working_files = std::collections::HashMap::new();
-    if let Ok(workdir) = repository.workdir() {
-        for file_path in &stashed_files {
-            let abs_path = workdir.join(file_path);
-            if abs_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&abs_path) {
-                    working_files.insert(file_path.clone(), content);
-                }
-            }
-        }
-    }
-
-    if working_files.is_empty() {
-        debug_log("No working files to restore attributions for");
-        return;
-    }
-
-    // Build a VA for the new HEAD state (if there are any existing attributions)
-    let new_va = match VirtualAttributions::from_just_working_log(
-        repository.clone(),
-        new_head.to_string(),
-        None,
-    ) {
-        Ok(va) => va,
-        Err(e) => {
-            debug_log(&format!("Failed to build new VA: {}, using empty", e));
-            VirtualAttributions::new(
-                repository.clone(),
-                new_head.to_string(),
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-                0,
-            )
-        }
-    };
-
-    // Merge VAs, favoring the stashed VA (our original work)
-    let merged_va = match merge_attributions_favoring_first(stashed_va, new_va, working_files) {
-        Ok(va) => va,
-        Err(e) => {
-            debug_log(&format!("Failed to merge VirtualAttributions: {}", e));
-            return;
-        }
-    };
-
-    // Convert merged VA to INITIAL attributions for the new HEAD
-    // Since these are uncommitted changes, we use the same SHA for parent and commit
-    // to get all attributions into the INITIAL file (not the authorship log)
-    let (_authorship_log, initial_attributions) = match merged_va
-        .to_authorship_log_and_initial_working_log(repository, new_head, new_head, None)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            debug_log(&format!("Failed to convert VA to INITIAL: {}", e));
-            return;
-        }
-    };
-
-    // Write INITIAL attributions to working log for new HEAD
-    if !initial_attributions.files.is_empty() || !initial_attributions.prompts.is_empty() {
-        let working_log = repository.storage.working_log_for_base_commit(new_head);
-        if let Err(e) = working_log
-            .write_initial_attributions(initial_attributions.files, initial_attributions.prompts)
-        {
-            debug_log(&format!("Failed to write INITIAL attributions: {}", e));
-            return;
-        }
-
-        debug_log(&format!(
-            "✓ Restored AI attributions to INITIAL for new HEAD {}",
-            &new_head[..8]
-        ));
+    // Handle committed authorship rewriting for pull --rebase
+    let config = get_pull_rebase_autostash_config(parsed_args, repository);
+    if config.is_rebase {
+        process_completed_pull_rebase(repository, &old_head, &new_head);
     }
 }
 
@@ -394,4 +304,70 @@ fn has_uncommitted_changes(repository: &Repository) -> bool {
         Ok(filenames) => !filenames.is_empty(),
         Err(_) => false,
     }
+}
+
+/// Rewrite authorship for committed local changes that were rebased by `git pull --rebase`.
+/// Uses the same commit-mapping and rewrite logic as `rebase_hooks::process_completed_rebase`.
+fn process_completed_pull_rebase(repository: &mut Repository, original_head: &str, new_head: &str) {
+    debug_log(&format!(
+        "Processing pull --rebase authorship: {} -> {}",
+        original_head, new_head
+    ));
+
+    let onto_head = resolve_pull_rebase_onto_head(repository);
+    let (original_commits, new_commits) = match build_rebase_commit_mappings(
+        repository,
+        original_head,
+        new_head,
+        onto_head.as_deref(),
+    ) {
+        Ok(mappings) => {
+            debug_log(&format!(
+                "Pull rebase mappings: {} original -> {} new commits",
+                mappings.0.len(),
+                mappings.1.len()
+            ));
+            mappings
+        }
+        Err(e) => {
+            debug_log(&format!("Failed to build pull rebase mappings: {}", e));
+            return;
+        }
+    };
+
+    if original_commits.is_empty() {
+        debug_log("No committed changes to rewrite authorship for after pull --rebase");
+        return;
+    }
+    if new_commits.is_empty() {
+        debug_log("No newly rebased commits to rewrite authorship for after pull --rebase");
+        return;
+    }
+
+    let rebase_event =
+        RewriteLogEvent::rebase_complete(crate::git::rewrite_log::RebaseCompleteEvent::new(
+            original_head.to_string(),
+            new_head.to_string(),
+            false, // pull --rebase is not interactive
+            original_commits,
+            new_commits,
+        ));
+
+    let commit_author = get_commit_default_author(repository, &[]);
+    repository.handle_rewrite_log_event(
+        rebase_event,
+        commit_author,
+        false, // don't suppress output
+        true,  // save to log
+    );
+
+    debug_log("Pull --rebase authorship rewrite complete");
+}
+
+fn resolve_pull_rebase_onto_head(repository: &Repository) -> Option<String> {
+    repository
+        .revparse_single("@{upstream}")
+        .and_then(|obj| obj.peel_to_commit())
+        .map(|commit| commit.id())
+        .ok()
 }

@@ -205,13 +205,29 @@ impl MergeSquashEvent {
 pub struct RebaseStartEvent {
     pub original_head: String,
     pub is_interactive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onto_head: Option<String>,
 }
 
 impl RebaseStartEvent {
+    #[allow(dead_code)]
     pub fn new(original_head: String, is_interactive: bool) -> Self {
         Self {
             original_head,
             is_interactive,
+            onto_head: None,
+        }
+    }
+
+    pub fn new_with_onto(
+        original_head: String,
+        is_interactive: bool,
+        onto_head: Option<String>,
+    ) -> Self {
+        Self {
+            original_head,
+            is_interactive,
+            onto_head,
         }
     }
 }
@@ -646,7 +662,7 @@ mod tests {
             vec!["ghi789".to_string()],
         ));
 
-        let initial_jsonl = serialize_events_to_jsonl(&[event1.clone()]).unwrap();
+        let initial_jsonl = serialize_events_to_jsonl(std::slice::from_ref(&event1)).unwrap();
         // Test with temp file
         let temp_file = std::env::temp_dir().join("test_rewrite_log.jsonl");
         std::fs::write(&temp_file, &initial_jsonl).unwrap();

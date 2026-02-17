@@ -94,6 +94,21 @@ impl ParsedGitInvocation {
 
         None
     }
+
+    /// Returns all arguments after the `--` separator in command_args.
+    /// These are typically pathspecs (file paths) that should be treated literally.
+    ///
+    /// Examples:
+    /// - `git checkout -- file.txt` => pathspecs() returns vec!["file.txt"]
+    /// - `git reset HEAD -- a.txt b.txt` => pathspecs() returns vec!["a.txt", "b.txt"]
+    /// - `git checkout main` => pathspecs() returns vec![]
+    pub fn pathspecs(&self) -> Vec<String> {
+        if let Some(separator_pos) = self.command_args.iter().position(|arg| arg == "--") {
+            self.command_args[separator_pos + 1..].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// Returns true if the given flag typically takes a value as the next argument.
@@ -219,14 +234,15 @@ pub fn parse_git_cli_args(args: &[String]) -> ParsedGitInvocation {
 
     // Consume one token that *may* have an attached value (e.g. `--opt=VAL`, `-Cpath`, `-cname=val`).
     // Returns (tokens_to_push, tokens_consumed).
-    fn take_valueish<'a>(all: &'a [String], i: usize, key: &str) -> (Vec<String>, usize) {
+    fn take_valueish(all: &[String], i: usize, key: &str) -> (Vec<String>, usize) {
         let tok = &all[i];
 
         // Long form with '=' (e.g. --git-dir=/x, --exec-path=/x, --config-env=name=ENV).
-        if let Some(eq) = tok.find('=') {
-            if eq > 0 && tok.starts_with("--") {
-                return (vec![tok.clone()], 1);
-            }
+        if let Some(eq) = tok.find('=')
+            && eq > 0
+            && tok.starts_with("--")
+        {
+            return (vec![tok.clone()], 1);
         }
 
         // Short sticky for -Cpath / -cname=value
@@ -371,7 +387,7 @@ pub fn parse_git_cli_args(args: &[String]) -> ParsedGitInvocation {
             let orig_cmd = command.take().unwrap();
             let mut new_args = vec![orig_cmd];
             // Pass trailing tokens after the command to `git help` unchanged.
-            new_args.extend(command_args.drain(..));
+            new_args.append(&mut command_args);
             command = Some("help".into());
             command_args = new_args;
         }
@@ -542,11 +558,9 @@ fn derive_directory_from_url(url: &str) -> Option<String> {
     }
 
     // Strip .git suffix if present
-    let dir_name = if last_component.ends_with(".git") {
-        &last_component[..last_component.len() - 4]
-    } else {
-        last_component
-    };
+    let dir_name = last_component
+        .strip_suffix(".git")
+        .unwrap_or(last_component);
 
     if dir_name.is_empty() {
         None

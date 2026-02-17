@@ -29,7 +29,14 @@ Thank you for your interest in contributing to `git-ai`. This is a cool moment f
    cargo test
    ```
 
-### (Option 1) Using debug commands with symlinks (Recommended)
+5. **Check code coverage** (optional but recommended):
+   ```bash
+   task coverage
+   ```
+
+   The project maintains a minimum code coverage threshold of **50%** (enforced in CI). This threshold is based on the current coverage rounded down to the nearest 5%. Pull requests that reduce coverage below this threshold will fail CI checks.
+
+### (Option 1) Putting a development build on your path
 
 The recommended way to test your changes is to use the debug commands (`debug-git-ai` and `debug-git`). This approach doesn't interfere with any installed version of git-ai.
 
@@ -112,5 +119,5 @@ The project uses standard Rust formatting. Please run `cargo fmt` before committ
 
 If you have questions about contributing, feel free to open an issue or reach out to the maintainers.
 
-- **Discord**: [Link TBD]
-- **Office Hours**: [Schedule TBD]
+- **Discord**: https://discord.gg/XJStYvkb5U
+- **Office Hours**: https://calendly.com/acunniffe/meeting-with-git-ai-authors

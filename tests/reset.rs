@@ -2,6 +2,7 @@
 mod repos;
 use repos::test_file::ExpectedLineExt;
 use repos::test_repo::TestRepo;
+use std::fs;
 
 /// Test git reset --hard: should discard all changes and reset to target commit
 #[test]
@@ -59,7 +60,7 @@ fn test_reset_soft_reconstructs_working_log() {
 
     // Verify AI authorship was preserved in the commit
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved after reset --soft"
     );
 
@@ -98,7 +99,7 @@ fn test_reset_mixed_reconstructs_working_log() {
 
     // Verify AI authorship was preserved
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved after reset --mixed"
     );
 
@@ -132,7 +133,7 @@ fn test_reset_to_same_commit_is_noop() {
     let new_commit = repo.stage_all_and_commit("After reset to HEAD").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved for uncommitted changes"
     );
 
@@ -170,7 +171,7 @@ fn test_reset_multiple_commits() {
     let new_commit = repo.commit("Re-commit features").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved for all unwound commits"
     );
 
@@ -210,7 +211,7 @@ fn test_reset_preserves_uncommitted_changes() {
     let new_commit = repo.commit("Re-commit AI changes").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved from multiple unwound commits"
     );
 
@@ -251,7 +252,7 @@ fn test_reset_with_pathspec() {
     let new_commit = repo.stage_all_and_commit("After pathspec reset").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved for file2"
     );
 
@@ -320,7 +321,7 @@ fn test_reset_mixed_ai_human_changes() {
     let new_commit = repo.commit("Re-commit mixed changes").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved in mixed AI/human changes"
     );
 
@@ -357,7 +358,7 @@ fn test_reset_merge() {
     let new_commit = repo.stage_all_and_commit("Re-commit").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved after reset"
     );
 
@@ -388,7 +389,7 @@ fn test_reset_with_new_files() {
     let new_commit = repo.commit("Re-commit with new file").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved for new file"
     );
 
@@ -474,7 +475,7 @@ fn test_reset_mixed_pathspec_preserves_ai_authorship() {
     let new_commit = repo.stage_all_and_commit("After pathspec reset").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved for file2 after pathspec reset"
     );
 
@@ -530,7 +531,7 @@ fn test_reset_mixed_pathspec_multiple_commits() {
     let new_commit = repo.stage_all_and_commit("After pathspec reset").unwrap();
 
     assert!(
-        new_commit.authorship_log.attestations.len() > 0,
+        !new_commit.authorship_log.attestations.is_empty(),
         "AI authorship should be preserved for lib.js after pathspec reset"
     );
 
@@ -540,5 +541,65 @@ fn test_reset_mixed_pathspec_multiple_commits() {
         "// AI lib 1".ai(),
         "// AI lib 2".ai(),
         "// More lib".ai(),
+    ]);
+}
+
+/// Test git reset with directory pathspec: should reset only files in the specified directory
+#[test]
+fn test_reset_with_directory_pathspec() {
+    let repo = TestRepo::new();
+
+    // Create directory structure
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::create_dir_all(repo.path().join("lib")).unwrap();
+
+    let mut src_file = repo.filename("src/app.rs");
+    let mut lib_file = repo.filename("lib/utils.rs");
+    let mut root_file = repo.filename("root.txt");
+
+    // Base commit with files in different directories
+    src_file.set_contents(lines!["fn main() {}", ""]);
+    lib_file.set_contents(lines!["pub fn helper() {}", ""]);
+    root_file.set_contents(lines!["root content", ""]);
+    let base_commit = repo.stage_all_and_commit("Base commit").unwrap();
+
+    // Second commit: AI modifies files in all directories
+    src_file.insert_at(1, lines!["    // AI src change".ai()]);
+    lib_file.insert_at(1, lines!["    // AI lib change".ai()]);
+    root_file.insert_at(1, lines!["// AI root change".ai()]);
+    repo.stage_all_and_commit("AI changes everywhere").unwrap();
+
+    // Make uncommitted AI changes to lib and root (not src)
+    lib_file.insert_at(2, lines!["    // More AI lib".ai()]);
+    root_file.insert_at(2, lines!["// More AI root".ai()]);
+
+    // Reset only the src directory to base commit using directory pathspec
+    repo.git(&["reset", &base_commit.commit_sha, "--", "src"])
+        .expect("reset with directory pathspec should succeed");
+
+    // Stage all and commit to verify attributions
+    let new_commit = repo
+        .stage_all_and_commit("After directory pathspec reset")
+        .unwrap();
+
+    assert!(
+        !new_commit.authorship_log.attestations.is_empty(),
+        "AI authorship should be preserved for lib and root files"
+    );
+
+    // lib/utils.rs should still have AI changes (not in reset pathspec)
+    lib_file = repo.filename("lib/utils.rs");
+    lib_file.assert_lines_and_blame(lines![
+        "pub fn helper() {}".human(),
+        "    // AI lib change".ai(),
+        "    // More AI lib".ai(),
+    ]);
+
+    // root.txt should still have AI changes (not in reset pathspec)
+    root_file = repo.filename("root.txt");
+    root_file.assert_lines_and_blame(lines![
+        "root content".human(),
+        "// AI root change".ai(),
+        "// More AI root".ai(),
     ]);
 }

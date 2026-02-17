@@ -40,10 +40,9 @@ fn truncate_checkpoint_hashes(repo: &TestRepo, commit_sha: &str) {
                     for attr in attributions {
                         if let Some(author_id) =
                             attr.get_mut("author_id").and_then(|id| id.as_str())
+                            && author_id.len() == 16
                         {
-                            if author_id.len() == 16 {
-                                attr["author_id"] = Value::String(author_id[..7].to_string());
-                            }
+                            attr["author_id"] = Value::String(author_id[..7].to_string());
                         }
                     }
                 }
@@ -56,18 +55,16 @@ fn truncate_checkpoint_hashes(repo: &TestRepo, commit_sha: &str) {
                     for line_attr in line_attrs {
                         if let Some(author_id) =
                             line_attr.get_mut("author_id").and_then(|id| id.as_str())
+                            && author_id.len() == 16
                         {
-                            if author_id.len() == 16 {
-                                line_attr["author_id"] = Value::String(author_id[..7].to_string());
-                            }
+                            line_attr["author_id"] = Value::String(author_id[..7].to_string());
                         }
                         // Also truncate overrode field if present
                         if let Some(overrode) =
                             line_attr.get_mut("overrode").and_then(|o| o.as_str())
+                            && overrode.len() == 16
                         {
-                            if overrode.len() == 16 {
-                                line_attr["overrode"] = Value::String(overrode[..7].to_string());
-                            }
+                            line_attr["overrode"] = Value::String(overrode[..7].to_string());
                         }
                     }
                 }
@@ -88,7 +85,7 @@ fn verify_prompt_ids_are_16_chars(
     authorship_log: &git_ai::authorship::authorship_log_serialization::AuthorshipLog,
 ) {
     // Check all prompt IDs in metadata.prompts
-    for (prompt_id, _) in &authorship_log.metadata.prompts {
+    for prompt_id in authorship_log.metadata.prompts.keys() {
         assert_eq!(
             prompt_id.len(),
             16,

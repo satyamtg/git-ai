@@ -224,8 +224,13 @@ fn test_github_copilot_empty_will_edit_filepaths_fails() {
         &hook_input.to_string(),
     ]);
 
-    // Should fail because will_edit_filepaths is empty
-    assert!(result.is_err());
+    // Should exit 0 (to avoid interrupting agent hooks) but print error message
+    let output = result.unwrap();
+    assert!(
+        output.contains("will_edit_filepaths cannot be empty"),
+        "Expected error message about empty will_edit_filepaths, got: {}",
+        output
+    );
 }
 
 /// Test human checkpoint preserves file contents even when file isn't dirty

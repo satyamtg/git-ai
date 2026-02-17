@@ -307,7 +307,7 @@ fn test_ai_tab_e2e_handles_dirty_files_map() {
     let lib_file_path_str = lib_file_path.to_string_lossy().to_string();
     let readme_file_path_str = readme_file_path.to_string_lossy().to_string();
 
-    let working_logs = repo.current_working_logs();
+    let _working_logs = repo.current_working_logs();
 
     // Before edit snapshot includes all dirty files (AI target plus unrelated human edits)
     run_ai_tab_checkpoint(
@@ -331,7 +331,7 @@ fn test_ai_tab_e2e_handles_dirty_files_map() {
             .to_string();
     fs::write(&lib_file_path, &ai_content).unwrap();
 
-    let working_logs = repo.current_working_logs();
+    let _working_logs = repo.current_working_logs();
 
     run_ai_tab_checkpoint(
         &repo,
@@ -348,7 +348,7 @@ fn test_ai_tab_e2e_handles_dirty_files_map() {
         }),
     );
 
-    let working_logs = repo.current_working_logs();
+    let _working_logs = repo.current_working_logs();
 
     let commit_result = repo
         .stage_all_and_commit("Record AI tab completion while other files dirty")

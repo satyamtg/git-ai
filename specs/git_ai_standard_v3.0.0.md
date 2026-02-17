@@ -6,9 +6,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ---
 
-The [Git AI project](https://github.com/acunniffe/git-ai) is a full, production-ready implimentation of this standard built as a Git extension. Another project would be considered compliant with this standard if it also attached AI Authorship Logs with Git Notes, even if it was implimented in another way. 
+The [Git AI project](https://github.com/git-ai-project/git-ai) is a full, production-ready implementation of this standard built as a Git extension. Another project would be considered compliant with this standard if it also attached AI Authorship Logs with Git Notes, even if it was implemented in another way. 
 
-If you are trying to add support for your Coding Agent to Git AI format, that is best done by [integrating with published implimentation](https://usegitai.com/docs/add-your-agent), not implimenting this spec. 
+If you are trying to add support for your Coding Agent to Git AI format, that is best done by [integrating with published implementation](https://usegitai.com/docs/cli/add-your-agent), not implementing this spec. 
 
 ## 1. Authorship Logs
 
@@ -166,7 +166,7 @@ Each entry in the `prompts` object MUST contain:
 | `total_additions` | integer | REQUIRED | Total lines added by this session |
 | `total_deletions` | integer | REQUIRED | Total lines deleted by this session |
 | `accepted_lines` | integer | REQUIRED | Lines accepted in the final commit |
-| `overriden_lines` | integer | REQUIRED | Lines that were later modified by human |
+| `overridden_lines` | integer | REQUIRED | Lines that were later modified by human |
 
 #### Agent ID Object
 
@@ -505,7 +505,7 @@ When `git reset --hard` is used:
 
 - HEAD, index, and working directory all move to the target commit
 - AI Attributions in your implementation's working state MUST be cleared 
-- AI Authorship Notes SHOUT NOT be deleted. 
+- AI Authorship Notes SHOULD NOT be deleted. 
 
 #### Partial Reset
 
@@ -729,4 +729,8 @@ When amend is used during a rebase or other operation:
 
 - Implementations of 3.0.0 or later SHOULD NOT attempt to process earlier versions
 - Implementations > 3.0.0 MUST process earlier versions, provided they are valid and match the schema they advertise
+
+### Errata
+
+E-001: The field name overriden_lines was introduced as a typographical error in v3.0.0 and shipped in the reference git-ai implementation, where it became canonical. In v4.x, this field WILL be renamed to overridden_lines.
 

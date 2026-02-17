@@ -8,6 +8,7 @@ use git_ai::commands::checkpoint_agent::agent_presets::{
 };
 use serde_json::json;
 use std::fs;
+use std::io::Write;
 use test_utils::fixture_path;
 
 #[test]
@@ -37,6 +38,8 @@ fn test_parse_example_claude_code_jsonl_with_model() {
             Message::ToolUse { name, input, .. } => {
                 println!("{}: ToolUse: {} with input: {:?}", i, name, input)
             }
+            Message::Thinking { text, .. } => println!("{}: Thinking: {}", i, text),
+            Message::Plan { text, .. } => println!("{}: Plan: {}", i, text),
         }
     }
 }
@@ -93,6 +96,74 @@ fn test_claude_preset_no_filepath_when_tool_input_missing() {
 
     // Verify edited_filepaths is None when tool_input is missing
     assert!(result.edited_filepaths.is_none());
+}
+
+#[test]
+fn test_claude_preset_redirects_vscode_copilot_payload() {
+    let hook_input = json!({
+        "hookEventName": "PreToolUse",
+        "cwd": "/Users/test/project",
+        "toolName": "copilot_replaceString",
+        "toolInput": {
+            "file_path": "/Users/test/project/src/main.ts"
+        },
+        "sessionId": "copilot-session-1",
+        "model": "copilot/claude-sonnet-4"
+    });
+
+    let flags = AgentCheckpointFlags {
+        hook_input: Some(hook_input.to_string()),
+    };
+
+    let preset = ClaudePreset;
+    let result = preset
+        .run(flags)
+        .expect("Expected redirect to Copilot preset");
+
+    assert_eq!(
+        result.checkpoint_kind,
+        git_ai::authorship::working_log::CheckpointKind::Human
+    );
+    assert_eq!(result.agent_id.tool, "human");
+    assert_eq!(
+        result.will_edit_filepaths,
+        Some(vec!["/Users/test/project/src/main.ts".to_string()])
+    );
+}
+
+#[test]
+fn test_claude_preset_does_not_redirect_when_transcript_path_is_claude() {
+    let temp = tempfile::tempdir().unwrap();
+    let claude_dir = temp.path().join(".claude").join("projects");
+    fs::create_dir_all(&claude_dir).unwrap();
+
+    let transcript_path = claude_dir.join("session.jsonl");
+    let fixture = fixture_path("example-claude-code.jsonl");
+    let mut dst = std::fs::File::create(&transcript_path).unwrap();
+    let src = std::fs::read(fixture).unwrap();
+    dst.write_all(&src).unwrap();
+
+    let hook_input = json!({
+        "hookEventName": "PostToolUse",
+        "cwd": "/Users/test/project",
+        "toolName": "copilot_replaceString",
+        "toolInput": {
+            "file_path": "/Users/test/project/src/main.ts"
+        },
+        "sessionId": "copilot-session-2",
+        "transcript_path": transcript_path.to_string_lossy().to_string()
+    });
+
+    let flags = AgentCheckpointFlags {
+        hook_input: Some(hook_input.to_string()),
+    };
+
+    let preset = ClaudePreset;
+    let result = preset
+        .run(flags)
+        .expect("Expected native Claude preset handling");
+
+    assert_eq!(result.agent_id.tool, "claude");
 }
 
 #[test]
@@ -207,6 +278,20 @@ fn test_parse_claude_code_jsonl_with_thinking() {
             Message::ToolUse { name, input, .. } => {
                 println!("{}: ToolUse: {} with input: {:?}", i, name, input)
             }
+            Message::Thinking { text, .. } => {
+                println!(
+                    "{}: Thinking: {}",
+                    i,
+                    text.chars().take(100).collect::<String>()
+                )
+            }
+            Message::Plan { text, .. } => {
+                println!(
+                    "{}: Plan: {}",
+                    i,
+                    text.chars().take(100).collect::<String>()
+                )
+            }
         }
     }
 
@@ -288,9 +373,8 @@ fn test_tool_results_are_not_parsed_as_user_messages() {
     temp_file.write_all(jsonl_content.as_bytes()).unwrap();
     let temp_path = temp_file.path().to_str().unwrap();
 
-    let (transcript, _model) =
-        ClaudePreset::transcript_and_model_from_claude_code_jsonl(temp_path)
-            .expect("Failed to parse JSONL");
+    let (transcript, _model) = ClaudePreset::transcript_and_model_from_claude_code_jsonl(temp_path)
+        .expect("Failed to parse JSONL");
 
     // Should only have 1 message (the assistant response)
     // The tool_result should be skipped entirely
@@ -326,9 +410,8 @@ fn test_user_text_content_blocks_are_parsed_correctly() {
     temp_file.write_all(jsonl_content.as_bytes()).unwrap();
     let temp_path = temp_file.path().to_str().unwrap();
 
-    let (transcript, _model) =
-        ClaudePreset::transcript_and_model_from_claude_code_jsonl(temp_path)
-            .expect("Failed to parse JSONL");
+    let (transcript, _model) = ClaudePreset::transcript_and_model_from_claude_code_jsonl(temp_path)
+        .expect("Failed to parse JSONL");
 
     // Should have 2 messages (user + assistant)
     assert_eq!(

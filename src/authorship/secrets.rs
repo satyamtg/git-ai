@@ -111,7 +111,6 @@ fn get_bigram_set_len() -> usize {
     BIGRAMS.len()
 }
 
-
 /// Statistics collected in a single pass over the token.
 struct CharStats {
     distinct_count: usize,
@@ -256,11 +255,7 @@ fn erfc_approx(x: f64) -> f64 {
         * (0.254829592
             + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
     let result = poly * (-x * x).exp(); // Single exp() call
-    if x >= 0.0 {
-        result
-    } else {
-        2.0 - result
-    }
+    if x >= 0.0 { result } else { 2.0 - result }
 }
 
 /// Calculate binomial probability (cumulative tail probability).
@@ -330,6 +325,7 @@ fn get_stirling_table() -> &'static [[f64; 65]; MAX_SECRET_LENGTH + 1] {
 
         // S(n, 1) = 1 for all n >= 1
         // S(n, n) = 1 for all n >= 1
+        #[allow(clippy::needless_range_loop)]
         for n in 1..=MAX_SECRET_LENGTH {
             table[n][1] = 1.0;
             if n <= 64 {
@@ -340,6 +336,7 @@ fn get_stirling_table() -> &'static [[f64; 65]; MAX_SECRET_LENGTH + 1] {
         // Fill using DP: S(n,k) = k*S(n-1,k) + S(n-1,k-1)
         for n in 2..=MAX_SECRET_LENGTH {
             let max_k = n.min(64);
+            #[allow(clippy::needless_range_loop)]
             for k in 2..max_k {
                 table[n][k] = k as f64 * table[n - 1][k] + table[n - 1][k - 1];
             }
@@ -360,7 +357,6 @@ fn stirling(n: usize, k: usize) -> f64 {
     }
     get_stirling_table()[n][k]
 }
-
 
 /// Check if a string is likely a random/secret string.
 /// Returns true if the string appears to be a secret.
@@ -410,7 +406,7 @@ pub fn extract_tokens(text: &str) -> Vec<(usize, usize)> {
         let len = i - start;
 
         // Only consider tokens in the right length range
-        if len >= MIN_SECRET_LENGTH && len <= MAX_SECRET_LENGTH {
+        if (MIN_SECRET_LENGTH..=MAX_SECRET_LENGTH).contains(&len) {
             tokens.push((start, i));
         }
     }
@@ -440,7 +436,7 @@ pub fn redact_secrets_in_text(text: &str) -> (String, usize) {
     // Filter to only actual secrets (start, end positions)
     let secrets: Vec<(usize, usize)> = tokens
         .into_iter()
-        .filter(|&(start, end)| is_random(text[start..end].as_bytes()))
+        .filter(|&(start, end)| is_random(&text.as_bytes()[start..end]))
         .collect();
 
     let count = secrets.len();
@@ -479,7 +475,10 @@ pub fn redact_secrets_from_prompts(prompts: &mut BTreeMap<String, PromptRecord>)
     for record in prompts.values_mut() {
         for message in &mut record.messages {
             match message {
-                Message::User { text, .. } | Message::Assistant { text, .. } => {
+                Message::User { text, .. }
+                | Message::Assistant { text, .. }
+                | Message::Thinking { text, .. }
+                | Message::Plan { text, .. } => {
                     let (redacted, count) = redact_secrets_in_text(text);
                     *text = redacted;
                     total_redactions += count;
@@ -538,9 +537,11 @@ mod tests {
         let tokens = extract_tokens(text);
         assert!(!tokens.is_empty());
         // The token should be extracted (API_KEY is 7 chars, too short; the secret is 32 chars)
-        assert!(tokens
-            .iter()
-            .any(|&(start, end)| &text[start..end] == "sk_test_4eC39HqLyjWDarjtT1zdp7dc"));
+        assert!(
+            tokens
+                .iter()
+                .any(|&(start, end)| &text[start..end] == "sk_test_4eC39HqLyjWDarjtT1zdp7dc")
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod checkout_hooks;
 pub mod cherry_pick_hooks;
 pub mod clone_hooks;
 pub mod commit_hooks;
@@ -7,3 +8,4 @@ pub mod push_hooks;
 pub mod rebase_hooks;
 pub mod reset_hooks;
 pub mod stash_hooks;
+pub mod switch_hooks;

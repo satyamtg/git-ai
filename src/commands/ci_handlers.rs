@@ -1,8 +1,32 @@
-use crate::ci::ci_context::{CiContext, CiEvent};
+use crate::ci::ci_context::{CiContext, CiEvent, CiRunResult};
 use crate::ci::github::{get_github_ci_context, install_github_ci_workflow};
 use crate::ci::gitlab::{get_gitlab_ci_context, print_gitlab_ci_yaml};
 use crate::git::repository::find_repository_in_path;
 use crate::utils::debug_log;
+
+/// Print a human-readable message for a CiRunResult
+fn print_ci_result(result: &CiRunResult, prefix: &str) {
+    match result {
+        CiRunResult::AuthorshipRewritten { .. } => {
+            println!("{}: authorship rewritten successfully", prefix);
+        }
+        CiRunResult::AlreadyExists { .. } => {
+            println!("{}: authorship already exists", prefix);
+        }
+        CiRunResult::SkippedSimpleMerge => {
+            println!("{}: skipped simple merge (authorship preserved)", prefix);
+        }
+        CiRunResult::SkippedFastForward => {
+            println!("{}: skipped fast-forward merge", prefix);
+        }
+        CiRunResult::NoAuthorshipAvailable => {
+            println!(
+                "{}: no AI authorship to track (pre-git-ai commits or human-only code)",
+                prefix
+            );
+        }
+    }
+}
 
 pub fn handle_ci(args: &[String]) {
     if args.is_empty() {
@@ -38,9 +62,15 @@ fn handle_ci_github(args: &[String]) {
             match ci_context {
                 Ok(Some(ci_context)) => {
                     debug_log(&format!("GitHub CI context: {:?}", ci_context));
-                    if let Err(e) = ci_context.run() {
-                        eprintln!("Error running GitHub CI context: {}", e);
-                        std::process::exit(1);
+                    match ci_context.run() {
+                        Ok(result) => {
+                            debug_log(&format!("GitHub CI result: {:?}", result));
+                            print_ci_result(&result, "GitHub CI");
+                        }
+                        Err(e) => {
+                            eprintln!("Error running GitHub CI context: {}", e);
+                            std::process::exit(1);
+                        }
                     }
                     if !no_cleanup {
                         if let Err(e) = ci_context.teardown() {
@@ -92,9 +122,15 @@ fn handle_ci_gitlab(args: &[String]) {
             match ci_context {
                 Ok(Some(ci_context)) => {
                     debug_log(&format!("GitLab CI context: {:?}", ci_context));
-                    if let Err(e) = ci_context.run() {
-                        eprintln!("Error running GitLab CI context: {}", e);
-                        std::process::exit(1);
+                    match ci_context.run() {
+                        Ok(result) => {
+                            debug_log(&format!("GitLab CI result: {:?}", result));
+                            print_ci_result(&result, "GitLab CI");
+                        }
+                        Err(e) => {
+                            eprintln!("Error running GitLab CI context: {}", e);
+                            std::process::exit(1);
+                        }
                     }
                     if !no_cleanup {
                         if let Err(e) = ci_context.teardown() {
@@ -220,12 +256,16 @@ fn handle_ci_local(args: &[String]) {
             };
 
             debug_log(&format!("Local CI context: {:?}", ctx));
-            if let Err(e) = ctx.run() {
-                eprintln!("Error running local CI: {}", e);
-                std::process::exit(1);
+            match ctx.run() {
+                Ok(result) => {
+                    debug_log(&format!("Local CI result: {:?}", result));
+                    print_ci_result(&result, "Local CI (merge)");
+                }
+                Err(e) => {
+                    eprintln!("Error running local CI: {}", e);
+                    std::process::exit(1);
+                }
             }
-
-            println!("Local CI (merge) completed successfully");
             std::process::exit(0);
         }
         other => {
@@ -237,9 +277,9 @@ fn handle_ci_local(args: &[String]) {
 
 fn print_ci_help_and_exit() -> ! {
     eprintln!("git-ai ci - Continuous integration utilities");
-    eprintln!("");
+    eprintln!();
     eprintln!("Usage: git-ai ci <subcommand> [args...]");
-    eprintln!("");
+    eprintln!();
     eprintln!("Subcommands:");
     eprintln!("  github           GitHub CI");
     eprintln!("    run [--no-cleanup]  Run GitHub CI in current repo");
@@ -258,9 +298,9 @@ fn print_ci_help_and_exit() -> ! {
 
 fn print_ci_local_help_and_exit() -> ! {
     eprintln!("git-ai ci local - Run CI locally by event name and flags");
-    eprintln!("");
+    eprintln!();
     eprintln!("Usage: git-ai ci local <event> [flags]");
-    eprintln!("");
+    eprintln!();
     eprintln!("Events:");
     eprintln!(
         "  merge  --merge-commit-sha <sha> --base-ref <ref> --head-ref <ref> --head-sha <sha> --base-sha <sha>"
@@ -270,9 +310,9 @@ fn print_ci_local_help_and_exit() -> ! {
 
 fn print_ci_github_help_and_exit() -> ! {
     eprintln!("git-ai ci github - GitHub CI utilities");
-    eprintln!("");
+    eprintln!();
     eprintln!("Usage: git-ai ci github <subcommand> [args...]");
-    eprintln!("");
+    eprintln!();
     eprintln!("Subcommands:");
     eprintln!("  run [--no-cleanup]   Run GitHub CI in current repo");
     eprintln!("                       --no-cleanup  Skip teardown after run");
@@ -282,9 +322,9 @@ fn print_ci_github_help_and_exit() -> ! {
 
 fn print_ci_gitlab_help_and_exit() -> ! {
     eprintln!("git-ai ci gitlab - GitLab CI utilities");
-    eprintln!("");
+    eprintln!();
     eprintln!("Usage: git-ai ci gitlab <subcommand> [args...]");
-    eprintln!("");
+    eprintln!();
     eprintln!("Subcommands:");
     eprintln!("  run [--no-cleanup]   Run GitLab CI in current repo");
     eprintln!("                       --no-cleanup  Skip teardown after run");

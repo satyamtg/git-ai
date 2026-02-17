@@ -1,5 +1,8 @@
-use crate::config::{Config, id_file_path};
+use crate::api::{ApiClient, ApiContext, upload_metrics_with_retry};
+use crate::config::{Config, get_or_create_distinct_id};
 use crate::git::find_repository_in_path;
+use crate::metrics::db::MetricsDatabase;
+use crate::metrics::{MetricEvent, MetricsBatch};
 use futures::stream::{self, StreamExt};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -7,17 +10,28 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 /// Handle the flush-logs command
 pub fn handle_flush_logs(args: &[String]) {
+    // Acquire exclusive lock — if another flush-logs is already running, exit immediately
+    let _lock = {
+        let lock_path =
+            dirs::home_dir().map(|h| h.join(".git-ai").join("internal").join("flush-logs.lock"));
+        if let Some(ref p) = lock_path
+            && let Some(parent) = p.parent()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match lock_path.and_then(|p| crate::utils::LockFile::try_acquire(&p)) {
+            Some(lock) => lock,
+            None => std::process::exit(0),
+        }
+    };
+
     let force = args.contains(&"--force".to_string());
-    if cfg!(debug_assertions) && !force {
-        eprintln!(
-            "Flush logs is disabled in debug mode, but if you really want to run it add --force flag"
-        );
-        std::process::exit(1);
-    }
+
+    // In dev builds without --force, we only send metrics envelopes (skip error/performance/message)
+    let skip_non_metrics = cfg!(debug_assertions) && !force;
 
     let config = Config::get();
 
@@ -44,12 +58,10 @@ pub fn handle_flush_logs(args: &[String]) {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "https://us.i.posthog.com".to_string());
 
-    // Find the .git/ai/logs directory
-    let (repo_root, logs_dir) = match find_logs_directory() {
-        Some(result) => result,
-        None => {
-            std::process::exit(1);
-        }
+    // Get the global logs directory
+    let Some(logs_dir) = get_logs_directory() else {
+        // No logs directory - nothing to do, exit successfully
+        std::process::exit(0);
     };
 
     // Check for OSS DSN: runtime env var takes precedence over build-time value
@@ -64,39 +76,36 @@ pub fn handle_flush_logs(args: &[String]) {
             .filter(|s| !s.is_empty())
     };
 
-    // Need at least one DSN to proceed
-    if oss_dsn.is_none() && enterprise_dsn.is_none() && posthog_api_key.is_none() {
-        std::process::exit(1);
-    }
+    // Initialize metrics uploader (metrics can always be stored in local DB even if upload isn't possible)
+    let metrics_uploader = MetricsUploader::new();
 
     // Get current PID to exclude our own log file
     let current_pid = std::process::id();
     let current_log_file = format!("{}.log", current_pid);
 
     // Read all log files except current PID
-    let log_files: Vec<PathBuf> = match fs::read_dir(&logs_dir) {
-        Ok(entries) => entries
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n != current_log_file && n.ends_with(".log"))
-                        .unwrap_or(false)
-            })
-            .collect(),
-        Err(_) => {
-            std::process::exit(1);
-        }
-    };
+    let log_files: Vec<PathBuf> = fs::read_dir(&logs_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n != current_log_file && n.ends_with(".log"))
+                    .unwrap_or(false)
+        })
+        .collect();
 
     if log_files.is_empty() {
-        std::process::exit(1);
+        // No log files to process - nothing to do, exit successfully
+        std::process::exit(0);
     }
 
-    // Try to get repository info for metadata
+    // Try to get repository info for metadata (from current directory if in a repo)
+    let repo_root = std::env::current_dir().unwrap_or_default();
     let repo = find_repository_in_path(&repo_root.to_string_lossy()).ok();
     let remotes_info: Vec<(String, String)> = repo
         .as_ref()
@@ -121,8 +130,9 @@ pub fn handle_flush_logs(args: &[String]) {
             .map(|api_key| PostHogClient::new(api_key.clone(), posthog_host.clone()))
     };
 
-    // Check if clients are present (needed for cleanup logic later)
-    let has_clients =
+    // Check if telemetry clients are present (needed for cleanup logic later)
+    // Note: metrics are always processed (uploaded to API or stored in SQLite)
+    let has_telemetry_clients =
         oss_client.is_some() || enterprise_client.is_some() || posthog_client.is_some();
 
     eprintln!(
@@ -130,11 +140,69 @@ pub fn handle_flush_logs(args: &[String]) {
         log_files.len()
     );
 
+    // In debug mode (without --force), we only care about metrics.
+    // Coalesce all metrics across all log files and upload in large batches
+    // to avoid request storms from per-envelope uploads.
+    if skip_non_metrics {
+        let mut files_to_delete = Vec::new();
+        let mut all_metrics = Vec::new();
+
+        for log_file in &log_files {
+            let file_name = log_file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+
+            match collect_metrics_from_file(log_file) {
+                Ok((metrics_envelopes, metrics_events)) if !metrics_events.is_empty() => {
+                    eprintln!(
+                        "  ✓ {} - collected {} metrics event(s) from {} envelope(s)",
+                        file_name,
+                        metrics_events.len(),
+                        metrics_envelopes
+                    );
+                    files_to_delete.push(log_file.clone());
+                    all_metrics.extend(metrics_events);
+                }
+                Ok(_) => {
+                    eprintln!("  ○ {} - no metrics to send", file_name);
+                }
+                Err(e) => {
+                    eprintln!("  ✗ {} - error: {}", file_name, e);
+                }
+            }
+        }
+
+        let mut uploaded_batches = 0usize;
+        for chunk in all_metrics.chunks(crate::observability::MAX_METRICS_PER_ENVELOPE) {
+            if send_metrics_events(chunk, &metrics_uploader) {
+                uploaded_batches += 1;
+            }
+        }
+
+        eprintln!(
+            "\nSummary: {} metrics events sent in {} batch request(s) from {} files",
+            all_metrics.len(),
+            uploaded_batches,
+            files_to_delete.len()
+        );
+
+        if !files_to_delete.is_empty() {
+            eprintln!("Deleting {} processed log files", files_to_delete.len());
+            for file_path in files_to_delete {
+                let _ = fs::remove_file(&file_path);
+            }
+        }
+
+        std::process::exit(0);
+    }
+
     // Process log files in parallel (max 10 at a time)
     let results = smol::block_on(async {
         let oss_client = Arc::new(oss_client);
         let enterprise_client = Arc::new(enterprise_client);
         let posthog_client = Arc::new(posthog_client);
+        let metrics_uploader = Arc::new(metrics_uploader);
         let remotes_info = Arc::new(remotes_info);
         let distinct_id = Arc::new(distinct_id);
 
@@ -143,6 +211,7 @@ pub fn handle_flush_logs(args: &[String]) {
                 let oss_client = Arc::clone(&oss_client);
                 let enterprise_client = Arc::clone(&enterprise_client);
                 let posthog_client = Arc::clone(&posthog_client);
+                let metrics_uploader = Arc::clone(&metrics_uploader);
                 let remotes_info = Arc::clone(&remotes_info);
                 let distinct_id = Arc::clone(&distinct_id);
 
@@ -157,8 +226,10 @@ pub fn handle_flush_logs(args: &[String]) {
                         &oss_client,
                         &enterprise_client,
                         &posthog_client,
+                        &metrics_uploader,
                         &remotes_info,
                         &distinct_id,
+                        skip_non_metrics,
                     ) {
                         Ok(count) if count > 0 => {
                             eprintln!("  ✓ {} - sent {} events", file_name, count);
@@ -184,11 +255,9 @@ pub fn handle_flush_logs(args: &[String]) {
     let mut events_sent = 0;
     let mut files_to_delete = Vec::new();
 
-    for result in results {
-        if let Some((log_file, count)) = result {
-            events_sent += count;
-            files_to_delete.push(log_file);
-        }
+    for (log_file, count) in results.into_iter().flatten() {
+        events_sent += count;
+        files_to_delete.push(log_file);
     }
 
     eprintln!(
@@ -198,7 +267,7 @@ pub fn handle_flush_logs(args: &[String]) {
     );
 
     // Clean up old logs if no clients configured
-    if !has_clients {
+    if !has_telemetry_clients {
         eprintln!("Cleaning up old logs (no telemetry clients configured)...");
         cleanup_old_logs(&logs_dir);
     }
@@ -208,11 +277,11 @@ pub fn handle_flush_logs(args: &[String]) {
         for file_path in files_to_delete {
             let _ = fs::remove_file(&file_path);
         }
-
-        std::process::exit(0);
-    } else {
-        std::process::exit(1);
     }
+
+    // Exit 0 - processing completed successfully even if no events were sent
+    // (e.g., debug builds skip non-metrics events, which is expected behavior)
+    std::process::exit(0);
 }
 
 /// Clean up old log files when count > 100
@@ -224,14 +293,13 @@ fn cleanup_old_logs(logs_dir: &PathBuf) {
 
     // Collect all log files with their metadata
     let mut log_files: Vec<(PathBuf, fs::Metadata)> = Vec::new();
-    for entry in entries {
-        if let Ok(entry) = entry {
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("log") {
-                if let Ok(metadata) = entry.metadata() {
-                    log_files.push((path, metadata));
-                }
-            }
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().and_then(|s| s.to_str()) == Some("log")
+            && let Ok(metadata) = entry.metadata()
+        {
+            log_files.push((path, metadata));
         }
     }
 
@@ -250,40 +318,33 @@ fn cleanup_old_logs(logs_dir: &PathBuf) {
     // Delete logs older than a week
     for (path, metadata) in log_files {
         if let Ok(modified) = metadata.modified() {
-            if let Ok(modified_secs) = modified.duration_since(UNIX_EPOCH) {
-                if modified_secs.as_secs() < one_week_ago {
-                    let _ = fs::remove_file(&path);
-                }
+            if let Ok(modified_secs) = modified.duration_since(UNIX_EPOCH)
+                && modified_secs.as_secs() < one_week_ago
+            {
+                let _ = fs::remove_file(&path);
             }
         } else if let Ok(created) = metadata.created() {
             // Fallback to creation time if modification time is not available
-            if let Ok(created_secs) = created.duration_since(UNIX_EPOCH) {
-                if created_secs.as_secs() < one_week_ago {
-                    let _ = fs::remove_file(&path);
-                }
+            if let Ok(created_secs) = created.duration_since(UNIX_EPOCH)
+                && created_secs.as_secs() < one_week_ago
+            {
+                let _ = fs::remove_file(&path);
             }
         }
     }
 }
 
-fn find_logs_directory() -> Option<(PathBuf, PathBuf)> {
-    let mut current = std::env::current_dir().ok()?;
-
-    loop {
-        let git_dir = current.join(".git");
-        if git_dir.exists() && git_dir.is_dir() {
-            let logs_dir = git_dir.join("ai").join("logs");
-            if logs_dir.exists() && logs_dir.is_dir() {
-                return Some((current.clone(), logs_dir));
-            }
-        }
-
-        if !current.pop() {
-            break;
-        }
+/// Get the global logs directory (~/.git-ai/internal/logs).
+/// Creates it if it doesn't exist.
+fn get_logs_directory() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let logs_dir = home.join(".git-ai").join("internal").join("logs");
+    let _ = fs::create_dir_all(&logs_dir);
+    if logs_dir.is_dir() {
+        Some(logs_dir)
+    } else {
+        None
     }
-
-    None
 }
 
 struct SentryClient {
@@ -338,7 +399,7 @@ impl SentryClient {
             })
             .unwrap_or_else(|| "unknown".to_string());
 
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             Ok(event_id)
         } else {
             Err(format!("Sentry returned status {}", status).into())
@@ -362,10 +423,33 @@ impl PostHogClient {
 
         let status = response.status_code;
 
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             Ok(())
         } else {
             Err(format!("PostHog returned status {}", status).into())
+        }
+    }
+}
+
+/// Handles metrics upload via the API or fallback to SQLite
+struct MetricsUploader {
+    client: Option<ApiClient>,
+    should_upload: bool,
+}
+
+impl MetricsUploader {
+    fn new() -> Self {
+        let context = ApiContext::new(None);
+        let api_base_url = context.base_url.clone();
+        let client = ApiClient::new(context);
+
+        let using_default_api = api_base_url == crate::config::DEFAULT_API_BASE_URL;
+
+        let should_upload = !using_default_api || client.is_logged_in();
+
+        Self {
+            client: Some(client),
+            should_upload,
         }
     }
 }
@@ -380,13 +464,16 @@ fn initialize_sentry_clients(
     (oss_client, enterprise_client)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_log_file(
     path: &PathBuf,
     oss_client: &Option<SentryClient>,
     enterprise_client: &Option<SentryClient>,
     posthog_client: &Option<PostHogClient>,
+    metrics_uploader: &MetricsUploader,
     remotes_info: &[(String, String)],
     distinct_id: &str,
+    skip_non_metrics: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(path)?;
     let mut count = 0;
@@ -396,40 +483,73 @@ fn process_log_file(
             continue;
         }
 
-        match serde_json::from_str::<Value>(line) {
-            Ok(envelope) => {
-                let mut sent = false;
+        if let Ok(envelope) = serde_json::from_str::<Value>(line) {
+            let event_type = envelope.get("type").and_then(|t| t.as_str());
+            let mut sent = false;
+
+            // Handle metrics envelopes specially - send to API (always, even in dev builds)
+            if event_type == Some("metrics") {
+                if send_metrics_envelope(&envelope, metrics_uploader) {
+                    sent = true;
+                }
+            } else if !skip_non_metrics {
+                // Only send error/performance/message envelopes if not in dev mode
+                // (or if --force was passed)
 
                 // Send to OSS if configured
-                if let Some(client) = oss_client {
-                    if send_envelope_to_sentry(&envelope, client, remotes_info, distinct_id) {
-                        sent = true;
-                    }
+                if let Some(client) = oss_client
+                    && send_envelope_to_sentry(&envelope, client, remotes_info, distinct_id)
+                {
+                    sent = true;
                 }
 
                 // Send to Enterprise if configured
-                if let Some(client) = enterprise_client {
-                    if send_envelope_to_sentry(&envelope, client, remotes_info, distinct_id) {
-                        sent = true;
-                    }
+                if let Some(client) = enterprise_client
+                    && send_envelope_to_sentry(&envelope, client, remotes_info, distinct_id)
+                {
+                    sent = true;
                 }
 
                 // Send to PostHog if configured
-                if let Some(client) = posthog_client {
-                    if send_envelope_to_posthog(&envelope, client, remotes_info, distinct_id) {
-                        sent = true;
-                    }
-                }
-
-                if sent {
-                    count += 1;
+                if let Some(client) = posthog_client
+                    && send_envelope_to_posthog(&envelope, client, remotes_info, distinct_id)
+                {
+                    sent = true;
                 }
             }
-            Err(_) => {}
+
+            if sent {
+                count += 1;
+            }
         }
     }
 
     Ok(count)
+}
+
+fn collect_metrics_from_file(
+    path: &PathBuf,
+) -> Result<(usize, Vec<MetricEvent>), Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
+    let mut metrics_events = Vec::new();
+    let mut metrics_envelopes = 0usize;
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if let Ok(envelope) = serde_json::from_str::<Value>(line)
+            && envelope.get("type").and_then(|t| t.as_str()) == Some("metrics")
+            && let Some(events_value) = envelope.get("events")
+            && let Ok(mut events) = serde_json::from_value::<Vec<MetricEvent>>(events_value.clone())
+        {
+            metrics_envelopes += 1;
+            metrics_events.append(&mut events);
+        }
+    }
+
+    Ok((metrics_envelopes, metrics_events))
 }
 
 fn send_envelope_to_sentry(
@@ -462,11 +582,11 @@ fn send_envelope_to_sentry(
             let context = envelope.get("context");
 
             let mut extra = BTreeMap::new();
-            if let Some(ctx) = context {
-                if let Some(obj) = ctx.as_object() {
-                    for (key, value) in obj {
-                        extra.insert(key.clone(), value.clone());
-                    }
+            if let Some(ctx) = context
+                && let Some(obj) = ctx.as_object()
+            {
+                for (key, value) in obj {
+                    extra.insert(key.clone(), value.clone());
                 }
             }
 
@@ -494,11 +614,11 @@ fn send_envelope_to_sentry(
             let mut extra = BTreeMap::new();
             extra.insert("operation".to_string(), json!(operation));
             extra.insert("duration_ms".to_string(), json!(duration_ms));
-            if let Some(ctx) = context {
-                if let Some(obj) = ctx.as_object() {
-                    for (key, value) in obj {
-                        extra.insert(key.clone(), value.clone());
-                    }
+            if let Some(ctx) = context
+                && let Some(obj) = ctx.as_object()
+            {
+                for (key, value) in obj {
+                    extra.insert(key.clone(), value.clone());
                 }
             }
 
@@ -524,11 +644,11 @@ fn send_envelope_to_sentry(
             let context = envelope.get("context");
 
             let mut extra = BTreeMap::new();
-            if let Some(ctx) = context {
-                if let Some(obj) = ctx.as_object() {
-                    for (key, value) in obj {
-                        extra.insert(key.clone(), value.clone());
-                    }
+            if let Some(ctx) = context
+                && let Some(obj) = ctx.as_object()
+            {
+                for (key, value) in obj {
+                    extra.insert(key.clone(), value.clone());
                 }
             }
 
@@ -547,10 +667,7 @@ fn send_envelope_to_sentry(
         }
     };
 
-    match client.send_event(event) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    client.send_event(event).is_ok()
 }
 
 fn send_envelope_to_posthog(
@@ -591,11 +708,11 @@ fn send_envelope_to_posthog(
     properties.insert("message".to_string(), json!(message));
     properties.insert("level".to_string(), json!(level));
 
-    if let Some(ctx) = context {
-        if let Some(obj) = ctx.as_object() {
-            for (key, value) in obj {
-                properties.insert(key.clone(), value.clone());
-            }
+    if let Some(ctx) = context
+        && let Some(obj) = ctx.as_object()
+    {
+        for (key, value) in obj {
+            properties.insert(key.clone(), value.clone());
         }
     }
 
@@ -610,10 +727,7 @@ fn send_envelope_to_posthog(
         event["timestamp"] = json!(ts);
     }
 
-    match client.send_event(event) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    client.send_event(event).is_ok()
 }
 
 /// Sanitize git URLs by replacing passwords with asterisks
@@ -642,34 +756,69 @@ fn sanitize_git_url(url: &str) -> String {
     url.to_string()
 }
 
-/// Get or create the distinct_id (UUID) from ~/.git-ai/internal/distinct_id
-/// If the file doesn't exist, generates a new UUID and writes it to the file
-fn get_or_create_distinct_id() -> String {
-    let id_path = match id_file_path() {
-        Some(path) => path,
-        None => return "unknown".to_string(),
+/// Send a metrics envelope to the API or store in SQLite as fallback
+fn send_metrics_envelope(envelope: &Value, uploader: &MetricsUploader) -> bool {
+    // Parse events from the envelope
+    let events_value = match envelope.get("events") {
+        Some(e) => e,
+        None => return false,
     };
 
-    // Try to read existing ID
-    if let Ok(existing_id) = fs::read_to_string(&id_path) {
-        let trimmed = existing_id.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+    // Deserialize events
+    let events: Vec<MetricEvent> = match serde_json::from_value(events_value.clone()) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    send_metrics_events(&events, uploader)
+}
+
+fn send_metrics_events(events: &[MetricEvent], uploader: &MetricsUploader) -> bool {
+    if events.is_empty() {
+        return true; // Nothing to upload, but not a failure
+    }
+
+    let batch = MetricsBatch::new(events.to_vec());
+
+    if uploader.should_upload
+        && let Some(client) = &uploader.client
+    {
+        match upload_metrics_with_retry(client, &batch, "flush_logs") {
+            Ok(()) => return true,
+            Err(_) => {
+                store_metrics_in_db(events);
+                return true;
+            }
         }
     }
 
-    // Generate new UUID
-    let new_id = Uuid::new_v4().to_string();
+    store_metrics_in_db(events);
+    true
+}
 
-    // Ensure directory exists
-    if let Some(parent) = id_path.parent() {
-        let _ = fs::create_dir_all(parent);
+/// Store metric events in SQLite database for later upload
+fn store_metrics_in_db(events: &[MetricEvent]) {
+    if events.is_empty() {
+        return;
     }
 
-    // Write the new ID to file
-    if let Err(e) = fs::write(&id_path, &new_id) {
-        eprintln!("Warning: Failed to write distinct_id file: {}", e);
+    let event_jsons: Vec<String> = events
+        .iter()
+        .filter_map(|e| serde_json::to_string(e).ok())
+        .collect();
+
+    if event_jsons.is_empty() {
+        return;
     }
 
-    new_id
+    match MetricsDatabase::global() {
+        Ok(db) => {
+            if let Ok(mut db_lock) = db.lock() {
+                let _ = db_lock.insert_events(&event_jsons);
+            }
+        }
+        Err(_) => {
+            // Database unavailable - events will be lost
+        }
+    }
 }

@@ -1,5 +1,4 @@
-use serde_json::json;
-
+use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::range_authorship;
 use crate::authorship::stats::stats_command;
@@ -7,13 +6,14 @@ use crate::authorship::working_log::{AgentId, CheckpointKind};
 use crate::commands;
 use crate::commands::checkpoint_agent::agent_presets::{
     AgentCheckpointFlags, AgentCheckpointPreset, AgentRunResult, AiTabPreset, ClaudePreset,
-    ContinueCliPreset, CursorPreset, GeminiPreset, GithubCopilotPreset,
+    CodexPreset, ContinueCliPreset, CursorPreset, DroidPreset, GeminiPreset, GithubCopilotPreset,
 };
 use crate::commands::checkpoint_agent::agent_v1_preset::AgentV1Preset;
+use crate::commands::checkpoint_agent::opencode_preset::OpenCodePreset;
 use crate::config;
 use crate::git::find_repository;
 use crate::git::find_repository_in_path;
-use crate::git::repository::CommitRange;
+use crate::git::repository::{CommitRange, group_files_by_repository};
 use crate::observability::wrapper_performance_targets::log_performance_for_checkpoint;
 use crate::observability::{self, log_message};
 use crate::utils::is_interactive_terminal;
@@ -31,18 +31,14 @@ pub fn handle_git_ai(args: &[String]) {
     let current_dir = env::current_dir().unwrap().to_string_lossy().to_string();
     let repository_option = find_repository_in_path(&current_dir).ok();
 
-    // Set repo context to flush buffered events
-    if let Some(repo) = repository_option.as_ref() {
-        observability::set_repo_context(repo);
-    }
-
     let config = config::Config::get();
 
     let allowed_repository = config.is_allowed_repository(&repository_option);
 
     // Start DB warmup early for commands that need database access
     match args[0].as_str() {
-        "checkpoint" | "show-prompt" | "share" | "sync-prompts" | "flush-cas" => {
+        "checkpoint" | "show-prompt" | "share" | "sync-prompts" | "flush-cas" | "search"
+        | "continue" => {
             InternalDatabase::warmup();
         }
         _ => {}
@@ -72,6 +68,9 @@ pub fn handle_git_ai(args: &[String]) {
             }
             handle_stats(&args[1..]);
         }
+        "status" => {
+            commands::status::handle_status(&args[1..]);
+        }
         "show" => {
             commands::show::handle_show(&args[1..]);
         }
@@ -80,7 +79,7 @@ pub fn handle_git_ai(args: &[String]) {
                 eprintln!(
                     "Skipping checkpoint because repository is excluded or not in allow_repositories list"
                 );
-                std::process::exit(1);
+                std::process::exit(0);
             }
             handle_checkpoint(&args[1..]);
         }
@@ -101,7 +100,7 @@ pub fn handle_git_ai(args: &[String]) {
             println!("{}", config.git_cmd());
             std::process::exit(0);
         }
-        "install-hooks" => match commands::install_hooks::run(&args[1..]) {
+        "install-hooks" | "install" => match commands::install_hooks::run(&args[1..]) {
             Ok(statuses) => {
                 if let Ok(statuses_value) = serde_json::to_value(&statuses) {
                     log_message("install-hooks", "info", Some(statuses_value));
@@ -109,6 +108,17 @@ pub fn handle_git_ai(args: &[String]) {
             }
             Err(e) => {
                 eprintln!("Install hooks failed: {}", e);
+                std::process::exit(1);
+            }
+        },
+        "uninstall-hooks" => match commands::install_hooks::run_uninstall(&args[1..]) {
+            Ok(statuses) => {
+                if let Ok(statuses_value) = serde_json::to_value(&statuses) {
+                    log_message("uninstall-hooks", "info", Some(statuses_value));
+                }
+            }
+            Err(e) => {
+                eprintln!("Uninstall hooks failed: {}", e);
                 std::process::exit(1);
             }
         },
@@ -136,6 +146,21 @@ pub fn handle_git_ai(args: &[String]) {
         "flush-cas" => {
             commands::flush_cas::handle_flush_cas(&args[1..]);
         }
+        "flush-metrics-db" => {
+            commands::flush_metrics_db::handle_flush_metrics_db(&args[1..]);
+        }
+        "login" => {
+            commands::login::handle_login(&args[1..]);
+        }
+        "logout" => {
+            commands::logout::handle_logout(&args[1..]);
+        }
+        "exchange-nonce" => {
+            commands::exchange_nonce::handle_exchange_nonce(&args[1..]);
+        }
+        "dash" | "dashboard" => {
+            commands::personal_dashboard::handle_personal_dashboard(&args[1..]);
+        }
         "show-prompt" => {
             commands::show_prompt::handle_show_prompt(&args[1..]);
         }
@@ -144,6 +169,15 @@ pub fn handle_git_ai(args: &[String]) {
         }
         "sync-prompts" => {
             commands::sync_prompts::handle_sync_prompts(&args[1..]);
+        }
+        "prompts" => {
+            commands::prompts_db::handle_prompts(&args[1..]);
+        }
+        "search" => {
+            commands::search::handle_search(&args[1..]);
+        }
+        "continue" => {
+            commands::continue_session::handle_continue(&args[1..]);
         }
         #[cfg(debug_assertions)]
         "show-transcript" => {
@@ -158,12 +192,14 @@ pub fn handle_git_ai(args: &[String]) {
 
 fn print_help() {
     eprintln!("git-ai - git proxy with AI authorship tracking");
-    eprintln!("");
+    eprintln!();
     eprintln!("Usage: git-ai <command> [args...]");
-    eprintln!("");
+    eprintln!();
     eprintln!("Commands:");
     eprintln!("  checkpoint         Checkpoint working changes and attribute author");
-    eprintln!("    Presets: claude, continue-cli, cursor, gemini, github-copilot, ai_tab, mock_ai");
+    eprintln!(
+        "    Presets: claude, codex, continue-cli, cursor, gemini, github-copilot, ai_tab, mock_ai"
+    );
     eprintln!(
         "    --hook-input <json|stdin>   JSON payload required by presets, or 'stdin' to read from stdin"
     );
@@ -176,6 +212,8 @@ fn print_help() {
     eprintln!("    <commit1>..<commit2>  Diff between two commits");
     eprintln!("  stats [commit]     Show AI authorship statistics for a commit");
     eprintln!("    --json                 Output in JSON format");
+    eprintln!("  status             Show uncommitted AI authorship status (debug)");
+    eprintln!("    --json                 Output in JSON format");
     eprintln!("  show <rev|range>   Display authorship logs for a revision or range");
     eprintln!("  show-prompt <id>   Display a prompt record by its ID");
     eprintln!("    --commit <rev>        Look in a specific commit only");
@@ -186,7 +224,9 @@ fn print_help() {
     eprintln!("    --title <title>       Custom title for the bundle (default: auto-generated)");
     eprintln!("  sync-prompts       Update prompts in database to latest versions");
     eprintln!("    --since <time>        Only sync prompts updated after this time");
-    eprintln!("                          Formats: '1d', '2h', '1w', Unix timestamp, ISO8601, YYYY-MM-DD");
+    eprintln!(
+        "                          Formats: '1d', '2h', '1w', Unix timestamp, ISO8601, YYYY-MM-DD"
+    );
     eprintln!("    --workdir <path>      Only sync prompts from specific repository");
     eprintln!("  config             View and manage git-ai configuration");
     eprintln!("                        Show all config as formatted JSON");
@@ -195,6 +235,7 @@ fn print_help() {
     eprintln!("    --add <key> <value>   Add to array or upsert into object");
     eprintln!("    unset <key>           Remove config value (reverts to default)");
     eprintln!("  install-hooks      Install git hooks for AI authorship tracking");
+    eprintln!("  uninstall-hooks    Remove git-ai hooks from all detected tools");
     eprintln!("  ci                 Continuous integration utilities");
     eprintln!("    github                 GitHub CI helpers");
     eprintln!("  squash-authorship  Generate authorship log for squashed commits");
@@ -214,9 +255,43 @@ fn print_help() {
     eprintln!("  git-path           Print the path to the underlying git executable");
     eprintln!("  upgrade            Check for updates and install if available");
     eprintln!("    --force               Reinstall latest version even if already up to date");
+    eprintln!("  prompts            Create local SQLite database for prompt analysis");
+    eprintln!("    --since <time>        Only include prompts after this time (default: 30d)");
+    eprintln!("    --author <name>       Filter by human author (default: current git user)");
+    eprintln!("    --all-authors         Include prompts from all authors");
+    eprintln!("    --all-repositories    Include prompts from all repositories");
+    eprintln!("    exec \"<SQL>\"          Execute arbitrary SQL on prompts.db");
+    eprintln!("    list                  List prompts as TSV");
+    eprintln!("    next                  Get next prompt as JSON (iterator pattern)");
+    eprintln!("    reset                 Reset iteration pointer to start");
+    eprintln!("  search             Search AI prompt history");
+    eprintln!("    --commit <rev>        Search by commit (SHA, branch, tag, symbolic ref)");
+    eprintln!("    --file <path>         Search by file path");
+    eprintln!("    --lines <start-end>   Limit to line range (requires --file; repeatable)");
+    eprintln!("    --pattern <text>      Full-text search in prompt messages");
+    eprintln!("    --prompt-id <id>      Look up specific prompt");
+    eprintln!("    --tool <name>         Filter by AI tool (claude, cursor, etc.)");
+    eprintln!("    --author <name>       Filter by human author");
+    eprintln!("    --since <time>        Only prompts after this time");
+    eprintln!("    --until <time>        Only prompts before this time");
+    eprintln!("    --json                Output as JSON");
+    eprintln!("    --verbose             Include full transcripts");
+    eprintln!("    --porcelain           Stable machine-parseable format");
+    eprintln!("    --count               Just show result count");
+    eprintln!("  continue           Restore AI session context and launch agent");
+    eprintln!("    --commit <rev>        Continue from a specific commit");
+    eprintln!("    --file <path>         Continue from a specific file");
+    eprintln!("    --lines <start-end>   Limit to line range (requires --file)");
+    eprintln!("    --prompt-id <id>      Continue from a specific prompt");
+    eprintln!("    --agent <name>        Select agent (claude, cursor; default: claude)");
+    eprintln!("    --launch              Launch agent CLI with restored context");
+    eprintln!("    --clipboard           Copy context to system clipboard");
+    eprintln!("    --json                Output context as structured JSON");
+    eprintln!("  login              Authenticate with Git AI");
+    eprintln!("  logout             Clear stored credentials");
     eprintln!("  version, -v, --version     Print the git-ai version");
     eprintln!("  help, -h, --help           Show this help message");
-    eprintln!("");
+    eprintln!();
     std::process::exit(0);
 }
 
@@ -250,22 +325,22 @@ fn handle_checkpoint(args: &[String]) {
                         let mut buffer = String::new();
                         if let Err(e) = stdin.read_to_string(&mut buffer) {
                             eprintln!("Failed to read stdin for hook input: {}", e);
-                            std::process::exit(1);
+                            std::process::exit(0);
                         }
                         if !buffer.trim().is_empty() {
                             hook_input = Some(buffer);
                         } else {
                             eprintln!("No hook input provided (via --hook-input or stdin).");
-                            std::process::exit(1);
+                            std::process::exit(0);
                         }
                     } else if hook_input.as_ref().unwrap().trim().is_empty() {
                         eprintln!("Error: --hook-input requires a value");
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                     i += 2;
                 } else {
                     eprintln!("Error: --hook-input requires a value or 'stdin' to read from stdin");
-                    std::process::exit(1);
+                    std::process::exit(0);
                 }
             }
 
@@ -291,7 +366,23 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Claude preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
+                    }
+                }
+            }
+            "codex" => {
+                match CodexPreset.run(AgentCheckpointFlags {
+                    hook_input: hook_input.clone(),
+                }) {
+                    Ok(agent_run) => {
+                        if agent_run.repo_working_dir.is_some() {
+                            repository_working_dir = agent_run.repo_working_dir.clone().unwrap();
+                        }
+                        agent_run_result = Some(agent_run);
+                    }
+                    Err(e) => {
+                        eprintln!("Codex preset error: {}", e);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -307,7 +398,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Gemini preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -323,7 +414,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Continue CLI preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -339,7 +430,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Error running Cursor preset: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -352,7 +443,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Github Copilot preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -368,7 +459,7 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("ai_tab preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -381,7 +472,39 @@ fn handle_checkpoint(args: &[String]) {
                     }
                     Err(e) => {
                         eprintln!("Agent V1 preset error: {}", e);
-                        std::process::exit(1);
+                        std::process::exit(0);
+                    }
+                }
+            }
+            "droid" => {
+                match DroidPreset.run(AgentCheckpointFlags {
+                    hook_input: hook_input.clone(),
+                }) {
+                    Ok(agent_run) => {
+                        if agent_run.repo_working_dir.is_some() {
+                            repository_working_dir = agent_run.repo_working_dir.clone().unwrap();
+                        }
+                        agent_run_result = Some(agent_run);
+                    }
+                    Err(e) => {
+                        eprintln!("Droid preset error: {}", e);
+                        std::process::exit(0);
+                    }
+                }
+            }
+            "opencode" => {
+                match OpenCodePreset.run(AgentCheckpointFlags {
+                    hook_input: hook_input.clone(),
+                }) {
+                    Ok(agent_run) => {
+                        if agent_run.repo_working_dir.is_some() {
+                            repository_working_dir = agent_run.repo_working_dir.clone().unwrap();
+                        }
+                        agent_run_result = Some(agent_run);
+                    }
+                    Err(e) => {
+                        eprintln!("OpenCode preset error: {}", e);
+                        std::process::exit(0);
                     }
                 }
             }
@@ -435,15 +558,187 @@ fn handle_checkpoint(args: &[String]) {
     let final_working_dir = agent_run_result
         .as_ref()
         .and_then(|r| r.repo_working_dir.clone())
-        .unwrap_or_else(|| repository_working_dir);
-    // Find the git repository
-    let repo = match find_repository_in_path(&final_working_dir) {
-        Ok(repo) => repo,
-        Err(e) => {
-            eprintln!("Failed to find repository: {}", e);
-            std::process::exit(1);
+        .unwrap_or_else(|| repository_working_dir.clone());
+
+    // Try to find the git repository
+    // First, try the standard approach using the working directory
+    let repo_result = find_repository_in_path(&final_working_dir);
+
+    // If the working directory is not a git repository, we need to detect repos from file paths
+    // This happens in multi-repo workspaces where the workspace root contains multiple git repos
+    let needs_file_based_repo_detection = repo_result.is_err();
+
+    if needs_file_based_repo_detection {
+        // Workspace root is not a git repo - try to detect repositories from edited files
+        let files_to_check = agent_run_result.as_ref().and_then(|r| {
+            if r.checkpoint_kind == CheckpointKind::Human {
+                r.will_edit_filepaths.as_ref()
+            } else {
+                r.edited_filepaths.as_ref()
+            }
+        });
+
+        if let Some(files) = files_to_check
+            && !files.is_empty()
+        {
+            // Convert relative paths to absolute paths based on workspace root
+            let absolute_files: Vec<String> = files
+                .iter()
+                .map(|f| {
+                    let path = std::path::Path::new(f);
+                    if path.is_absolute() {
+                        f.clone()
+                    } else {
+                        std::path::Path::new(&repository_working_dir)
+                            .join(f)
+                            .to_string_lossy()
+                            .to_string()
+                    }
+                })
+                .collect();
+
+            // Group files by their containing repository
+            let (repo_files, orphan_files) =
+                group_files_by_repository(&absolute_files, Some(&repository_working_dir));
+
+            if repo_files.is_empty() {
+                eprintln!(
+                    "Failed to find any git repositories for the edited files. Orphaned files: {:?}",
+                    orphan_files
+                );
+                std::process::exit(0);
+            }
+
+            // Log orphan files if any
+            if !orphan_files.is_empty() {
+                eprintln!(
+                    "Warning: {} file(s) are not in any git repository and will be skipped: {:?}",
+                    orphan_files.len(),
+                    orphan_files
+                );
+            }
+
+            // Determine if this is truly a multi-repo workspace or just a single nested repo
+            let is_multi_repo = repo_files.len() > 1;
+
+            if is_multi_repo {
+                eprintln!(
+                    "Multi-repo workspace detected. Found {} repositories with edits.",
+                    repo_files.len()
+                );
+            } else {
+                eprintln!(
+                    "Workspace root is not a git repository. Detected repository from edited files."
+                );
+            }
+
+            let checkpoint_kind = agent_run_result
+                .as_ref()
+                .map(|r| r.checkpoint_kind)
+                .unwrap_or(CheckpointKind::Human);
+
+            let checkpoint_start = std::time::Instant::now();
+            let mut total_files_edited = 0;
+            let mut repos_processed = 0;
+            let total_repos = repo_files.len();
+
+            // Process each repository separately
+            for (repo_workdir, (repo, repo_file_paths)) in repo_files {
+                repos_processed += 1;
+                eprintln!(
+                    "Processing repository {}/{}: {}",
+                    repos_processed,
+                    total_repos,
+                    repo_workdir.display()
+                );
+
+                // Get user name from this repo's config
+                let default_user_name = match repo.config_get_str("user.name") {
+                    Ok(Some(name)) if !name.trim().is_empty() => name,
+                    _ => {
+                        eprintln!(
+                            "Warning: git user.name not configured for {}. Using 'unknown'.",
+                            repo_workdir.display()
+                        );
+                        "unknown".to_string()
+                    }
+                };
+
+                // Create a modified agent_run_result with only this repo's files
+                let repo_agent_result = agent_run_result.as_ref().map(|r| {
+                    let mut modified = r.clone();
+                    modified.repo_working_dir = Some(repo_workdir.to_string_lossy().to_string());
+                    if r.checkpoint_kind == CheckpointKind::Human {
+                        modified.will_edit_filepaths = Some(repo_file_paths.clone());
+                        modified.edited_filepaths = None;
+                    } else {
+                        modified.edited_filepaths = Some(repo_file_paths.clone());
+                        modified.will_edit_filepaths = None;
+                    }
+                    modified
+                });
+
+                let checkpoint_result = commands::checkpoint::run(
+                    &repo,
+                    &default_user_name,
+                    checkpoint_kind,
+                    show_working_log,
+                    reset,
+                    false,
+                    repo_agent_result,
+                    false,
+                );
+
+                match checkpoint_result {
+                    Ok((_, files_edited, _)) => {
+                        total_files_edited += files_edited;
+                        eprintln!(
+                            "  Checkpoint for {} completed ({} files)",
+                            repo_workdir.display(),
+                            files_edited
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("  Checkpoint for {} failed: {}", repo_workdir.display(), e);
+                        let context = serde_json::json!({
+                            "function": "checkpoint",
+                            "repo": repo_workdir.to_string_lossy(),
+                            "checkpoint_kind": format!("{:?}", checkpoint_kind)
+                        });
+                        observability::log_error(&e, Some(context));
+                        // Continue processing other repos instead of exiting
+                    }
+                }
+            }
+
+            let elapsed = checkpoint_start.elapsed();
+            log_performance_for_checkpoint(total_files_edited, elapsed, checkpoint_kind);
+            if is_multi_repo {
+                eprintln!(
+                    "Checkpoint completed in {:?} ({} repositories, {} total files)",
+                    elapsed, repos_processed, total_files_edited
+                );
+            } else {
+                eprintln!("Checkpoint completed in {:?}", elapsed);
+            }
+            return;
         }
-    };
+
+        // No files to check, fall through to error
+        eprintln!(
+            "Failed to find repository: workspace root is not a git repository and no edited files provided"
+        );
+        std::process::exit(0);
+    }
+
+    // Standard single-repo mode
+    let repo = repo_result.unwrap();
+
+    // Get the effective working directory from the detected repository
+    let effective_working_dir = repo
+        .workdir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| final_working_dir.clone());
 
     let checkpoint_kind = agent_run_result
         .as_ref()
@@ -460,7 +755,7 @@ fn handle_checkpoint(args: &[String]) {
                 .collect();
             if paths.is_empty() { None } else { Some(paths) }
         } else {
-            Some(get_all_files_for_mock_ai(&final_working_dir))
+            Some(get_all_files_for_mock_ai(&effective_working_dir))
         };
 
         agent_run_result = Some(AgentRunResult {
@@ -480,7 +775,7 @@ fn handle_checkpoint(args: &[String]) {
             transcript: None,
             will_edit_filepaths: Some(will_edit_filepaths.unwrap_or_default()),
             edited_filepaths: None,
-            repo_working_dir: Some(final_working_dir),
+            repo_working_dir: Some(effective_working_dir),
             dirty_files: None,
         });
     }
@@ -511,6 +806,11 @@ fn handle_checkpoint(args: &[String]) {
             let elapsed = checkpoint_start.elapsed();
             log_performance_for_checkpoint(files_edited, elapsed, checkpoint_kind);
             eprintln!("Checkpoint completed in {:?}", elapsed);
+
+            // Flush logs and metrics after checkpoint (skip for human checkpoints)
+            if checkpoint_kind != CheckpointKind::Human {
+                observability::spawn_background_flush();
+            }
         }
         Err(e) => {
             let elapsed = checkpoint_start.elapsed();
@@ -522,7 +822,7 @@ fn handle_checkpoint(args: &[String]) {
                 "checkpoint_kind": format!("{:?}", checkpoint_kind)
             });
             observability::log_error(&e, Some(context));
-            std::process::exit(1);
+            std::process::exit(0);
         }
     }
 }
@@ -547,13 +847,47 @@ fn handle_ai_blame(args: &[String]) {
     };
 
     // Parse blame arguments
-    let (file_path, options) = match commands::blame::parse_blame_args(args) {
+    let (file_path, mut options) = match commands::blame::parse_blame_args(args) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("Failed to parse blame arguments: {}", e);
             std::process::exit(1);
         }
     };
+
+    // Auto-detect ignore-revs-file if not explicitly provided, not disabled via --no-ignore-revs-file,
+    // and git version supports --ignore-revs-file (git >= 2.23)
+    if options.ignore_revs_file.is_none()
+        && !options.no_ignore_revs_file
+        && repo.git_supports_ignore_revs_file()
+    {
+        // First, check git config for blame.ignoreRevsFile
+        if let Ok(Some(config_path)) = repo.config_get_str("blame.ignoreRevsFile")
+            && !config_path.is_empty()
+        {
+            // Config path could be relative to repo root or absolute
+            if let Ok(workdir) = repo.workdir() {
+                let full_path = if std::path::Path::new(&config_path).is_absolute() {
+                    std::path::PathBuf::from(&config_path)
+                } else {
+                    workdir.join(&config_path)
+                };
+                if full_path.exists() {
+                    options.ignore_revs_file = Some(full_path.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        // If still not set, check for .git-blame-ignore-revs in the repository root
+        if options.ignore_revs_file.is_none()
+            && let Ok(workdir) = repo.workdir()
+        {
+            let ignore_revs_path = workdir.join(".git-blame-ignore-revs");
+            if ignore_revs_path.exists() {
+                options.ignore_revs_file = Some(ignore_revs_path.to_string_lossy().to_string());
+            }
+        }
+    }
 
     // Check if this is an interactive terminal
     let is_interactive = std::io::stdout().is_terminal();
@@ -564,6 +898,16 @@ fn handle_ai_blame(args: &[String]) {
         eprintln!("Error: incremental mode is not supported in interactive terminal");
         std::process::exit(1);
     }
+
+    let file_path = if !std::path::Path::new(&file_path).is_absolute() {
+        let current_dir_path = std::path::PathBuf::from(&current_dir);
+        current_dir_path
+            .join(&file_path)
+            .to_string_lossy()
+            .to_string()
+    } else {
+        file_path
+    };
 
     if let Err(e) = repo.blame(&file_path, &options) {
         eprintln!("Blame failed: {}", e);
@@ -678,9 +1022,11 @@ fn handle_stats(args: &[String]) {
         }
     }
 
+    let effective_patterns = effective_ignore_patterns(&repo, &ignore_patterns, &[]);
+
     // Handle commit range if detected
     if let Some(range) = commit_range {
-        match range_authorship::range_authorship(range, false, &ignore_patterns) {
+        match range_authorship::range_authorship(range, false, &effective_patterns) {
             Ok(stats) => {
                 if json_output {
                     let json_str = serde_json::to_string(&stats).unwrap();
@@ -697,7 +1043,12 @@ fn handle_stats(args: &[String]) {
         return;
     }
 
-    if let Err(e) = stats_command(&repo, commit_sha.as_deref(), json_output, &ignore_patterns) {
+    if let Err(e) = stats_command(
+        &repo,
+        commit_sha.as_deref(),
+        json_output,
+        &effective_patterns,
+    ) {
         match e {
             crate::error::GitAiError::Generic(msg) if msg.starts_with("No commit found:") => {
                 eprintln!("{}", msg);
@@ -712,7 +1063,7 @@ fn handle_stats(args: &[String]) {
 
 fn get_all_files_for_mock_ai(working_dir: &str) -> Vec<String> {
     // Find the git repository
-    let repo = match find_repository_in_path(&working_dir) {
+    let repo = match find_repository_in_path(working_dir) {
         Ok(repo) => repo,
         Err(e) => {
             eprintln!("Failed to find repository: {}", e);
@@ -730,7 +1081,7 @@ fn handle_show_transcript(args: &[String]) {
     if args.len() < 2 {
         eprintln!("Error: show-transcript requires agent name and path/id");
         eprintln!("Usage: git-ai show-transcript <agent> <path|id>");
-        eprintln!("  Agents: claude, gemini, continue-cli, github-copilot, cursor");
+        eprintln!("  Agents: claude, codex, gemini, continue-cli, github-copilot, cursor");
         eprintln!("  For cursor, provide conversation_id instead of path");
         std::process::exit(1);
     }
@@ -746,6 +1097,13 @@ fn handle_show_transcript(args: &[String]) {
             Ok((transcript, model)) => Ok((transcript, model)),
             Err(e) => {
                 eprintln!("Error loading Claude transcript: {}", e);
+                std::process::exit(1);
+            }
+        },
+        "codex" => match CodexPreset::transcript_and_model_from_codex_rollout_jsonl(path_or_id) {
+            Ok((transcript, model)) => Ok((transcript, model)),
+            Err(e) => {
+                eprintln!("Error loading Codex transcript: {}", e);
                 std::process::exit(1);
             }
         },
@@ -785,7 +1143,9 @@ fn handle_show_transcript(args: &[String]) {
         },
         _ => {
             eprintln!("Error: Unknown agent '{}'", agent_name);
-            eprintln!("Supported agents: claude, gemini, continue-cli, github-copilot, cursor");
+            eprintln!(
+                "Supported agents: claude, codex, gemini, continue-cli, github-copilot, cursor"
+            );
             std::process::exit(1);
         }
     };

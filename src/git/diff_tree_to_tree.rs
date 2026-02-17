@@ -1,5 +1,6 @@
 use crate::error::GitAiError;
 use crate::git::repository::{Repository, Tree, exec_git};
+use crate::git::status::MAX_PATHSPEC_ARGS;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -98,6 +99,11 @@ impl Diff {
     pub fn len(&self) -> usize {
         self.deltas.len()
     }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.deltas.is_empty()
+    }
 }
 
 impl Repository {
@@ -153,16 +159,33 @@ impl Repository {
         args.push(old_oid);
         args.push(new_oid);
 
-        // Add pathspecs if provided
-        if let Some(paths) = pathspecs {
-            args.push("--".to_string());
-            for path in paths {
-                args.push(path.clone());
+        // Add pathspecs if provided (only as CLI args when under threshold)
+        let needs_post_filter = if let Some(paths) = pathspecs {
+            if paths.len() > MAX_PATHSPEC_ARGS {
+                true
+            } else {
+                args.push("--".to_string());
+                for path in paths {
+                    args.push(path.clone());
+                }
+                false
             }
-        }
+        } else {
+            false
+        };
 
         let output = exec_git(&args)?;
-        let deltas = parse_diff_raw(&output.stdout)?;
+        let mut deltas = parse_diff_raw(&output.stdout)?;
+
+        if needs_post_filter && let Some(paths) = pathspecs {
+            deltas.retain(|delta| {
+                delta
+                    .new_file
+                    .path()
+                    .and_then(|p| p.to_str())
+                    .is_some_and(|p| paths.contains(p))
+            });
+        }
 
         Ok(Diff { deltas })
     }
@@ -252,6 +275,7 @@ fn parse_diff_raw(data: &[u8]) -> Result<Vec<DiffDelta>, GitAiError> {
             path: old_path
                 .or_else(|| {
                     // For deletions, the old file path is the path
+                    #[allow(clippy::if_same_then_else)]
                     if matches!(status, DiffStatus::Deleted) {
                         Some(new_path.clone())
                     } else {

@@ -42,6 +42,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact_name: git-ai-windows-x64
             use_docker: false
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact_name: git-ai-windows-arm64
+            use_docker: false
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: git-ai-macos-arm64
@@ -97,8 +101,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
-      - name: Build release binary (non-Docker)
-        if: matrix.use_docker == false
+      - name: Build release binary (non-Docker, non-Windows-ARM64)
+        if: matrix.use_docker == false && matrix.os != 'windows-11-arm'
         run: |
           cargo build --release --target ${{ matrix.target }}
         env:
@@ -106,6 +110,17 @@ jobs:
           SENTRY_OSS: ${{ secrets.SENTRY_OSS }}
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
           OSS_BUILD: "1"
+
+      - name: Build release binary (Windows ARM64 with LLVM strip)
+        if: matrix.os == 'windows-11-arm'
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_INCREMENTAL: 0
+          SENTRY_OSS: ${{ secrets.SENTRY_OSS }}
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          OSS_BUILD: "1"
+          RUSTFLAGS: "-C strip=symbols"
 
       - name: Verify binary architecture (Linux)
         if: contains(matrix.os, 'ubuntu')
@@ -116,12 +131,12 @@ jobs:
           objdump -T target/${{ matrix.target }}/release/git-ai | grep GLIBC | sed 's/.*GLIBC_/GLIBC_/' | sort -V | uniq | tail -1
 
       - name: Verify binary architecture (Windows)
-        if: matrix.os == 'windows-latest'
+        if: contains(matrix.os, 'windows')
         shell: bash
         run: |
           file target/${{ matrix.target }}/release/git-ai.exe
 
-      - name: Strip binary (Windows)
+      - name: Strip binary (Windows x64)
         if: matrix.os == 'windows-latest'
         run: |
           strip target/${{ matrix.target }}/release/git-ai.exe
@@ -136,17 +151,17 @@ jobs:
           mkdir -p release
 
       - name: Copy binary to release directory
-        if: matrix.os == 'windows-latest'
+        if: contains(matrix.os, 'windows')
         run: |
           cp target/${{ matrix.target }}/release/git-ai.exe release/${{ matrix.artifact_name }}.exe
 
       - name: Copy binary to release directory (non-Windows)
-        if: matrix.os != 'windows-latest'
+        if: ${{ !contains(matrix.os, 'windows') }}
         run: |
           cp target/${{ matrix.target }}/release/git-ai release/${{ matrix.artifact_name }}
 
       - name: Upload artifact (Windows)
-        if: matrix.os == 'windows-latest'
+        if: contains(matrix.os, 'windows')
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
@@ -154,7 +169,7 @@ jobs:
           retention-days: 30
 
       - name: Upload artifact (non-Windows)
-        if: matrix.os != 'windows-latest'
+        if: ${{ !contains(matrix.os, 'windows') }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
@@ -351,11 +366,18 @@ jobs:
         with:
           tag_name: ${{ steps.release-meta.outputs.tag_name }}
           name: ${{ steps.release-meta.outputs.release_name }}
+          generate_release_notes: true
           body: |
             ## git-ai ${{ steps.release-meta.outputs.tag_name }}
 
             ### Release Channel
             `${{ steps.release-meta.outputs.channel_label }}`
+
+            ${{ steps.release-meta.outputs.prerelease != 'true' && '---' || '' }}
+
+            ${{ steps.release-meta.outputs.prerelease != 'true' && '> **Detailed AI-generated changelog is being generated and will appear here shortly...**' || '' }}
+
+            ${{ steps.release-meta.outputs.prerelease != 'true' && '---' || '' }}
 
             ### Installation
             Install this specific version with checksum verification:
@@ -374,6 +396,7 @@ jobs:
             - **Linux (x64)**: `git-ai-linux-x64`
             - **Linux (ARM64)**: `git-ai-linux-arm64`
             - **Windows (x64)**: `git-ai-windows-x64.exe`
+            - **Windows (ARM64)**: `git-ai-windows-arm64.exe`
             - **macOS (Intel)**: `git-ai-macos-x64`
             - **macOS (Apple Silicon)**: `git-ai-macos-arm64`
 
@@ -451,7 +474,7 @@ jobs:
           curl -X POST \
             -H "Authorization: token ${{ secrets.RELEASE_CHANNEL_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/tight-eng/git-ai-bot/actions/workflows/update-release-version.yaml/dispatches \
+            https://api.github.com/repos/git-ai-project/monorepo/actions/workflows/update-release-version.yaml/dispatches \
             -d '{
               "ref": "dev",
               "inputs": {

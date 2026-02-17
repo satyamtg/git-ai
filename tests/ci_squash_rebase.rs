@@ -1,5 +1,6 @@
 #[macro_use]
 mod repos;
+use git_ai::git::refs::get_reference_as_authorship_log_v3;
 use git_ai::git::repository as GitAiRepository;
 use repos::test_file::ExpectedLineExt;
 use repos::test_repo::TestRepo;
@@ -229,6 +230,105 @@ fn test_ci_squash_merge_mixed_content() {
         "}".ai(),
         "// Another human comment".human()
     ]);
+}
+
+/// Test squash merge where source commits have notes but no AI attestations.
+#[test]
+fn test_ci_squash_merge_empty_notes_preserved() {
+    let repo = TestRepo::new();
+    let mut file = repo.filename("feature.txt");
+
+    file.set_contents(lines!["base"]);
+    let _base_commit = repo.stage_all_and_commit("Initial commit").unwrap();
+    repo.git(&["branch", "-M", "main"]).unwrap();
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    file.set_contents(lines!["base", "human change"]);
+    let feature_commit = repo.stage_all_and_commit("Human change").unwrap();
+    let feature_sha = feature_commit.commit_sha;
+
+    repo.git(&["checkout", "main"]).unwrap();
+    file.set_contents(lines!["base", "human change"]);
+    let merge_commit = repo
+        .stage_all_and_commit("Merge feature via squash")
+        .unwrap();
+    let merge_sha = merge_commit.commit_sha;
+
+    let git_ai_repo = GitAiRepository::find_repository_in_path(repo.path().to_str().unwrap())
+        .expect("Failed to find repository");
+
+    use git_ai::authorship::rebase_authorship::rewrite_authorship_after_squash_or_rebase;
+    rewrite_authorship_after_squash_or_rebase(
+        &git_ai_repo,
+        "feature",
+        "main",
+        &feature_sha,
+        &merge_sha,
+        false,
+    )
+    .unwrap();
+
+    let authorship_log = get_reference_as_authorship_log_v3(&git_ai_repo, &merge_sha).unwrap();
+    assert!(
+        authorship_log.attestations.is_empty(),
+        "Expected empty attestations for human-only squash merge"
+    );
+}
+
+/// Test squash merge where source commits have no notes at all.
+#[test]
+fn test_ci_squash_merge_no_notes_no_authorship_created() {
+    let repo = TestRepo::new();
+
+    repo.git_og(&["config", "user.name", "Test User"]).unwrap();
+    repo.git_og(&["config", "user.email", "test@example.com"])
+        .unwrap();
+
+    let mut file = repo.filename("feature.txt");
+    file.set_contents(lines!["base"]);
+    repo.git_og(&["add", "-A"]).unwrap();
+    repo.git_og(&["commit", "-m", "Initial commit"]).unwrap();
+    repo.git_og(&["branch", "-M", "main"]).unwrap();
+
+    repo.git_og(&["checkout", "-b", "feature"]).unwrap();
+    file.set_contents(lines!["base", "human change"]);
+    repo.git_og(&["add", "-A"]).unwrap();
+    repo.git_og(&["commit", "-m", "Human change"]).unwrap();
+    let feature_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    repo.git_og(&["checkout", "main"]).unwrap();
+    file.set_contents(lines!["base", "human change"]);
+    repo.git_og(&["add", "-A"]).unwrap();
+    repo.git_og(&["commit", "-m", "Merge feature via squash"])
+        .unwrap();
+    let merge_sha = repo
+        .git_og(&["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let git_ai_repo = GitAiRepository::find_repository_in_path(repo.path().to_str().unwrap())
+        .expect("Failed to find repository");
+
+    use git_ai::authorship::rebase_authorship::rewrite_authorship_after_squash_or_rebase;
+    rewrite_authorship_after_squash_or_rebase(
+        &git_ai_repo,
+        "feature",
+        "main",
+        &feature_sha,
+        &merge_sha,
+        false,
+    )
+    .unwrap();
+
+    assert!(
+        get_reference_as_authorship_log_v3(&git_ai_repo, &merge_sha).is_err(),
+        "Expected no authorship log when source commits have no notes"
+    );
 }
 
 /// Test squash merge where conflict resolution adds content

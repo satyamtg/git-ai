@@ -40,6 +40,8 @@ fn test_parse_example_gemini_json_with_model() {
             Message::ToolUse { name, input, .. } => {
                 println!("{}: ToolUse: {} with input: {:?}", i, name, input)
             }
+            Message::Thinking { text, .. } => println!("{}: Thinking: {}", i, text),
+            Message::Plan { text, .. } => println!("{}: Plan: {}", i, text),
         }
     }
 }
@@ -86,7 +88,7 @@ fn test_gemini_parses_assistant_messages() {
         .collect();
 
     assert!(
-        assistant_messages.len() >= 1,
+        !assistant_messages.is_empty(),
         "Should have at least one assistant message"
     );
 
@@ -110,7 +112,7 @@ fn test_gemini_parses_tool_calls() {
         .filter(|m| matches!(m, Message::ToolUse { .. }))
         .collect();
 
-    assert!(tool_uses.len() >= 1, "Should have at least one tool call");
+    assert!(!tool_uses.is_empty(), "Should have at least one tool call");
 
     // Verify tool calls have correct structure
     for tool_use in &tool_uses {
@@ -135,7 +137,7 @@ fn test_gemini_parses_tool_calls() {
         .collect();
 
     assert!(
-        replace_tools.len() >= 1,
+        !replace_tools.is_empty(),
         "Should have at least one 'replace' tool call"
     );
 }
@@ -600,13 +602,13 @@ fn test_gemini_e2e_with_attribution() {
 
     // Verify the authorship log contains attestations and prompts
     assert!(
-        commit.authorship_log.attestations.len() > 0,
+        !commit.authorship_log.attestations.is_empty(),
         "Should have at least one attestation"
     );
 
     // Verify the metadata has prompts with transcript data
     assert!(
-        commit.authorship_log.metadata.prompts.len() > 0,
+        !commit.authorship_log.metadata.prompts.is_empty(),
         "Should have at least one prompt record in metadata"
     );
 
@@ -621,7 +623,7 @@ fn test_gemini_e2e_with_attribution() {
 
     // Verify that the prompt record has messages (transcript)
     assert!(
-        prompt_record.messages.len() > 0,
+        !prompt_record.messages.is_empty(),
         "Prompt record should contain messages from the gemini session"
     );
 
@@ -734,7 +736,7 @@ fn test_gemini_e2e_multiple_tool_calls() {
         "const z = 3;".ai(),
     ]);
 
-    assert!(commit.authorship_log.attestations.len() > 0);
+    assert!(!commit.authorship_log.attestations.is_empty());
 }
 
 #[test]
@@ -818,7 +820,7 @@ fn test_gemini_e2e_with_resync() {
 
     // Verify the authorship log contains prompts
     assert!(
-        commit.authorship_log.metadata.prompts.len() > 0,
+        !commit.authorship_log.metadata.prompts.is_empty(),
         "Should have at least one prompt record"
     );
 
@@ -839,7 +841,7 @@ fn test_gemini_e2e_with_resync() {
     // that the post_commit logic would pick up the new message if transcript_path is in metadata
     // For now, we just verify the basic structure is correct
     assert!(
-        prompt_record.messages.len() > 0,
+        !prompt_record.messages.is_empty(),
         "Prompt record should contain messages"
     );
 }
@@ -885,7 +887,7 @@ fn test_gemini_e2e_partial_staging() {
     let commit = repo.commit("Partial staging").unwrap();
 
     // Verify only staged lines are attributed
-    assert!(commit.authorship_log.attestations.len() > 0);
+    assert!(!commit.authorship_log.attestations.is_empty());
 
     // Check committed lines only
     let mut file = repo.filename("test.ts");
