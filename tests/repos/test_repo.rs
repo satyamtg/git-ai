@@ -778,11 +778,37 @@ impl TestRepo {
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
-        fs::remove_dir_all(self.path.clone()).expect("failed to remove test repo");
+        remove_dir_all_with_retry(&self.path, 20, Duration::from_millis(25))
+            .expect("failed to remove test repo");
         // Also clean up the test database directory (may not exist if no DB operations were done)
-        let _ = fs::remove_dir_all(self.test_db_path.clone());
-        let _ = fs::remove_dir_all(self.test_home.clone());
+        let _ = remove_dir_all_with_retry(&self.test_db_path, 10, Duration::from_millis(10));
+        let _ = remove_dir_all_with_retry(&self.test_home, 10, Duration::from_millis(10));
     }
+}
+
+fn remove_dir_all_with_retry(
+    path: &std::path::Path,
+    attempts: usize,
+    delay: Duration,
+) -> std::io::Result<()> {
+    for attempt in 0..attempts {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    || err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                if attempt + 1 == attempts {
+                    return Err(err);
+                }
+                std::thread::sleep(delay);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
