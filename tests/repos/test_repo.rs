@@ -778,11 +778,11 @@ impl TestRepo {
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
-        remove_dir_all_with_retry(&self.path, 20, Duration::from_millis(25))
+        remove_dir_all_with_retry(&self.path, 80, Duration::from_millis(50))
             .expect("failed to remove test repo");
         // Also clean up the test database directory (may not exist if no DB operations were done)
-        let _ = remove_dir_all_with_retry(&self.test_db_path, 10, Duration::from_millis(10));
-        let _ = remove_dir_all_with_retry(&self.test_home, 10, Duration::from_millis(10));
+        let _ = remove_dir_all_with_retry(&self.test_db_path, 40, Duration::from_millis(25));
+        let _ = remove_dir_all_with_retry(&self.test_home, 40, Duration::from_millis(25));
     }
 }
 
@@ -795,10 +795,7 @@ fn remove_dir_all_with_retry(
         match fs::remove_dir_all(path) {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::DirectoryNotEmpty
-                    || err.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
+            Err(err) if should_retry_remove_dir_error(&err) => {
                 if attempt + 1 == attempts {
                     return Err(err);
                 }
@@ -809,6 +806,25 @@ fn remove_dir_all_with_retry(
     }
 
     Ok(())
+}
+
+fn should_retry_remove_dir_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+    {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows can report transient file locks as `Uncategorized` with raw code 32.
+        // Retry these so process teardown races don't fail otherwise-successful tests.
+        if let Some(code) = err.raw_os_error() {
+            return matches!(code, 5 | 32 | 145);
+        }
+    }
+
+    false
 }
 
 #[derive(Debug)]
