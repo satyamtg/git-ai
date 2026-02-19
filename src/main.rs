@@ -47,11 +47,6 @@ fn main() {
 
     let cli = Cli::parse();
 
-    if commands::git_hook_handlers::is_git_hook_binary_name(&binary_name) {
-        let exit_code =
-            commands::git_hook_handlers::handle_git_hook_invocation(&binary_name, &cli.args);
-        std::process::exit(exit_code);
-    }
 
     #[cfg(debug_assertions)]
     {
