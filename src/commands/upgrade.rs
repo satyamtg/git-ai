@@ -20,6 +20,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
 const GIT_AI_RELEASE_ENV: &str = "GIT_AI_RELEASE_TAG";
 const BACKGROUND_SPAWN_THROTTLE_SECS: u64 = 60;
+const ENV_BACKGROUND_UPGRADE_WORKER: &str = "GIT_AI_BACKGROUND_UPGRADE_WORKER";
 
 static UPDATE_NOTICE_EMITTED: AtomicBool = AtomicBool::new(false);
 static LAST_BACKGROUND_SPAWN: AtomicU64 = AtomicU64::new(0);
@@ -712,17 +713,12 @@ pub fn maybe_schedule_background_update_check() {
 }
 
 fn spawn_background_upgrade_process() -> bool {
-    match crate::utils::current_git_ai_exe() {
-        Ok(exe) => {
-            let mut cmd = Command::new(exe);
-            cmd.arg("upgrade")
-                .arg("--background")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            cmd.spawn().is_ok()
-        }
-        Err(_) => false,
-    }
+    crate::utils::spawn_internal_git_ai_subcommand(
+        "upgrade",
+        &["--background"],
+        ENV_BACKGROUND_UPGRADE_WORKER,
+        &[],
+    )
 }
 
 fn is_newer_version(latest: &str, current: &str) -> bool {

@@ -87,6 +87,7 @@ struct ObservabilityInner {
 }
 
 static OBSERVABILITY: OnceLock<Mutex<ObservabilityInner>> = OnceLock::new();
+const ENV_FLUSH_LOGS_WORKER: &str = "GIT_AI_FLUSH_LOGS_WORKER";
 
 fn get_observability() -> &'static Mutex<ObservabilityInner> {
     OBSERVABILITY.get_or_init(|| {
@@ -189,15 +190,12 @@ pub fn spawn_background_flush() {
         return;
     }
 
-    use std::process::Command;
-
-    if let Ok(exe) = crate::utils::current_git_ai_exe() {
-        let _ = Command::new(exe)
-            .arg("flush-logs")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    let _ = crate::utils::spawn_internal_git_ai_subcommand(
+        "flush-logs",
+        &[],
+        ENV_FLUSH_LOGS_WORKER,
+        &[],
+    );
 }
 
 /// Debounce background flushes to avoid process/request storms when checkpoints
