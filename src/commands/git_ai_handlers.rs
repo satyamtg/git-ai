@@ -854,68 +854,68 @@ fn handle_checkpoint(args: &[String]) {
         }
     }
 
-    if !external_files.is_empty() {
-        if let Some(base_result) = external_agent_base {
-            let (repo_files, orphan_files) = group_files_by_repository(&external_files, None);
+    if !external_files.is_empty()
+        && let Some(base_result) = external_agent_base
+    {
+        let (repo_files, orphan_files) = group_files_by_repository(&external_files, None);
 
-            if !orphan_files.is_empty() {
-                eprintln!(
-                    "Warning: {} cross-repo file(s) are not in any git repository and will be skipped",
-                    orphan_files.len()
-                );
+        if !orphan_files.is_empty() {
+            eprintln!(
+                "Warning: {} cross-repo file(s) are not in any git repository and will be skipped",
+                orphan_files.len()
+            );
+        }
+
+        for (repo_workdir, (ext_repo, repo_file_paths)) in repo_files {
+            if !config.is_allowed_repository(&Some(ext_repo.clone())) {
+                continue;
             }
 
-            for (repo_workdir, (ext_repo, repo_file_paths)) in repo_files {
-                if !config.is_allowed_repository(&Some(ext_repo.clone())) {
-                    continue;
+            let ext_user_name = match ext_repo.config_get_str("user.name") {
+                Ok(Some(name)) if !name.trim().is_empty() => name,
+                _ => "unknown".to_string(),
+            };
+
+            let mut modified = base_result.clone();
+            modified.repo_working_dir = Some(repo_workdir.to_string_lossy().to_string());
+            if base_result.checkpoint_kind == CheckpointKind::Human {
+                modified.will_edit_filepaths = Some(repo_file_paths);
+                modified.edited_filepaths = None;
+            } else {
+                modified.edited_filepaths = Some(repo_file_paths);
+                modified.will_edit_filepaths = None;
+            }
+
+            commands::git_hook_handlers::ensure_repo_level_hooks_for_checkpoint(&ext_repo);
+            match commands::checkpoint::run(
+                &ext_repo,
+                &ext_user_name,
+                checkpoint_kind,
+                false,
+                false,
+                false,
+                Some(modified),
+                false,
+            ) {
+                Ok((_, files_edited, _)) => {
+                    eprintln!(
+                        "Cross-repo checkpoint for {} completed ({} files)",
+                        repo_workdir.display(),
+                        files_edited
+                    );
                 }
-
-                let ext_user_name = match ext_repo.config_get_str("user.name") {
-                    Ok(Some(name)) if !name.trim().is_empty() => name,
-                    _ => "unknown".to_string(),
-                };
-
-                let mut modified = base_result.clone();
-                modified.repo_working_dir = Some(repo_workdir.to_string_lossy().to_string());
-                if base_result.checkpoint_kind == CheckpointKind::Human {
-                    modified.will_edit_filepaths = Some(repo_file_paths);
-                    modified.edited_filepaths = None;
-                } else {
-                    modified.edited_filepaths = Some(repo_file_paths);
-                    modified.will_edit_filepaths = None;
-                }
-
-                commands::git_hook_handlers::ensure_repo_level_hooks_for_checkpoint(&ext_repo);
-                match commands::checkpoint::run(
-                    &ext_repo,
-                    &ext_user_name,
-                    checkpoint_kind,
-                    false,
-                    false,
-                    false,
-                    Some(modified),
-                    false,
-                ) {
-                    Ok((_, files_edited, _)) => {
-                        eprintln!(
-                            "Cross-repo checkpoint for {} completed ({} files)",
-                            repo_workdir.display(),
-                            files_edited
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Cross-repo checkpoint for {} failed: {}",
-                            repo_workdir.display(),
-                            e
-                        );
-                        let context = serde_json::json!({
-                            "function": "checkpoint",
-                            "repo": repo_workdir.to_string_lossy(),
-                            "checkpoint_kind": format!("{:?}", checkpoint_kind)
-                        });
-                        observability::log_error(&e, Some(context));
-                    }
+                Err(e) => {
+                    eprintln!(
+                        "Cross-repo checkpoint for {} failed: {}",
+                        repo_workdir.display(),
+                        e
+                    );
+                    let context = serde_json::json!({
+                        "function": "checkpoint",
+                        "repo": repo_workdir.to_string_lossy(),
+                        "checkpoint_kind": format!("{:?}", checkpoint_kind)
+                    });
+                    observability::log_error(&e, Some(context));
                 }
             }
         }
