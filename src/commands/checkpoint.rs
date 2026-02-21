@@ -86,7 +86,7 @@ fn build_checkpoint_attrs(
 
 /// Persistent local rate limit keyed by prompt ID hash.
 #[cfg(not(any(test, feature = "test-support")))]
-fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
+pub(crate) fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
     let prompt_id = generate_short_hash(&agent_id.id, &agent_id.tool);
     let now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -107,7 +107,7 @@ fn should_emit_agent_usage(agent_id: &AgentId) -> bool {
 
 /// Always returns false in test mode — no metrics DB access needed.
 #[cfg(any(test, feature = "test-support"))]
-fn should_emit_agent_usage(_agent_id: &AgentId) -> bool {
+pub(crate) fn should_emit_agent_usage(_agent_id: &AgentId) -> bool {
     false
 }
 

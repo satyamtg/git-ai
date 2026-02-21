@@ -1,3 +1,4 @@
+use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::range_authorship;
@@ -589,6 +590,7 @@ fn handle_checkpoint(args: &[String]) {
                     "Failed to find any git repositories for the edited files. Orphaned files: {:?}",
                     orphan_files
                 );
+                emit_no_repo_agent_metrics(agent_run_result.as_ref());
                 std::process::exit(0);
             }
 
@@ -719,6 +721,7 @@ fn handle_checkpoint(args: &[String]) {
         eprintln!(
             "Failed to find repository: workspace root is not a git repository and no edited files provided"
         );
+        emit_no_repo_agent_metrics(agent_run_result.as_ref());
         std::process::exit(0);
     }
 
@@ -1089,6 +1092,32 @@ fn handle_git_hooks(args: &[String]) {
             std::process::exit(1);
         }
     }
+}
+
+fn emit_no_repo_agent_metrics(agent_run_result: Option<&AgentRunResult>) {
+    let Some(result) = agent_run_result else {
+        return;
+    };
+    if result.checkpoint_kind == CheckpointKind::Human {
+        return;
+    }
+
+    let agent_id = &result.agent_id;
+    if !commands::checkpoint::should_emit_agent_usage(agent_id) {
+        return;
+    }
+
+    let prompt_id = generate_short_hash(&agent_id.id, &agent_id.tool);
+    let attrs = crate::metrics::EventAttributes::with_version(env!("CARGO_PKG_VERSION"))
+        .tool(&agent_id.tool)
+        .model(&agent_id.model)
+        .prompt_id(prompt_id)
+        .external_prompt_id(&agent_id.id);
+
+    let values = crate::metrics::AgentUsageValues::new();
+    crate::metrics::record(values, attrs);
+
+    observability::spawn_background_flush();
 }
 
 fn get_all_files_for_mock_ai(working_dir: &str) -> Vec<String> {
