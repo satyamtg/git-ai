@@ -17,7 +17,7 @@ const SCHEMA_VERSION: usize = 3;
 const MIGRATIONS: &[&str] = &[
     // Migration 0 -> 1: Initial schema with prompts table
     r#"
-    CREATE TABLE prompts (
+    CREATE TABLE IF NOT EXISTS prompts (
         id TEXT PRIMARY KEY NOT NULL,
         workdir TEXT,
         tool TEXT NOT NULL,
@@ -35,20 +35,20 @@ const MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     );
 
-    CREATE INDEX idx_prompts_tool
+    CREATE INDEX IF NOT EXISTS idx_prompts_tool
         ON prompts(tool);
-    CREATE INDEX idx_prompts_external_thread_id
+    CREATE INDEX IF NOT EXISTS idx_prompts_external_thread_id
         ON prompts(external_thread_id);
-    CREATE INDEX idx_prompts_workdir
+    CREATE INDEX IF NOT EXISTS idx_prompts_workdir
         ON prompts(workdir);
-    CREATE INDEX idx_prompts_commit_sha
+    CREATE INDEX IF NOT EXISTS idx_prompts_commit_sha
         ON prompts(commit_sha);
-    CREATE INDEX idx_prompts_updated_at
+    CREATE INDEX IF NOT EXISTS idx_prompts_updated_at
         ON prompts(updated_at);
     "#,
     // Migration 1 -> 2: Add CAS sync queue
     r#"
-    CREATE TABLE cas_sync_queue (
+    CREATE TABLE IF NOT EXISTS cas_sync_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         hash TEXT NOT NULL UNIQUE,
         data TEXT NOT NULL,
@@ -62,16 +62,16 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
 
-    CREATE INDEX idx_cas_sync_queue_status_retry
+    CREATE INDEX IF NOT EXISTS idx_cas_sync_queue_status_retry
         ON cas_sync_queue(status, next_retry_at);
-    CREATE INDEX idx_cas_sync_queue_hash
+    CREATE INDEX IF NOT EXISTS idx_cas_sync_queue_hash
         ON cas_sync_queue(hash);
-    CREATE INDEX idx_cas_sync_queue_stale_processing
+    CREATE INDEX IF NOT EXISTS idx_cas_sync_queue_stale_processing
         ON cas_sync_queue(processing_started_at) WHERE status = 'processing';
     "#,
     // Migration 2 -> 3: Add CAS cache for fetched prompts
     r#"
-    CREATE TABLE cas_cache (
+    CREATE TABLE IF NOT EXISTS cas_cache (
         hash TEXT PRIMARY KEY NOT NULL,
         messages TEXT NOT NULL,
         cached_at INTEGER NOT NULL
