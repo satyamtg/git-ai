@@ -2580,12 +2580,26 @@ mod tests {
 
     fn init_repo(path: &Path) -> Repository {
         fs::create_dir_all(path).expect("failed to create repo dir");
+        let isolated_home = path.join(".git-ai-test-home");
+        fs::create_dir_all(&isolated_home).expect("failed to create isolated HOME for git init");
+        let isolated_global_config = isolated_home.join(".gitconfig");
+        fs::write(&isolated_global_config, "").expect("failed to create isolated global config");
+
         let init = Command::new("git")
             .args(["init", "."])
             .current_dir(path)
+            .env("HOME", &isolated_home)
+            .env("USERPROFILE", &isolated_home)
+            .env("GIT_CONFIG_GLOBAL", &isolated_global_config)
             .output()
             .expect("failed to run git init");
-        assert!(init.status.success(), "git init should succeed");
+        assert!(
+            init.status.success(),
+            "git init should succeed (status={:?}, stdout={}, stderr={})",
+            init.status.code(),
+            String::from_utf8_lossy(&init.stdout),
+            String::from_utf8_lossy(&init.stderr)
+        );
         crate::git::find_repository_in_path(&path.to_string_lossy())
             .expect("failed to open initialized repo")
     }
