@@ -142,46 +142,14 @@ fn args_with_standard_diff_backend_for_internal_git(args: &[String]) -> Vec<Stri
         return args;
     };
 
-    let mut out = Vec::with_capacity(args.len() + 2);
-    let mut index = 0usize;
-
-    // Preserve global args but drop caller-provided diff.external config to guarantee
-    // standard git diff behavior for internal commands.
-    while index < command_index {
-        let arg = &args[index];
-
-        if arg == "-c" {
-            if index + 1 >= command_index {
-                out.push(arg.clone());
-                index += 1;
-                continue;
-            }
-
-            let value = &args[index + 1];
-            if value.starts_with("diff.external=") {
-                index += 2;
-                continue;
-            }
-
-            out.push(arg.clone());
-            out.push(value.clone());
-            index += 2;
-            continue;
-        }
-
-        if arg.starts_with("-cdiff.external=") || arg.starts_with("--config=diff.external=") {
-            index += 1;
-            continue;
-        }
-
-        out.push(arg.clone());
-        index += 1;
+    let command = args[command_index].as_str();
+    let is_patch_command = matches!(command, "diff" | "show" | "log");
+    if !is_patch_command {
+        return args;
     }
 
-    out.push("-c".to_string());
-    out.push("diff.external=".to_string());
-    out.extend(args[command_index..].iter().cloned());
-    out
+    // Ensure explicit ext-diff opts cannot re-enable external diff after we add --no-ext-diff.
+    args.into_iter().filter(|arg| arg != "--ext-diff").collect()
 }
 
 pub struct Object<'a> {
@@ -2868,45 +2836,29 @@ mod tests {
     }
 
     #[test]
-    fn internal_git_commands_force_standard_diff_external_config() {
+    fn internal_git_patch_commands_strip_ext_diff_flag() {
         let args = vec![
             "-C".to_string(),
             "/tmp/repo".to_string(),
-            "-c".to_string(),
-            "diff.external=custom-helper".to_string(),
             "diff".to_string(),
+            "--ext-diff".to_string(),
             "HEAD".to_string(),
         ];
         let rewritten = args_with_standard_diff_backend_for_internal_git(&args);
 
-        // Caller override is stripped.
-        assert!(
-            !rewritten
-                .iter()
-                .any(|arg| arg == "diff.external=custom-helper")
-        );
-        // Standard diff backend override is injected.
-        assert!(
-            rewritten
-                .windows(2)
-                .any(|pair| pair[0] == "-c" && pair[1] == "diff.external=")
-        );
         // Patch commands also get --no-ext-diff.
         assert!(rewritten.iter().any(|arg| arg == "--no-ext-diff"));
+        // Explicit enabling flags are removed.
+        assert!(!rewritten.iter().any(|arg| arg == "--ext-diff"));
         assert!(rewritten.iter().any(|arg| arg == "diff"));
     }
 
     #[test]
-    fn non_diff_internal_commands_still_get_standard_diff_external_override() {
+    fn non_patch_internal_commands_are_unchanged_by_standard_diff_rewrite() {
         let args = vec!["status".to_string(), "--porcelain=v2".to_string()];
         let rewritten = args_with_standard_diff_backend_for_internal_git(&args);
 
-        assert!(
-            rewritten
-                .windows(2)
-                .any(|pair| pair[0] == "-c" && pair[1] == "diff.external=")
-        );
-        assert_eq!(rewritten.last(), Some(&"--porcelain=v2".to_string()));
+        assert_eq!(rewritten, args);
     }
 
     #[test]
