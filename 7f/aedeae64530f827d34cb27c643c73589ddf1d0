@@ -1,0 +1,36 @@
+src/authorship/rebase_authorship.rs
+  f4569b523f00b9e6 1389-1390,1392,1394,1399-1406,1408-1412,1414-1417,1457-1482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.5",
+  "base_commit_sha": "7faedeae64530f827d34cb27c643c73589ddf1d0",
+  "prompts": {
+    "a0412bec68db9d90": {
+      "agent_id": {
+        "tool": "DeputyDev",
+        "id": "378120",
+        "model": "CLAUDE_4_POINT_5_SONNET"
+      },
+      "human_author": "Satyam Kumar <satyam.kumar1@1mg.com>",
+      "messages": [],
+      "total_additions": 10,
+      "total_deletions": 0,
+      "accepted_lines": 10,
+      "overriden_lines": 0
+    },
+    "f4569b523f00b9e6": {
+      "agent_id": {
+        "tool": "DeputyDev",
+        "id": "385359",
+        "model": "OPENROUTER_GPT_5_POINT_3_CODEX"
+      },
+      "human_author": "Satyam Kumar <satyam.kumar1@1mg.com>",
+      "messages": [],
+      "total_additions": 50,
+      "total_deletions": 10,
+      "accepted_lines": 49,
+      "overriden_lines": 0
+    }
+  }
+}
