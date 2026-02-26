@@ -3,6 +3,7 @@ import * as path from "path";
 import * as fs from "fs";
 import { exec, spawn } from "child_process";
 import { isVersionSatisfied } from "./utils/semver";
+import { getGitAiBinary } from "./utils/binary-path";
 import { MIN_GIT_AI_VERSION, GIT_AI_INSTALL_DOCS_URL } from "./consts";
 import { getGitRepoRoot } from "./utils/git-api";
 import { shouldSkipLegacyCopilotHooks } from "./utils/vscode-hooks";
@@ -415,7 +416,7 @@ export class AIEditManager {
       console.log('[git-ai] AIEditManager: Workspace root:', workspaceRoot);
       console.log('[git-ai] AIEditManager: Hook input:', hookInput);
 
-      const proc = spawn("git-ai", args, { cwd: workspaceRoot });
+      const proc = spawn(getGitAiBinary(), args, { cwd: workspaceRoot });
 
       let stdout = "";
       let stderr = "";

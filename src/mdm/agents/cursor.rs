@@ -377,8 +377,7 @@ impl HookInstaller for CursorInstaller {
             });
         }
 
-        // Configure git.path on Windows
-        #[cfg(windows)]
+        // Configure git.path
         {
             use crate::mdm::utils::{git_shim_path_string, update_git_path_setting};
 
@@ -667,5 +666,11 @@ mod tests {
             before_submit_cmd.contains("checkpoint cursor"),
             "command should still contain checkpoint args"
         );
+    }
+
+    #[test]
+    fn test_cursor_settings_targets_returns_candidates() {
+        let targets = CursorInstaller::settings_targets();
+        assert!(!targets.is_empty());
     }
 }

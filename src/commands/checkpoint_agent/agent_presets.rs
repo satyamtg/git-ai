@@ -13,7 +13,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub struct AgentCheckpointFlags {
     pub hook_input: Option<String>,
@@ -48,13 +48,13 @@ impl AgentCheckpointPreset for ClaudePreset {
         let hook_data: serde_json::Value = serde_json::from_str(&stdin_json)
             .map_err(|e| GitAiError::PresetError(format!("Invalid JSON in hook_input: {}", e)))?;
 
-        // VS Code Copilot hooks can be imported into Claude settings. In that case, the
-        // payload uses VS Code hook fields (hookEventName/toolName/sessionId), and should be
-        // handled by the github-copilot preset, not the native Claude preset.
+        // VS Code Copilot hooks can be imported into Claude settings. We ignore those payloads
+        // here because dedicated VS Code/GitHub Copilot hooks should handle them directly.
         if ClaudePreset::is_vscode_copilot_hook_payload(&hook_data) {
-            return GithubCopilotPreset.run(AgentCheckpointFlags {
-                hook_input: Some(stdin_json),
-            });
+            return Err(GitAiError::PresetError(
+                "Skipping VS Code hook payload in Claude preset; use github-copilot/vscode hooks."
+                    .to_string(),
+            ));
         }
 
         // Extract transcript_path and cwd from the JSON
@@ -153,56 +153,12 @@ impl AgentCheckpointPreset for ClaudePreset {
 
 impl ClaudePreset {
     fn is_vscode_copilot_hook_payload(hook_data: &serde_json::Value) -> bool {
-        let has_vscode_shape = hook_data.get("hookEventName").is_some()
-            && (hook_data.get("toolName").is_some()
-                || hook_data.get("tool_name").is_some()
-                || hook_data.get("sessionId").is_some()
-                || hook_data.get("session_id").is_some());
-
-        if !has_vscode_shape {
-            return false;
-        }
-
         let transcript_path = GithubCopilotPreset::transcript_path_from_hook_data(hook_data);
-        if let Some(path) = transcript_path {
-            if GithubCopilotPreset::looks_like_claude_transcript_path(path) {
-                return false;
-            }
-            if GithubCopilotPreset::looks_like_copilot_transcript_path(path) {
-                return true;
-            }
+        match transcript_path {
+            Some(path) if GithubCopilotPreset::looks_like_claude_transcript_path(path) => false,
+            Some(path) => GithubCopilotPreset::looks_like_copilot_transcript_path(path),
+            None => false,
         }
-
-        // Conservative fallback: only redirect if there's explicit Copilot identity data.
-        if let Some(model_hint) = hook_data
-            .get("model")
-            .and_then(|v| v.as_str())
-            .or_else(|| hook_data.get("modelId").and_then(|v| v.as_str()))
-            .or_else(|| hook_data.get("selectedModel").and_then(|v| v.as_str()))
-            && model_hint.starts_with("copilot/")
-        {
-            return true;
-        }
-
-        if let Some(agent_hint) = hook_data
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .or_else(|| hook_data.get("agentId").and_then(|v| v.as_str()))
-            && agent_hint.to_ascii_lowercase().contains("copilot")
-        {
-            return true;
-        }
-
-        if let Some(tool_hint) = hook_data
-            .get("tool_name")
-            .and_then(|v| v.as_str())
-            .or_else(|| hook_data.get("toolName").and_then(|v| v.as_str()))
-            && tool_hint.to_ascii_lowercase().contains("copilot")
-        {
-            return true;
-        }
-
-        false
     }
 
     /// Parse a Claude Code JSONL file into a transcript and extract model info
@@ -213,6 +169,7 @@ impl ClaudePreset {
             std::fs::read_to_string(transcript_path).map_err(GitAiError::IoError)?;
         let mut transcript = AiTranscript::new();
         let mut model = None;
+        let mut plan_states = std::collections::HashMap::new();
 
         for line in jsonl_content.lines() {
             if !line.trim().is_empty() {
@@ -290,11 +247,23 @@ impl ClaudePreset {
                                         if let (Some(name), Some(_input)) =
                                             (item["name"].as_str(), item["input"].as_object())
                                         {
-                                            transcript.add_message(Message::ToolUse {
-                                                name: name.to_string(),
-                                                input: item["input"].clone(),
-                                                timestamp: timestamp.clone(),
-                                            });
+                                            // Check if this is a Write/Edit to a plan file
+                                            if let Some(plan_text) = extract_plan_from_tool_use(
+                                                name,
+                                                &item["input"],
+                                                &mut plan_states,
+                                            ) {
+                                                transcript.add_message(Message::Plan {
+                                                    text: plan_text,
+                                                    timestamp: timestamp.clone(),
+                                                });
+                                            } else {
+                                                transcript.add_message(Message::ToolUse {
+                                                    name: name.to_string(),
+                                                    input: item["input"].clone(),
+                                                    timestamp: timestamp.clone(),
+                                                });
+                                            }
                                         }
                                     }
                                     _ => continue, // Skip unknown content types
@@ -308,6 +277,93 @@ impl ClaudePreset {
         }
 
         Ok((transcript, model))
+    }
+}
+
+/// Check if a file path refers to a Claude plan file.
+///
+/// Claude plans are written under `~/.claude/plans/`. We treat a path as a plan
+/// file only when it:
+/// - ends with `.md` (case-insensitive), and
+/// - contains the path segment pair `.claude/plans` (platform-aware separators).
+pub fn is_plan_file_path(file_path: &str) -> bool {
+    let path = Path::new(file_path);
+    let is_markdown = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    if !is_markdown {
+        false
+    } else {
+        let components: Vec<String> = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(segment) => Some(segment.to_string_lossy().to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect();
+
+        components
+            .windows(2)
+            .any(|window| window[0] == ".claude" && window[1] == "plans")
+    }
+}
+
+/// Extract plan content from a Write or Edit tool_use input if it targets a plan file.
+///
+/// Maintains a running `plan_states` map keyed by file path so that Edit operations
+/// can reconstruct the full plan text (not just the replaced fragment). On Write the
+/// full content is stored; on Edit the old_string→new_string replacement is applied
+/// to the tracked state and the complete result is returned.
+///
+/// Returns None if this is not a plan file edit.
+pub fn extract_plan_from_tool_use(
+    tool_name: &str,
+    input: &serde_json::Value,
+    plan_states: &mut std::collections::HashMap<String, String>,
+) -> Option<String> {
+    match tool_name {
+        "Write" => {
+            let file_path = input.get("file_path")?.as_str()?;
+            if !is_plan_file_path(file_path) {
+                return None;
+            }
+            let content = input.get("content")?.as_str()?;
+            if content.trim().is_empty() {
+                return None;
+            }
+            plan_states.insert(file_path.to_string(), content.to_string());
+            Some(content.to_string())
+        }
+        "Edit" => {
+            let file_path = input.get("file_path")?.as_str()?;
+            if !is_plan_file_path(file_path) {
+                return None;
+            }
+            let old_string = input.get("old_string").and_then(|v| v.as_str());
+            let new_string = input.get("new_string").and_then(|v| v.as_str());
+
+            match (old_string, new_string) {
+                (Some(old), Some(new)) if !old.is_empty() || !new.is_empty() => {
+                    // Apply the replacement to the tracked plan state if available
+                    if let Some(current) = plan_states.get(file_path) {
+                        let updated = current.replacen(old, new, 1);
+                        plan_states.insert(file_path.to_string(), updated.clone());
+                        Some(updated)
+                    } else {
+                        // No prior state tracked — store what we can and return the fragment
+                        plan_states.insert(file_path.to_string(), new.to_string());
+                        Some(new.to_string())
+                    }
+                }
+                (None, Some(new)) if !new.is_empty() => {
+                    plan_states.insert(file_path.to_string(), new.to_string());
+                    Some(new.to_string())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1822,12 +1878,7 @@ impl GithubCopilotPreset {
             detected_model = Some(chat_sessions_model);
         }
 
-        if !Self::is_likely_copilot_native_hook(
-            tool_name,
-            detected_model.as_deref(),
-            hook_data,
-            transcript_path.as_deref(),
-        ) {
+        if !Self::is_likely_copilot_native_hook(transcript_path.as_deref()) {
             return Err(GitAiError::PresetError(format!(
                 "Skipping VS Code hook for non-Copilot session (tool_name: {}, model: {}).",
                 tool_name,
@@ -1926,35 +1977,16 @@ impl GithubCopilotPreset {
             })
     }
 
-    fn is_likely_copilot_native_hook(
-        tool_name: &str,
-        detected_model: Option<&str>,
-        hook_data: &serde_json::Value,
-        transcript_path: Option<&str>,
-    ) -> bool {
-        if let Some(path) = transcript_path {
-            if Self::looks_like_claude_transcript_path(path) {
-                return false;
-            }
-            if Self::looks_like_copilot_transcript_path(path) {
-                return true;
-            }
+    fn is_likely_copilot_native_hook(transcript_path: Option<&str>) -> bool {
+        let Some(path) = transcript_path else {
+            return false;
+        };
+
+        if Self::looks_like_claude_transcript_path(path) {
+            return false;
         }
 
-        if let Some(model) = detected_model {
-            return model.starts_with("copilot/");
-        }
-
-        if let Some(model_hint) = hook_data
-            .get("model")
-            .and_then(|v| v.as_str())
-            .or_else(|| hook_data.get("modelId").and_then(|v| v.as_str()))
-            .or_else(|| hook_data.get("selectedModel").and_then(|v| v.as_str()))
-        {
-            return model_hint.starts_with("copilot/");
-        }
-
-        tool_name.to_ascii_lowercase().contains("copilot")
+        Self::looks_like_copilot_transcript_path(path)
     }
 
     fn should_resolve_model_from_chat_sessions(detected_model: Option<&str>) -> bool {
@@ -2202,6 +2234,7 @@ impl GithubCopilotPreset {
         hook_data
             .get("transcript_path")
             .and_then(|v| v.as_str())
+            .or_else(|| hook_data.get("transcriptPath").and_then(|v| v.as_str()))
             .or_else(|| hook_data.get("chat_session_path").and_then(|v| v.as_str()))
             .or_else(|| hook_data.get("chatSessionPath").and_then(|v| v.as_str()))
     }
@@ -2213,10 +2246,10 @@ impl GithubCopilotPreset {
 
     fn looks_like_copilot_transcript_path(path: &str) -> bool {
         let normalized = path.replace('\\', "/").to_ascii_lowercase();
-        normalized.contains("/chatsessions/")
+        normalized.contains("/github.copilot-chat/transcripts/")
             || normalized.contains("vscode-chat-session")
-            || normalized.contains("/workspacestorage/")
             || normalized.contains("copilot_session")
+            || (normalized.contains("/workspacestorage/") && normalized.contains("/chatsessions/"))
     }
 
     fn is_supported_vscode_edit_tool_name(tool_name: &str) -> bool {
@@ -2238,6 +2271,12 @@ impl GithubCopilotPreset {
             "copilot_insertedit",
             "copilot_replacestring",
             "vscode_editfile_internal",
+            "create_file",
+            "delete_file",
+            "rename_file",
+            "move_file",
+            "replace_string_in_file",
+            "insert_edit_into_file",
         ];
         if exact_edit_tools.iter().any(|name| lower == *name) {
             return true;
@@ -2275,13 +2314,31 @@ impl GithubCopilotPreset {
             serde_json::Value::Object(map) => {
                 for (key, val) in map {
                     let key_lower = key.to_ascii_lowercase();
-                    if (key_lower == "file_path"
+                    let is_single_path_key = key_lower == "file_path"
                         || key_lower == "filepath"
                         || key_lower == "path"
-                        || key_lower == "fspath")
-                        && let Some(path) = val.as_str()
-                    {
-                        out.push(path.to_string());
+                        || key_lower == "fspath";
+
+                    let is_multi_path_key = key_lower == "files"
+                        || key_lower == "filepaths"
+                        || key_lower == "file_paths";
+
+                    if is_single_path_key {
+                        if let Some(path) = val.as_str() {
+                            out.push(path.to_string());
+                        }
+                    } else if is_multi_path_key {
+                        match val {
+                            serde_json::Value::String(path) => out.push(path.to_string()),
+                            serde_json::Value::Array(paths) => {
+                                for path_value in paths {
+                                    if let Some(path) = path_value.as_str() {
+                                        out.push(path.to_string());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     Self::collect_tool_paths(val, out);
                 }
@@ -2539,6 +2596,7 @@ impl DroidPreset {
         let jsonl_content =
             std::fs::read_to_string(transcript_path).map_err(GitAiError::IoError)?;
         let mut transcript = AiTranscript::new();
+        let mut plan_states = std::collections::HashMap::new();
 
         for line in jsonl_content.lines() {
             if line.trim().is_empty() {
@@ -2615,11 +2673,23 @@ impl DroidPreset {
                                     if let (Some(name), Some(_input)) =
                                         (item["name"].as_str(), item["input"].as_object())
                                     {
-                                        transcript.add_message(Message::ToolUse {
-                                            name: name.to_string(),
-                                            input: item["input"].clone(),
-                                            timestamp: timestamp.clone(),
-                                        });
+                                        // Check if this is a Write/Edit to a plan file
+                                        if let Some(plan_text) = extract_plan_from_tool_use(
+                                            name,
+                                            &item["input"],
+                                            &mut plan_states,
+                                        ) {
+                                            transcript.add_message(Message::Plan {
+                                                text: plan_text,
+                                                timestamp: timestamp.clone(),
+                                            });
+                                        } else {
+                                            transcript.add_message(Message::ToolUse {
+                                                name: name.to_string(),
+                                                input: item["input"].clone(),
+                                                timestamp: timestamp.clone(),
+                                            });
+                                        }
                                     }
                                 }
                                 _ => continue,

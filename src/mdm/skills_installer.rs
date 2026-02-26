@@ -20,6 +20,10 @@ const EMBEDDED_SKILLS: &[EmbeddedSkill] = &[
         name: "git-ai-search",
         skill_md: include_str!("../../skills/git-ai-search/SKILL.md"),
     },
+    EmbeddedSkill {
+        name: "ask",
+        skill_md: include_str!("../../skills/ask/SKILL.md"),
+    },
 ];
 
 /// Result of installing skills
@@ -39,6 +43,11 @@ fn agents_skills_dir() -> Option<PathBuf> {
 /// Get the ~/.claude/skills directory path
 fn claude_skills_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("skills"))
+}
+
+/// Get the ~/.cursor/skills directory path
+fn cursor_skills_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cursor").join("skills"))
 }
 
 /// Link a skill directory to the target location.
@@ -163,6 +172,14 @@ pub fn install_skills(dry_run: bool, _verbose: bool) -> Result<SkillsInstallResu
                 eprintln!("Warning: Failed to link skill at {:?}: {}", claude_link, e);
             }
         }
+
+        // ~/.cursor/skills/{skill-name} -> ~/.git-ai/skills/{skill-name}
+        if let Some(cursor_dir) = cursor_skills_dir() {
+            let cursor_link = cursor_dir.join(skill.name);
+            if let Err(e) = link_skill_dir(&skill_dir, &cursor_link) {
+                eprintln!("Warning: Failed to link skill at {:?}: {}", cursor_link, e);
+            }
+        }
     }
 
     Ok(SkillsInstallResult {
@@ -214,6 +231,17 @@ pub fn uninstall_skills(dry_run: bool, _verbose: bool) -> Result<SkillsInstallRe
                 );
             }
         }
+
+        // ~/.cursor/skills/{skill-name}
+        if let Some(cursor_dir) = cursor_skills_dir() {
+            let cursor_link = cursor_dir.join(skill.name);
+            if let Err(e) = remove_skill_link(&cursor_link) {
+                eprintln!(
+                    "Warning: Failed to remove skill link at {:?}: {}",
+                    cursor_link, e
+                );
+            }
+        }
     }
 
     // Nuke the entire skills directory
@@ -228,6 +256,40 @@ pub fn uninstall_skills(dry_run: bool, _verbose: bool) -> Result<SkillsInstallRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    /// Temporarily override HOME (and USERPROFILE on Windows) to a temp directory
+    /// for the duration of the closure. Must only be called from `#[serial]` tests
+    /// to avoid racing with other tests that read HOME.
+    fn with_temp_home<F: FnOnce(&std::path::Path)>(f: F) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+
+        // SAFETY: tests using this helper are serialized via #[serial],
+        // so mutating the process environment is safe.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &home);
+        }
+
+        f(&home);
+
+        // SAFETY: tests using this helper are serialized via #[serial],
+        // so restoring the process environment is safe.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
 
     #[test]
     fn test_embedded_skills_are_loaded() {
@@ -371,46 +433,51 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_install_and_uninstall_skills_lifecycle() {
-        let skills_base = skills_dir_path().unwrap();
+        // Use an isolated temp HOME so we don't pollute the real home directory
+        // and don't race with other tests that mutate HOME (e.g. codex tests).
+        with_temp_home(|_home| {
+            let skills_base = skills_dir_path().unwrap();
 
-        // Dry run should not create anything
-        let dry_result = install_skills(true, false).unwrap();
-        assert!(dry_result.changed);
-        assert_eq!(dry_result.installed_count, EMBEDDED_SKILLS.len());
+            // Dry run should not create anything
+            let dry_result = install_skills(true, false).unwrap();
+            assert!(dry_result.changed);
+            assert_eq!(dry_result.installed_count, EMBEDDED_SKILLS.len());
 
-        // Install creates skill files with correct content
-        let result = install_skills(false, false).unwrap();
-        assert!(result.changed);
-        assert_eq!(result.installed_count, EMBEDDED_SKILLS.len());
-        assert!(skills_base.exists());
-        for skill in EMBEDDED_SKILLS {
-            let skill_md = skills_base.join(skill.name).join("SKILL.md");
-            assert!(skill_md.exists(), "SKILL.md missing for {}", skill.name);
-            let content = fs::read_to_string(&skill_md).unwrap();
-            assert_eq!(content, skill.skill_md);
-        }
+            // Install creates skill files with correct content
+            let result = install_skills(false, false).unwrap();
+            assert!(result.changed);
+            assert_eq!(result.installed_count, EMBEDDED_SKILLS.len());
+            assert!(skills_base.exists());
+            for skill in EMBEDDED_SKILLS {
+                let skill_md = skills_base.join(skill.name).join("SKILL.md");
+                assert!(skill_md.exists(), "SKILL.md missing for {}", skill.name);
+                let content = fs::read_to_string(&skill_md).unwrap();
+                assert_eq!(content, skill.skill_md);
+            }
 
-        // Install again is idempotent
-        let result2 = install_skills(false, false).unwrap();
-        assert!(result2.changed);
-        for skill in EMBEDDED_SKILLS {
-            let skill_md = skills_base.join(skill.name).join("SKILL.md");
-            assert!(
-                skill_md.exists(),
-                "SKILL.md missing after re-install for {}",
-                skill.name
-            );
-        }
+            // Install again is idempotent
+            let result2 = install_skills(false, false).unwrap();
+            assert!(result2.changed);
+            for skill in EMBEDDED_SKILLS {
+                let skill_md = skills_base.join(skill.name).join("SKILL.md");
+                assert!(
+                    skill_md.exists(),
+                    "SKILL.md missing after re-install for {}",
+                    skill.name
+                );
+            }
 
-        // Uninstall removes skills directory
-        let uninstall_result = uninstall_skills(false, false).unwrap();
-        assert!(uninstall_result.changed);
-        assert!(!skills_base.exists());
+            // Uninstall removes skills directory
+            let uninstall_result = uninstall_skills(false, false).unwrap();
+            assert!(uninstall_result.changed);
+            assert!(!skills_base.exists());
 
-        // Uninstall again is a no-op
-        let noop_result = uninstall_skills(false, false).unwrap();
-        assert!(!noop_result.changed);
-        assert_eq!(noop_result.installed_count, 0);
+            // Uninstall again is a no-op
+            let noop_result = uninstall_skills(false, false).unwrap();
+            assert!(!noop_result.changed);
+            assert_eq!(noop_result.installed_count, 0);
+        });
     }
 }
