@@ -15,14 +15,14 @@ const SCHEMA_VERSION: usize = 2;
 const MIGRATIONS: &[&str] = &[
     // Migration 0 -> 1: Initial schema with metrics table
     r#"
-    CREATE TABLE metrics (
+    CREATE TABLE IF NOT EXISTS metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_json TEXT NOT NULL
     );
     "#,
     // Migration 1 -> 2: Persistent rate limiter state for agent_usage events
     r#"
-    CREATE TABLE agent_usage_throttle (
+    CREATE TABLE IF NOT EXISTS agent_usage_throttle (
         prompt_id TEXT PRIMARY KEY,
         last_sent_ts INTEGER NOT NULL
     );
