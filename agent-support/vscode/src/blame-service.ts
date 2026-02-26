@@ -2,11 +2,18 @@ import * as vscode from "vscode";
 import { spawn } from "child_process";
 import { BlameQueue } from "./blame-queue";
 import { findRepoForFile, getGitRepoRoot } from "./utils/git-api";
+import { getGitAiBinary, resolveGitAiBinary } from "./utils/binary-path";
+
+export interface BlameMetadata {
+  is_logged_in: boolean;
+  current_user: string | null;
+}
 
 // JSON output structure from git-ai blame --json
 export interface BlameJsonOutput {
   lines: Record<string, string>;  // lineRange -> promptHash (e.g., "11-114" -> "abc1234")
   prompts: Record<string, PromptRecord>;
+  metadata?: BlameMetadata;
 }
 
 export interface PromptRecord {
@@ -27,6 +34,7 @@ export interface PromptRecord {
   overriden_lines?: number;
   other_files?: string[];
   commits?: string[];
+  messages_url?: string;
 }
 
 export interface LineBlameInfo {
@@ -39,6 +47,7 @@ export interface LineBlameInfo {
 export interface BlameResult {
   lineAuthors: Map<number, LineBlameInfo>;
   prompts: Map<string, PromptRecord>;
+  metadata?: BlameMetadata;
   timestamp: number;
   totalLines: number;
 }
@@ -219,16 +228,21 @@ export class BlameService {
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
     const cwd = gitRepoRoot || workspaceFolder?.uri.fsPath;
 
+    // Ensure binary path is resolved before spawning
+    await resolveGitAiBinary();
+
     return new Promise((resolve, reject) => {
       if (signal.aborted) {
         reject(new Error('Aborted'));
         return;
       }
-      
+
       // Use --contents - to read file contents from stdin
       // This allows git-ai to properly shift AI attributions for dirty files
       const args = ['blame', '--json', '--contents', '-', filePath];
-      const proc = spawn('git-ai', args, { 
+      const binary = getGitAiBinary();
+      console.log('[git-ai] Spawning blame:', { binary, args, cwd });
+      const proc = spawn(binary, args, {
         cwd,
         timeout: BlameService.TIMEOUT_MS,
       });
@@ -293,6 +307,8 @@ export class BlameService {
         this.gitAiAvailable = true;
         
         try {
+          console.log('[git-ai] Raw blame stdout (first 500 chars):', stdout.substring(0, 500));
+          console.log('[git-ai] Raw blame stderr:', stderr);
           const jsonOutput = JSON.parse(stdout) as BlameJsonOutput;
           const result = this.parseBlameOutput(jsonOutput, document.lineCount);
           resolve(result);
@@ -313,6 +329,8 @@ export class BlameService {
     
     // Copy prompts to our map
     for (const [hash, record] of Object.entries(output.prompts || {})) {
+      const msgs = record.messages || [];
+      console.log(`[git-ai] parseBlameOutput prompt ${hash}: messages=${msgs.length}, hasText=${msgs.some(m => m.text)}, messages_url=${record.messages_url || 'none'}`);
       prompts.set(hash, record);
     }
     
@@ -334,6 +352,7 @@ export class BlameService {
     return {
       lineAuthors,
       prompts,
+      metadata: output.metadata,
       timestamp: Date.now(),
       totalLines,
     };
@@ -368,6 +387,55 @@ export class BlameService {
     return result;
   }
   
+  /**
+   * Fetch prompt messages from CAS via `git-ai show-prompt`.
+   * Returns the messages array on success, or null on failure/timeout.
+   */
+  public async fetchPromptFromCAS(
+    promptId: string,
+    cwd: string
+  ): Promise<Array<{ type: string; text?: string; timestamp?: string }> | null> {
+    await resolveGitAiBinary();
+    return new Promise((resolve) => {
+      const args = ['show-prompt', promptId];
+      const proc = spawn(getGitAiBinary(), args, {
+        cwd,
+        timeout: 15000,
+      });
+
+      let stdout = '';
+
+      proc.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      proc.stderr.on('data', () => {}); // Ignore stderr
+
+      proc.on('error', () => {
+        resolve(null);
+      });
+
+      proc.on('close', (code) => {
+        if (code !== 0) {
+          resolve(null);
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(stdout);
+          const messages = parsed?.prompt?.messages;
+          if (Array.isArray(messages) && messages.length > 0) {
+            resolve(messages);
+          } else {
+            resolve(null);
+          }
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+  }
+
   private showInstallMessage(): void {
     if (this.hasShownInstallMessage) {
       return;

@@ -192,7 +192,11 @@ impl Config {
     }
 
     /// Helper that accepts pre-fetched remotes to avoid multiple git operations
-    fn is_allowed_repository_with_remotes(&self, remotes: Option<&Vec<(String, String)>>) -> bool {
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn is_allowed_repository_with_remotes(
+        &self,
+        remotes: Option<&Vec<(String, String)>>,
+    ) -> bool {
         // First check if repository is in exclusion list - exclusions take precedence
         if !self.exclude_repositories.is_empty()
             && let Some(remotes) = remotes
@@ -619,12 +623,23 @@ fn build_config() -> Config {
 }
 
 fn build_feature_flags(file_cfg: &Option<FileConfig>) -> FeatureFlags {
-    let file_flags_value = file_cfg.as_ref().and_then(|c| c.feature_flags.as_ref());
+    let mut file_flags_value = file_cfg
+        .as_ref()
+        .and_then(|c| c.feature_flags.as_ref())
+        .cloned();
+
+    // Backward-compatible alias: accept `feature_flags.globalGitHooks` from config files.
+    if let Some(serde_json::Value::Object(ref mut flags)) = file_flags_value
+        && let Some(value) = flags.get("globalGitHooks").cloned()
+        && !flags.contains_key("global_git_hooks")
+    {
+        flags.insert("global_git_hooks".to_string(), value);
+    }
 
     // Try to deserialize the feature flags from the JSON value
     let file_flags = file_flags_value.and_then(|value| {
         // Use from_value to deserialize, but ignore any errors and fall back to defaults
-        serde_json::from_value(value.clone()).ok()
+        serde_json::from_value(value).ok()
     });
 
     FeatureFlags::from_env_and_file(file_flags)
@@ -1294,5 +1309,93 @@ mod tests {
         let mut config = create_test_config(vec![], vec![]);
         config.quiet = true;
         assert!(config.is_quiet());
+    }
+
+    #[test]
+    fn test_excluded_repo_with_remotes() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/excluded/repo".to_string(),
+        )];
+        assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_allowed_repo_not_excluded_with_remotes() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/allowed/repo".to_string(),
+        )];
+        assert!(config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_allowlist_with_remotes() {
+        let config = create_test_config(vec!["https://github.com/myorg/*".to_string()], vec![]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/myorg/project".to_string(),
+        )];
+        assert!(config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_allowlist_denies_unmatched_remotes() {
+        let config = create_test_config(vec!["https://github.com/myorg/*".to_string()], vec![]);
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/other/project".to_string(),
+        )];
+        assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_exclusion_takes_precedence_with_remotes() {
+        let config = create_test_config(
+            vec!["https://github.com/myorg/*".to_string()],
+            vec!["https://github.com/myorg/secret".to_string()],
+        );
+        let remotes = vec![(
+            "origin".to_string(),
+            "https://github.com/myorg/secret".to_string(),
+        )];
+        assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_no_remotes_allowed_when_only_excludes() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        assert!(config.is_allowed_repository_with_remotes(None));
+    }
+
+    #[test]
+    fn test_no_remotes_denied_when_allowlist_active() {
+        let config = create_test_config(vec!["https://github.com/myorg/*".to_string()], vec![]);
+        assert!(!config.is_allowed_repository_with_remotes(None));
+    }
+
+    #[test]
+    fn test_empty_remotes_treated_as_no_match_for_exclusion() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        let remotes: Vec<(String, String)> = vec![];
+        assert!(config.is_allowed_repository_with_remotes(Some(&remotes)));
+    }
+
+    #[test]
+    fn test_multiple_remotes_one_excluded() {
+        let config = create_test_config(vec![], vec!["https://github.com/excluded/*".to_string()]);
+        let remotes = vec![
+            (
+                "origin".to_string(),
+                "https://github.com/allowed/repo".to_string(),
+            ),
+            (
+                "upstream".to_string(),
+                "https://github.com/excluded/repo".to_string(),
+            ),
+        ];
+        assert!(!config.is_allowed_repository_with_remotes(Some(&remotes)));
     }
 }

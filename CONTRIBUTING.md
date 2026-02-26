@@ -120,4 +120,4 @@ The project uses standard Rust formatting. Please run `cargo fmt` before committ
 If you have questions about contributing, feel free to open an issue or reach out to the maintainers.
 
 - **Discord**: https://discord.gg/XJStYvkb5U
-- **Office Hours**: https://calendly.com/acunniffe/meeting-with-git-ai-authors
+- **Office Hours**: https://calendly.com/d/cxjh-z79-ktm/meeting-with-git-ai-authors

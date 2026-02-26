@@ -240,6 +240,14 @@ fn test_fast_forward_pull_preserves_ai_attribution() {
         .git_ai(&["checkpoint", "mock_ai"])
         .expect("checkpoint should succeed");
 
+    // Configure git pull behavior for Git 2.52.0+ compatibility
+    local
+        .git(&["config", "pull.rebase", "false"])
+        .expect("config should succeed");
+    local
+        .git(&["config", "pull.ff", "only"])
+        .expect("config should succeed");
+
     // Perform fast-forward pull
     local.git(&["pull"]).expect("pull should succeed");
 
@@ -247,7 +255,6 @@ fn test_fast_forward_pull_preserves_ai_attribution() {
     local
         .stage_all_and_commit("commit after pull")
         .expect("commit should succeed");
-
     ai_file.assert_lines_and_blame(vec!["AI generated line 1".ai(), "AI generated line 2".ai()]);
 }
 
@@ -255,6 +262,11 @@ fn test_fast_forward_pull_preserves_ai_attribution() {
 fn test_fast_forward_pull_without_local_changes() {
     let setup = setup_pull_test();
     let local = setup.local;
+
+    // Configure git pull behavior
+    local
+        .git(&["config", "pull.ff", "only"])
+        .expect("config should succeed");
 
     // No local changes - just a clean fast-forward pull
     local.git(&["pull"]).expect("pull should succeed");
