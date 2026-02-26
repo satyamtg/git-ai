@@ -1386,22 +1386,35 @@ pub fn rewrite_authorship_after_commit_amend(
 ) -> Result<AuthorshipLog, GitAiError> {
     use crate::authorship::virtual_attribution::VirtualAttributions;
 
-    // Get the files that changed between original and amended commit
+    // Get the files that changed between original and amended commit.
+    // These are the only files whose committed authorship should be recomputed for amend.
     let changed_files = repo.list_commit_files(amended_commit, None)?;
-    let mut pathspecs: HashSet<String> = changed_files.into_iter().collect();
+    let mut pathspecs: HashSet<String> = changed_files.clone();
 
+    // Include files touched in local working log to preserve unstaged attribution behavior.
     let working_log = repo.storage.working_log_for_base_commit(original_commit);
     let touched_files = working_log.all_touched_files()?;
     pathspecs.extend(touched_files);
 
-    // Check if original commit has an authorship log with prompts
-    let has_existing_log = get_reference_as_authorship_log_v3(repo, original_commit).is_ok();
-    let has_existing_prompts = if has_existing_log {
-        let original_log = get_reference_as_authorship_log_v3(repo, original_commit).unwrap();
-        !original_log.metadata.prompts.is_empty()
-    } else {
-        false
-    };
+    // Load original authorship log once (if present).
+    // This is the source of truth for preserving AI attributions across terminals/machines.
+    let original_authorship_log = get_reference_as_authorship_log_v3(repo, original_commit).ok();
+
+    // Include all files already present in the original authorship note so amend does not
+    // silently drop untouched AI attributions when local working log/database state is missing.
+    if let Some(original_log) = original_authorship_log.as_ref() {
+        pathspecs.extend(
+            original_log
+                .attestations
+                .iter()
+                .map(|attestation| attestation.file_path.clone()),
+        );
+    }
+
+    let has_existing_prompts = original_authorship_log
+        .as_ref()
+        .map(|log| !log.metadata.prompts.is_empty())
+        .unwrap_or(false);
 
     // Phase 1: Load all attributions (committed + uncommitted)
     let repo_clone = repo.clone();
@@ -1440,6 +1453,33 @@ pub fn rewrite_authorship_after_commit_amend(
             amended_commit,
             Some(&pathspecs_set),
         )?;
+
+    // Preserve untouched file attestations from the original commit note.
+    // Only files changed by amend are eligible for recomputation/replacement.
+    if let Some(original_log) = original_authorship_log {
+        let existing_new_files: HashSet<String> = authorship_log
+            .attestations
+            .iter()
+            .map(|attestation| attestation.file_path.clone())
+            .collect();
+
+        for file_attestation in original_log.attestations {
+            if !changed_files.contains(&file_attestation.file_path)
+                && !existing_new_files.contains(&file_attestation.file_path)
+            {
+                authorship_log.attestations.push(file_attestation);
+            }
+        }
+
+        // Ensure prompt metadata required by preserved attestations is retained.
+        for (prompt_id, prompt_record) in original_log.metadata.prompts {
+            authorship_log
+                .metadata
+                .prompts
+                .entry(prompt_id)
+                .or_insert(prompt_record);
+        }
+    }
 
     // Update base commit SHA
     authorship_log.metadata.base_commit_sha = amended_commit.to_string();
